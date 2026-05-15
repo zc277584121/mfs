@@ -1,0 +1,484 @@
+# CLI 命令清单与行为契约
+
+MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名词管理命令。CLI 是 HTTP client，所有重活通过 `/v1` API 转给 local daemon 或 remote server。
+
+## 1. 完整命令清单
+
+### 动词命令（POSIX 风格）
+
+| 命令 | 作用 |
+| --- | --- |
+| `mfs add <path-or-uri>` | 注册并同步本地路径或外部 connector。**幂等**：再跑等于"再同步" |
+| `mfs status [<uri>]` | 看 daemon / profile / connector / freshness / job |
+| `mfs search <query> <path>` | 语义 + 关键词混合搜索 |
+| `mfs grep <pattern> <path>` | 精确搜索，能下推 connector 时下推 |
+| `mfs ls <path-or-uri>` | 列子节点 |
+| `mfs tree <path-or-uri>` | 树状浏览 |
+| `mfs cat <path-or-uri>` | 读取对象；大对象拒绝并提示 head/tail/range/export |
+| `mfs head <path-or-uri>` | 前 N 行/记录 |
+| `mfs tail <path-or-uri>` | 后 N 行/记录；`-f` 跟随 append-only |
+| `mfs export <path-or-uri> <file>` | 把对象写到本地文件 |
+| `mfs remove <path-or-uri>` | 从索引移除 |
+
+### 名词管理命令
+
+| 命令 | 子命令 |
+| --- | --- |
+| `mfs connector` | `list / inspect / update / remove` — 管理已注册 connector |
+| `mfs profile` | `add / use / list / status` — client endpoint profile |
+| `mfs serve` | `start / stop / status / logs` — 本机起一个 server 进程 |
+| `mfs job` | `list / inspect / cancel` — 后台任务 |
+| `mfs config` | `show / set` — 查看与修改配置 |
+
+## 2. 设计原则
+
+- **动词命令跟 POSIX 同名同义**：agent 不学新词。
+- **管理类操作集中到名词子树**：`mfs connector list` 不是 `mfs list-connectors`。
+- **一个幂等命令搞定就够**：`mfs add` 一个动词承担注册和同步两件事。
+- **隐藏复杂度**：单条 issue / row / message 通过 `locator` 表达，不让用户构造伪路径。
+- **大对象有 guard**：`cat` 默认拒绝大对象并给替代建议。
+
+## 3. `mfs add` 是统一入口
+
+本地路径和外部 URI 共用同一个动词。`mfs add` 是**幂等的**，分三档语义：
+
+```bash
+# ─── 本地路径 ───
+mfs add .
+mfs add ./repo
+mfs add ./repo --force         # 强制重建
+mfs add ./repo --watch         # 启动 watcher
+mfs add ./repo --sync          # 同步等待完成（默认后台）
+
+# ─── 外部 connector：三档明确语义 ───
+mfs add postgres://prod --probe --config x.toml             # ① 试连接，不写任何状态
+mfs add postgres://prod --register-only --config x.toml     # ② 注册 + 探测对象，不触发同步
+mfs add postgres://prod --config x.toml                     # ③ 注册 + 同步（首次默认 confirm）
+mfs add postgres://prod --config x.toml --yes               # 跳过 confirm
+mfs add postgres://prod                                     # 已注册：再同步一次
+mfs add postgres://prod --force                             # 强制重建
+mfs add slack://eng --since 2026-05-01                      # 增量（仅时间游标 connector）
+```
+
+行为：
+
+- `--probe`：仅试连接 + 校验配置，**不写状态**。验证凭据和连通性，不会出现在 `connector list` 里。
+- `--register-only`：注册 connector + 探测对象列表 + 估算同步成本，**不触发同步**。
+- 默认（无 `--probe` / `--register-only`）：注册 + 同步。**首次注册外部 connector 默认 confirm**，估算同步成本后等用户确认。`--yes` 跳过 confirm。本地路径小目录直接跑，超过阈值才 confirm。
+- 已注册再跑：等价于"再同步一次"（按 fingerprint 增量）。`--config` 在已注册时被忽略，要改配置用 `mfs connector update`。
+- `--force`：跳过 fingerprint 比对，重建可重建的部分。
+- `--since <date>`：仅对**时间游标 connector**（postgres updated_at / slack ts / github / gmail）有效；其他 connector 收到 `--since` 会报 `since_unsupported`，不会被默默忽略。
+
+`--register-only` 输出（防呆估算）：
+
+```text
+Connector validated: postgres://prod
+type: postgres
+health: ok
+
+Discovered: 38 tables / ~12.4M rows
+Estimated sync:
+  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
+  duration:  ~8h on 4 workers
+  storage:   ~3.2GB index + cache
+
+To sync now:
+  mfs add postgres://prod --yes
+To limit scope:
+  mfs add postgres://prod --tables-only public.tickets,public.accounts
+  mfs add postgres://prod --schema-only
+```
+
+默认 add 输出（首次注册外部 connector，confirm 模式）：
+
+```text
+Connector validated: postgres://prod
+Discovered: 38 tables / ~12.4M rows
+Estimated sync: ~2.4M tokens (~$48), ~8h on 4 workers, ~3.2GB
+
+Continue? [y/N]
+```
+
+本地路径或 `--yes` 后直接开始：
+
+```text
+Added connector: postgres://prod
+type: postgres
+health: ok
+objects discovered:
+  postgres://prod/public/tickets/schema.json
+  postgres://prod/public/tickets/rows.jsonl
+  ...
+Sync started.
+job: job_01HX...
+Run `mfs status postgres://prod` for progress.
+```
+
+### URI 写法
+
+connector URI 是主推风格（跟 DSN/connection string 一致，跟后续 `mfs ls postgres://prod` 风格统一）。脚本场景可以用 `--type / --alias` 的等价写法：
+
+```bash
+# 两种等价
+mfs add postgres://prod --config x.toml
+mfs add --type postgres --alias prod --config x.toml
+```
+
+输出（本地路径）：
+
+```text
+Processing 184 files under /repo
+Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
+Worker running in background. Run `mfs status` to check progress.
+```
+
+remote profile 下传本地路径返回明确错误：
+
+```text
+Local path requires local profile: ./repo
+Run `mfs profile use <local-profile>` and `mfs serve start` for local files.
+```
+
+错误码：`remote_server_cannot_read_local_path`。
+
+## 4. Search 行为
+
+```bash
+mfs search "session storage" ./src --top-k 5
+mfs search "customer cannot login" postgres://prod/public/tickets
+mfs search "session" --all                # 跨所有已注册 connector
+```
+
+输出（本地）：
+
+```text
+[1] src/session/store.py  score=0.884
+ 82  class SessionStore:
+ 83      def save(self, session: Session) -> None:
+
+[2] src/auth/session.py  score=0.731
+ 14  SESSION_COOKIE_NAME = "sid"
+```
+
+输出（外部 connector）：
+
+```text
+[1] postgres://prod/public/tickets/rows.jsonl  score=0.842
+     row: id=12
+     subject: Login broken after SSO migration
+     status: open
+     priority: high
+```
+
+- 召回走 Milvus hybrid（dense + sparse + RRF）。
+- 必须显式给 `<path>` 或 `--all`，不会默认搜全部。
+- 返回结果必含可继续操作的 `source` URI 和 `locator`。
+
+## 5. Grep 行为
+
+```bash
+mfs grep "ERR_TOKEN_EXPIRED" .
+mfs grep -C 5 "OAuth" ./docs
+mfs grep "SSO" postgres://prod/public/tickets/rows.jsonl
+mfs grep "timeout" slack://eng/channels/incidents
+```
+
+输出按 path/URI 分组（unix grep 风格）：
+
+```text
+src/auth/token.py
+167  raise TokenExpiredError("ERR_TOKEN_EXPIRED")
+
+slack://eng/channels/incidents/2026-05-10/messages.jsonl
+118  {"ts":"1715320060.456","user":"U2","text":"api timeout is rising"}
+```
+
+派发规则（详见 [04-browse-and-read.md §6](04-browse-and-read.md#6-grep-的派发)）：
+
+- connector 声明 `grep_pushdown=true` → 下推为 SQL `ILIKE` / Slack search API / S3 Select。
+- 有 cache → 扫 cache。
+- 否则 connector.read() 流式扫。
+- 标记 `indexable=true` 且对象已建 chunk → 走 Milvus BM25 召回。
+
+## 6. 浏览三件套：ls / tree / cat
+
+### ls
+
+```bash
+mfs ls postgres://prod/public/tickets
+```
+
+```text
+TYPE  NAME            MEDIA-TYPE           SIZE      EXTRA
+file  schema.json     application/json     2.1 KB
+file  rows.jsonl      application/x-ndjson ~1.2 GB   ~12.4M rows (lazy)
+```
+
+- 数据从 metadata DB 取，stale 时后台 refresh（详见 [04-browse-and-read.md §1](04-browse-and-read.md#1-ls-与-tree-的后台行为)）。
+- `--refresh` 强制刷新。
+- 无界目录（slack 几百频道、s3 海量 key）默认截断 100 项 + 提示。
+
+### tree
+
+```bash
+mfs tree --peek -L 2 ./docs/
+mfs tree slack://eng -L 3
+```
+
+- 默认 `-L 2`。
+- 大目录单层超过 100 截断。
+- 时间分区目录默认时间倒序，只显示最近 30 天。
+
+### cat
+
+```bash
+mfs cat ./README.md                                           # 完整读文件
+mfs cat ./README.md -n 40:90                                  # 行范围
+mfs cat postgres://prod/public/tickets/schema.json            # JSON
+mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100  # 区间
+mfs cat ./docs/diagram.png --meta                             # 看 VLM description
+```
+
+- 完整 cat 大对象会被拒绝，提示用 head/tail/range/export。详见 [04-browse-and-read.md §4](04-browse-and-read.md#4-分页与大对象)。
+
+## 7. 密度视图 `--peek / --skim / --deep`
+
+`ls / tree / cat` 支持三档密度，**仅对 document / code / directory 形态生效**：
+
+| 命令 | 用途 | 数据来源 |
+|---|---|---|
+| `--peek` | 只列名字 / 标题骨架 | metadata DB |
+| `--skim` | + 每条 summary 一行 | Milvus 查 `directory_summary` / `summary` / `vlm_description` |
+| `--deep` | 展开更多结构 | Milvus + cache head |
+
+```bash
+mfs tree --peek -L 2 ./
+mfs ls --skim ./docs
+mfs cat --skim ./docs/auth.md
+```
+
+**对结构化对象**（rows.jsonl / messages.jsonl / records.jsonl / schema.json）传 `--peek/--skim/--deep` 直接报错：
+
+```text
+density view not supported for application/x-ndjson
+use head/tail/cat --range instead:
+  mfs head -n 20 postgres://prod/public/tickets/rows.jsonl
+```
+
+错误码 `density_unsupported`。理由：head/tail 已经完整覆盖结构化对象的预览需求，密度视图重复造轮子。
+
+W/H/D 参数同样规则。
+
+## 8. head / tail / export
+
+```bash
+mfs head -n 20 postgres://prod/public/tickets/rows.jsonl
+mfs tail -n 50 s3://logs/app/2026-05-10.jsonl
+mfs tail -f slack://eng/channels/incidents/today/messages.jsonl
+mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
+```
+
+- `head -n N` / `tail -n N` 无状态。
+- `tail -f` 用 SSE / chunked stream，仅 connector 声明 `efficient_tail=true` 时可用。
+- `export` 把对象完整写到本地文件——大对象遍历的标准做法。
+
+## 9. Status 是统一状态入口
+
+```bash
+mfs status                              # 总览（local / remote profile 都支持）
+mfs status postgres://prod              # 单 connector 详情
+mfs status --verbose postgres://prod    # 含 retrieval index 细节
+mfs status --diagnose                   # 自检 profile/connector/storage/search
+mfs status --watch                      # 列正在 watch 的目录（仅 local profile）
+```
+
+`--watch` 只对 local profile 有意义；remote profile 下执行返回 `watch_unsupported_on_remote`（远端 server 不 watch 本地路径）。
+
+样例输出：
+
+```text
+$ mfs status
+Profile: local (kind=local)
+Daemon:  running (pid=4112, port=8765, version=0.4.0)
+Connectors: 3 active
+  ./repo                    last_add=2026-05-14T09:21:00Z   index=fresh
+  postgres://prod           last_add=2026-05-14T07:00:00Z   index=stale (3 tables changed)
+  slack://eng               last_add=2026-05-13T22:00:00Z   index=fresh
+Jobs:    1 running, 0 failed
+Search:  available
+```
+
+健康检查、watch 状态、诊断都收敛到 `status` 这一个命令。
+
+## 10. Connector / Profile / Daemon / Job 管理
+
+### `mfs connector`（管理类）
+
+```bash
+mfs connector list
+mfs connector inspect postgres://prod      # 配置、能力声明、暴露的对象
+mfs connector update postgres://prod --config .mfs/connectors/prod-postgres.toml
+mfs connector remove postgres://prod
+```
+
+注册和同步走 `mfs add <uri> --config X`，不在这里。
+
+### `mfs profile`
+
+```bash
+mfs profile add local --url http://127.0.0.1:8765 --kind local
+mfs profile add prod  --url https://mfs.example.com --kind remote
+mfs profile use local
+mfs profile list
+mfs profile status
+```
+
+`kind` 字段决定 client/server 是否共享文件系统命名空间，详见 [06-architecture.md §2](06-architecture.md#2-profile-与存储后端是正交的)。
+
+### `mfs serve`
+
+```bash
+mfs serve start
+mfs serve stop
+mfs serve status
+mfs serve logs
+```
+
+`mfs serve` 是 client-side 封装，本质是本机 spawn 一个 `mfs-server` 进程。服务端运维直接用 `mfs-server` binary（systemd / docker entrypoint），详见 [06-architecture.md §5](06-architecture.md#5-server-端启动).
+
+如果只装了 `mfs-cli` 没装 `mfs-server`：
+
+```text
+mfs serve requires mfs-server package.
+Install it with:
+  uv tool install mfs-server
+```
+
+### `mfs job`
+
+```bash
+mfs job list [--failed]
+mfs job inspect job_01HX...
+mfs job cancel job_01HX...
+```
+
+失败时 `mfs add <uri>` 即可（幂等），所以不提供 `job retry`。
+
+## 11. `--json` envelope
+
+每个动词命令都支持 `--json`。统一 envelope：
+
+```json
+{
+  "source": "postgres://prod/public/tickets/rows.jsonl",
+  "lines": null,
+  "content": "Login broken after SSO migration",
+  "score": 0.842,
+  "locator": {
+    "kind": "row",
+    "primary_key": {"id": 12}
+  },
+  "metadata": {
+    "kind": "search",
+    "chunk_kind": "row_text",
+    "connector_type": "postgres",
+    "media_type": "application/x-ndjson",
+    "fields": {
+      "status": "open",
+      "priority": "high"
+    }
+  }
+}
+```
+
+字段：
+
+| 字段 | 含义 |
+|---|---|
+| `source` | 包含该结果的 object URI（可继续 `mfs cat`） |
+| `lines` | 文本对象时的 line range `[start, end]`，否则 null |
+| `content` | 召回 / 读取的文本 |
+| `score` | search/grep 才有；ls/cat 为 null |
+| `locator` | 容器内单元定位；schema per connector（见 [05-search §3](05-search-and-retrieval.md#3-locator-schema-per-connector)） |
+| `metadata` | 包含 `kind` (search/cat/...) / `chunk_kind` / `connector_type` / `media_type` / connector-specific `fields` |
+
+`cat --range A:B --json` 返回 `items` 数组 + `range` 信息：
+
+```json
+{
+  "source": "postgres://prod/public/tickets/rows.jsonl",
+  "media_type": "application/x-ndjson",
+  "range": {"start": 0, "end": 2, "total_hint": 12453},
+  "items": [
+    {"id": 12, "subject": "Login broken after SSO migration"},
+    {"id": 41, "subject": "SSO redirect loop"}
+  ]
+}
+```
+
+## 12. 错误输出
+
+人类文本：
+
+```text
+Object is too large for full cat: postgres://prod/public/tickets/rows.jsonl
+size_hint: 4.2GiB
+try:
+  mfs head -n 20 postgres://prod/public/tickets/rows.jsonl
+  mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:1000
+  mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
+```
+
+JSON：
+
+```json
+{
+  "error": {
+    "code": "object_too_large_for_cat",
+    "message": "Object is too large for full cat",
+    "source": "postgres://prod/public/tickets/rows.jsonl",
+    "size_hint": "4.2GiB",
+    "suggestions": [
+      "mfs head -n 20 postgres://prod/public/tickets/rows.jsonl",
+      "mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:1000",
+      "mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl"
+    ]
+  }
+}
+```
+
+稳定错误码：
+
+| code | 含义 |
+|---|---|
+| `remote_server_cannot_read_local_path` | remote profile 收到本地 path |
+| `object_too_large_for_cat` | cat 大对象未带 `--range` |
+| `is_directory` | 对目录 cat |
+| `connector_unhealthy` | connector healthcheck 失败 |
+| `tail_unsupported` | connector 不支持 `tail -f` |
+| `density_unsupported` | 对结构化对象用 `--peek/--skim/--deep` |
+| `chunk_max_exceeded` | 该对象超过 `chunk_max`，部分索引 |
+| `local_server_unavailable` | local profile 但本机 server 进程不可达 |
+| `field_missing` | connector 数据缺 text_fields 配置的字段 |
+| `since_unsupported` | 给不支持时间游标的 connector 传 `--since` |
+| `watch_unsupported_on_remote` | remote profile 下用 `mfs status --watch` |
+
+## 13. Pipe 行为
+
+```bash
+mfs cat --meta ./docs/auth.md | mfs search "token expiry"
+```
+
+- stdin 有 MFS header：`search` 限定到该 source。
+- stdin 普通文本：`search` 对 stdin 做临时搜索。
+- 无 path 且无 `--all` 且无 stdin：报错。
+
+结构化输出 pipe 到本地 jq：
+
+```bash
+mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100 --json \
+  | jq '.items[] | select(.priority == "high")'
+
+mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl \
+  && jq 'select(.priority == "high")' ./tickets.jsonl
+```
