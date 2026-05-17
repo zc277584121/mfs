@@ -22,6 +22,8 @@ Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
 
 整个系统就这四个对外可见概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 cache 和 chunks。
 
+**本地文件也是一种 connector**：scheme 是 `file`，用户写普通 path 即可（无需写 `file://./repo`）。`postgres connector` / `slack connector` / `file connector` 概念上一视同仁——同样的 list / stat / read / fingerprint 契约，同样的 chunk pipeline，同样的搜索能力。
+
 `Connector` 这个词跟业界 ETL/iPaaS 用法一致（Airbyte / Kafka Connect / Snowflake Connector），避免与 shell `source` 命令的"激活"语义混淆。
 
 ## 系统全景图
@@ -80,9 +82,8 @@ CLI、SDK 是 client，所有重活在 server。server 有两种部署位置：
 ```text
 mfs serve start                      启动本机 server 进程
 mfs profile use local                选择本机 server
-mfs add . --yes                      给工作目录建索引（注册 + 同步，幂等）
-mfs add <connector-uri> --register-only --config X    首次：仅注册 + 估算
-mfs add <connector-uri> --config X --yes              注册 + 同步
+mfs add .                            注册并同步本地 file connector（小目录直接跑）
+mfs add <connector-uri> --config X   首次注册外部 connector（含估算 + confirm）
 mfs add <connector-uri>              已注册：再同步一次
 
 mfs ls / tree <path-or-uri>          浏览结构
@@ -95,7 +96,7 @@ mfs search "..." <path>              语义混合搜索
 mfs grep "..." <path>                精确搜索（connector 可下推）
 
 mfs status [<uri>]                   看 server / connector / freshness / job
-mfs connector list/inspect/update/remove   管理已注册 connector
+mfs connector list/inspect/probe/update/remove   管理已注册 connector
 mfs job list/inspect/cancel          看后台任务
 ```
 

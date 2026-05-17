@@ -40,58 +40,42 @@ MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名�
 
 ## 3. `mfs add` 是统一入口
 
-本地路径和外部 URI 共用同一个动词。`mfs add` 是**幂等的**，分三档语义：
+`mfs add` 注册并同步一个 connector。**本地路径是 file connector**（scheme=`file`，用户写普通 path 即可，无需 `file://` 前缀）；外部 connector 首次需要 `--config <toml>`。命令是幂等的：再跑一次 = 再同步一次。
 
 ```bash
-# ─── 本地路径 ───
+# 本地路径（file connector）
 mfs add .
 mfs add ./repo
-mfs add ./repo --force         # 强制重建
-mfs add ./repo --watch         # 启动 watcher
-mfs add ./repo --sync          # 同步等待完成（默认后台）
+mfs add ./repo --watch                  # 启动 watcher
+mfs add ./repo --force                  # 强制重建
 
-# ─── 外部 connector：三档明确语义 ───
-mfs add postgres://prod --probe --config x.toml             # ① 试连接，不写任何状态
-mfs add postgres://prod --register-only --config x.toml     # ② 注册 + 探测对象，不触发同步
-mfs add postgres://prod --config x.toml                     # ③ 注册 + 同步（首次默认 confirm）
-mfs add postgres://prod --config x.toml --yes               # 跳过 confirm
-mfs add postgres://prod                                     # 已注册：再同步一次
-mfs add postgres://prod --force                             # 强制重建
-mfs add slack://eng --since 2026-05-01                      # 增量（仅时间游标 connector）
+# 外部 connector
+mfs add postgres://prod --config x.toml             # 首次：注册 + 同步（默认 confirm）
+mfs add postgres://prod --config x.toml --yes       # 跳过 confirm
+mfs add postgres://prod                             # 已注册：再同步一次
+mfs add postgres://prod --force                     # 强制重建
+mfs add slack://eng --since 2026-05-01              # 时间游标增量
+
+# 想先试连接、不写状态
+mfs connector probe postgres://prod --config x.toml
 ```
 
-行为：
+5 个核心 flag：
 
-- `--probe`：仅试连接 + 校验配置，**不写状态**。验证凭据和连通性，不会出现在 `connector list` 里。
-- `--register-only`：注册 connector + 探测对象列表 + 估算同步成本，**不触发同步**。
-- 默认（无 `--probe` / `--register-only`）：注册 + 同步。**首次注册外部 connector 默认 confirm**，估算同步成本后等用户确认。`--yes` 跳过 confirm。本地路径小目录直接跑，超过阈值才 confirm。
-- 已注册再跑：等价于"再同步一次"（按 fingerprint 增量）。`--config` 在已注册时被忽略，要改配置用 `mfs connector update`。
-- `--force`：跳过 fingerprint 比对，重建可重建的部分。
-- `--since <date>`：仅对**时间游标 connector**（postgres updated_at / slack ts / github / gmail）有效；其他 connector 收到 `--since` 会报 `since_unsupported`，不会被默默忽略。
+| flag | 作用 |
+|---|---|
+| `--config <toml>` | 外部 connector 首次注册必填；已注册时忽略（要改配置用 `mfs connector update`） |
+| `--yes` | 跳过 confirm。默认行为：首次注册外部 connector 估算成本后等确认；本地小目录直接跑 |
+| `--watch` | 仅本地路径有效，启动 daemon 内 watcher |
+| `--force` | 跳过 fingerprint 比对，重建可重建部分 |
+| `--since <date>` | 仅时间游标 connector（postgres updated_at / slack ts / github / gmail）有效；其他报 `since_unsupported` |
 
-`--register-only` 输出（防呆估算）：
+试连接、注册管理等不在 `mfs add` 上挂 flag，拆到 `mfs connector` 子树（probe / list / inspect / update / remove）。
 
-```text
-Connector validated: postgres://prod
-type: postgres
-health: ok
-
-Discovered: 38 tables / ~12.4M rows
-Estimated sync:
-  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
-  duration:  ~8h on 4 workers
-  storage:   ~3.2GB index + cache
-
-To sync now:
-  mfs add postgres://prod --yes
-To limit scope:
-  mfs add postgres://prod --tables-only public.tickets,public.accounts
-  mfs add postgres://prod --schema-only
-```
-
-默认 add 输出（首次注册外部 connector，confirm 模式）：
+### 首次注册外部 connector 的默认行为
 
 ```text
+$ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
 Estimated sync: ~2.4M tokens (~$48), ~8h on 4 workers, ~3.2GB
@@ -99,29 +83,22 @@ Estimated sync: ~2.4M tokens (~$48), ~8h on 4 workers, ~3.2GB
 Continue? [y/N]
 ```
 
-本地路径或 `--yes` 后直接开始：
+`--yes` 或本地路径直接开始：
 
 ```text
-Added connector: postgres://prod
-type: postgres
-health: ok
-objects discovered:
-  postgres://prod/public/tickets/schema.json
-  postgres://prod/public/tickets/rows.jsonl
-  ...
-Sync started.
-job: job_01HX...
-Run `mfs status postgres://prod` for progress.
+$ mfs add ./repo
+Processing 184 files under /repo
+Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
+Worker running in background. Run `mfs status` to check progress.
 ```
 
 ### URI 写法
 
-connector URI 是主推风格（跟 DSN/connection string 一致，跟后续 `mfs ls postgres://prod` 风格统一）。脚本场景可以用 `--type / --alias` 的等价写法：
+connector URI 是主推风格（跟 DSN / connection string 一致，跟后续 `mfs ls postgres://prod` 风格统一）。脚本场景可以用 `--type / --alias` 的等价写法：
 
 ```bash
-# 两种等价
 mfs add postgres://prod --config x.toml
-mfs add --type postgres --alias prod --config x.toml
+mfs add --type postgres --alias prod --config x.toml      # 等价
 ```
 
 输出（本地路径）：
@@ -316,12 +293,13 @@ Search:  available
 
 ```bash
 mfs connector list
-mfs connector inspect postgres://prod      # 配置、能力声明、暴露的对象
+mfs connector inspect postgres://prod                                     # 配置、能力声明、暴露的对象
+mfs connector probe postgres://prod --config .mfs/connectors/prod-postgres.toml   # 试连接，不写状态
 mfs connector update postgres://prod --config .mfs/connectors/prod-postgres.toml
 mfs connector remove postgres://prod
 ```
 
-注册和同步走 `mfs add <uri> --config X`，不在这里。
+注册和同步走 `mfs add <uri> --config X`，不在这里。`probe` 用来在正式 `mfs add` 之前验证凭据和连通性。
 
 ### `mfs profile`
 
@@ -465,20 +443,29 @@ JSON：
 
 ## 13. Pipe 行为
 
-```bash
-mfs cat --meta ./docs/auth.md | mfs search "token expiry"
-```
+**Pipe 是普通 unix 字节流**——MFS 不在 stdin/stdout 上发明私有协议，不识别"上游来自哪个 source"。这样每个新 connector 不需要做 pipe 元数据适配。
 
-- stdin 有 MFS header：`search` 限定到该 source。
-- stdin 普通文本：`search` 对 stdin 做临时搜索。
+规则：
+
+- 上游 `mfs cat / head / tail / grep / search` 输出**纯字节流**（默认）或 JSON（`--json`），没有 MFS header。
+- `mfs search` / `mfs grep` 读 stdin 时**总是把 stdin 当临时文本处理**，对它做搜索/grep。
+- 想限定到具体 source 就**传 path 参数**：`mfs search "..." <path>`，不要通过 pipe 表达。
 - 无 path 且无 `--all` 且无 stdin：报错。
 
-结构化输出 pipe 到本地 jq：
+典型用法：
 
 ```bash
+# 临时搜索 stdin 文本
+git log --oneline | mfs search "fix auth"
+
+# 大对象切片后用 jq
 mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100 --json \
   | jq '.items[] | select(.priority == "high")'
 
+# 大对象先导出再处理
 mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl \
   && jq 'select(.priority == "high")' ./tickets.jsonl
+
+# 限定 source 直接用 path 参数，不用 pipe
+mfs search "token expiry" ./docs/auth.md
 ```

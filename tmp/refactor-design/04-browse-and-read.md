@@ -355,17 +355,27 @@ eviction = "lru"
 
 ## 11. Pipe 与 stdin
 
-```bash
-mfs cat --meta ./docs/auth.md | mfs search "token expiry"
-git log --oneline | mfs search "fix auth"
-mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100 --json | jq '...'
-```
+**Pipe 是普通 unix 字节流**——MFS 不在 stdin/stdout 上发明私有协议，不识别"上游来自哪个 connector"。这样每个新 connector 不需要做 pipe 元数据适配，命令简单。
 
 规则：
 
-- stdin 有 MFS header（来自上游 `mfs cat` 等）：下游命令限定到该 source。
-- stdin 普通文本：临时索引 stdin 本身做搜索。
+- 上游 `mfs cat / head / tail / grep / search` 输出**纯字节流**（默认）或 JSON（`--json`），没有 MFS header。
+- `mfs search` / `mfs grep` 读 stdin 时**总是把 stdin 当临时文本处理**。
+- 想限定到具体 connector 或对象，**传 path 参数**：`mfs search "..." <path>`。
 - 无 path 且无 `--all` 且无 stdin：报错。
+
+示例：
+
+```bash
+# 临时搜索 stdin 文本
+git log --oneline | mfs search "fix auth"
+
+# 大对象切片后 pipe 到 jq
+mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100 --json | jq '...'
+
+# 限定 connector / 对象，用 path 参数（不要用 pipe 传 source 信息）
+mfs search "token expiry" ./docs/auth.md
+```
 
 ## 12. 端到端示例
 

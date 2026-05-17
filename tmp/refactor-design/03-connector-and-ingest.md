@@ -2,29 +2,42 @@
 
 本文回答：每类 connector 暴露什么对象、怎么注册、怎么同步、怎么判断 stale。
 
-`Connector` 是 MFS 对数据源的统称（postgres / slack / github / file / web / ...），跟业界 ETL/iPaaS 用法一致。每个 connector 通过插件实现，详见 [07-contributing-connector.md](07-contributing-connector.md)。
+`Connector` 是 MFS 对数据源的统称（postgres / slack / github / file / web / ...），跟业界 ETL/iPaaS 用法一致。**本地文件是一种 file connector**（scheme=`file`，用户写普通 path 即可），跟其他 connector 一视同仁。每个 connector 通过插件实现，详见 [07-contributing-connector.md](07-contributing-connector.md)。
 
 ## 1. Connector 注册
 
-外部 connector 通过 `mfs add <root-uri> --config <toml>` 注册。本地路径不需要 connector TOML，直接 `mfs add .`。
+`mfs add` 是注册 + 同步的统一入口（幂等）。本地路径无需 config TOML；外部 connector 首次需要 `--config`。
 
 ```bash
+# 本地路径（file connector，无需 config）
+mfs add ./repo
+mfs add .
+
+# 外部 connector（首次：含估算 + confirm）
 mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 mfs add slack://eng --config .mfs/connectors/slack-eng.toml
 mfs add web://acme-docs --config .mfs/connectors/acme-docs.toml
-mfs add ./repo
+
+# 跳过 confirm
+mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml --yes
+```
+
+正式 add 前想验证凭据和连通性，用 `mfs connector probe`（不写状态）：
+
+```bash
+mfs connector probe postgres://prod --config .mfs/connectors/prod-postgres.toml
 ```
 
 注册后日常使用通过 connector URI 即可：
 
 ```bash
-mfs add postgres://prod                      # 再同步
+mfs add postgres://prod                      # 再同步（幂等）
 mfs add postgres://prod --force              # 强制重建
 mfs ls postgres://prod/public/tickets        # 浏览
 mfs connector list                           # 看已注册的
 ```
 
-connector root URI 由 `scheme://<alias>` 组成。`alias` 是用户起的名（`prod` / `eng` / `acme-docs`），在 workspace 内唯一，会进入脚本和搜索结果；展示名放 `label`。
+connector root URI 由 `scheme://<alias>` 组成。`alias` 是用户起的名（`prod` / `eng` / `acme-docs`），在 workspace 内唯一，会进入脚本和搜索结果；展示名放 `label`。本地路径的 connector URI 内部表示为 `file://./repo` 或 `file:///abs/path`，但用户日常写普通 path 即可。
 
 ## 2. Connector 类型清单（v0.4 目标）
 
