@@ -34,7 +34,7 @@ Layer 2 (可选高级)
 | 连接外部系统 / 认证 | ✅ 用对应 SDK | 凭据通过 `credential_ref` 解析 |
 | 决定 URI 树长什么样 | ✅ 写 `PROMPT.md` + `layout.py` | 命名规范见 §10 |
 | `stat / list / read` 实现 | ✅ 三个 method | API 路由、HTTP、SSE 都是 framework |
-| 变化检测 (`fingerprint / change_set`) | ✅ 算法 per connector | `ChangeSet` 数据结构 framework 给 |
+| 变化检测 (`fingerprint / sync`) | ✅ 算法 + state schema 完全自由 | framework 接管"哪些变化要重建" |
 | 对象 → object_kind 映射 | ✅ 一个 dict | 每个 object_kind 的 chunker / structure 全 framework |
 | chunk 切分 / embedding / summary / VLM | ❌ | framework pipeline |
 | `cat / head / tail / grep / ls / tree` 命令 | ❌ | framework shell helpers |
@@ -92,10 +92,13 @@ class ConnectorPlugin(ABC):
 
     # ─────── Layer 0：变化检测（必须实现）──────────────────
     async def fingerprint(self, path: str) -> str | None:
-        """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。"""
+        """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。
+        framework 用这个跟自己存的对比，决定 cache / chunk / embedding 哪层失效。"""
 
-    async def change_set(self, since: Cursor | None) -> ChangeSet:
-        """增量拉取。返回 added/modified/deleted/unchanged + new_cursor。"""
+    async def sync(self) -> AsyncIterator[ObjectChange]:
+        """同步：流式 yield 每个变化的 object。
+        cursor / manifest / etag / state schema 都在 connector 内部，
+        通过 self.state（KV store）持久化，framework 不 introspect。"""
 
     # ─────── Layer 0：路径分类（必须实现）──────────────────
     def object_kind_of(self, path: str) -> ObjectKind:
@@ -185,12 +188,17 @@ class Range:
     end: int                            # 闭开 [start, end)；约定 -1 表示末尾
 
 @dataclass
-class ChangeSet:
-    added:     list[str]
-    modified:  list[str]
-    deleted:   list[str]
-    unchanged: list[str]
-    new_cursor: Cursor | None
+class ObjectChange:
+    uri:  str
+    kind: Literal["added", "modified", "deleted"]
+
+# self.state：framework 注入的命名空间 KV store
+class StateStore(Protocol):
+    async def get(self, key: str) -> Any | None: ...
+    async def set(self, key: str, value: Any) -> None: ...
+    async def delete(self, key: str) -> None: ...
+    # value 可以是任意 JSON-serializable 结构（dict / list / str / number），
+    # connector 自己定义 schema，framework 不 introspect。
 
 @dataclass
 class GrepMatch:
@@ -280,8 +288,11 @@ class ExamplePlugin(ConnectorPlugin):
     async def fingerprint(self, path):
         return fingerprint(self.config, path)
 
-    async def change_set(self, since):
-        return change_set(self.config, since)
+    async def sync(self):
+        last = await self.state.get("last_seen") or 0
+        for path, ts in scan(self.config, since=last):
+            yield ObjectChange(uri=path, kind="modified")
+        await self.state.set("last_seen", now())
 ```
 
 ### config.py
@@ -392,7 +403,8 @@ CI 自动跑 contract + fake。真连测试可选。
 | `CAPABILITIES` 准确（不撒谎说支持某能力但实际报错） | ✅ |
 | `PROMPT.md` 写清 root 下面有什么对象、cat 行为、限制 | ✅ |
 | `object_kind_of(path)` 覆盖该 connector 暴露的所有 path 模式 | ✅ |
-| `fingerprint / change_set` 实现增量 | ✅ |
+| `fingerprint(path)` + `sync()` 实现增量 | ✅ |
+| `self.state` 里存的 schema 在 connector 内部文档化（供自己维护） | ✅ |
 | 对象命名遵循 §10 的规范 | ✅ |
 | contract test 全过 | ✅ |
 | fake E2E test 至少跑通 add / ls / head / search | ✅ |
@@ -485,6 +497,7 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 | 在 connector 里写 schedule cron | ❌ 用户写 connector TOML 的 `schedule` 字段，framework scheduler 调 |
 | 暴露不在 PROMPT.md 描述里的 path | ❌ 暴露 = 文档化 |
 | 自定义 `tenant_id` 行为 | ❌ tenant_id 由 framework 注入 |
+| 在 `self.state` 里存任意 schema | ✅ schema 由 connector 自己定义（cursor / manifest / etag map 等），framework 不 introspect |
 
 ## 12. 写 connector 前的设计检查
 

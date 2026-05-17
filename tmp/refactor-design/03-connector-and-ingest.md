@@ -313,34 +313,72 @@ mfs add <target>
 
 数据流向：HTTP 只走 control plane（path / option / status），数据（文件 bytes、记录内容、chunk 文本）都在 server 内部完成。详见 [06-architecture.md §3](06-architecture.md#3-control-plane-vs-data-plane).
 
-## 5. Fingerprint 与变化检测
+## 5. 变化检测
 
-### 5.1 Per-artifact fingerprint chain
+变化检测**对 framework 是黑盒**：framework 只规定两条最小契约（怎么通知变化 + 怎么算单 object 的 fingerprint），具体策略（cursor / scan / etag / hash / CDC）完全由 connector 自己决定。下面分三层讲：用户面、framework 内部、connector 实现。
 
-每种产物（cache / chunk / embedding）的 fingerprint = **sha1 of (上游 inputs + 所有影响产物的配置和工具版本)**。改任何一项相关项 → 自动失效相关产物。
+### 5.1 Framework ↔ connector 的两条契约
+
+```python
+class ConnectorPlugin:
+    # ① 同步：connector 自己算变化，流式 yield 每个变化的 object。
+    #    cursor / manifest / etag / hash 怎么算、存哪、schema 长什么样，全在 connector 内部。
+    async def sync(self) -> AsyncIterator[ObjectChange]: ...
+
+    # ② 单 object 的当前 upstream fingerprint。
+    #    framework 用这个跟自己存的对比，决定 cache / chunk / embedding 失效。
+    async def fingerprint(self, path: str) -> str | None: ...
+
+
+@dataclass
+class ObjectChange:
+    uri:  str
+    kind: Literal["added", "modified", "deleted"]
+```
+
+仅此两条。没有 `ChangeSet` / `Cursor` / `new_cursor` / `unchanged` 列表——这些都是 connector 内部细节。
+
+Connector 内部 state（cursor / manifest / etag 表 / ...）用 framework 提供的命名空间 KV store 持久化：
+
+```python
+async def sync(self):
+    last = await self.state.get("last_ts")              # connector 自己定义的 key
+    rows = await self.api.fetch(since=last)
+    for r in rows:
+        yield ObjectChange(r.uri, "modified" if r.was_seen_before else "added")
+    await self.state.set("last_ts", new_ts)             # connector 自己存
+```
+
+framework 不 introspect `self.state` 里存的是什么——postgres 存 `updated_at`、slack 存 ts、s3 存 page token、file 存 manifest map、github 存 `(commit_sha, tree_sha)`，schema 各不相同。
+
+### 5.2 Framework 内部：per-artifact fingerprint chain
+
+这是 **framework 内部机制**，跟 connector 接口分开。framework 拿到 upstream fingerprint 后，自己组合 chunker / embedding model 等版本信息，算出每层 cache 的 fingerprint，决定哪层失效。
 
 ```
-cache_fp(converted_md)    = sha1( upstream + converter_name + converter_version )
-cache_fp(vlm_text)        = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
-cache_fp(page_cache)      = sha1( upstream )
-cache_fp(head_cache)      = sha1( upstream + N )
+cache_fp(converted_md)     = sha1( upstream + converter_name + converter_version )
+cache_fp(vlm_text)         = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
+cache_fp(page_cache)       = sha1( upstream )
+cache_fp(head_cache)       = sha1( upstream + N )
 
-chunk_fp(body)            = sha1( cache_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
-chunk_fp(row_text)        = sha1( upstream + text_fields + template_version )
-chunk_fp(thread_aggregate)= sha1( upstream + group_by + agg_template_version )
-chunk_fp(vlm_chunk)       = sha1( cache_fp(vlm_text) )
-chunk_fp(summary)         = sha1( cache_fp + summary_model + summary_prompt + summary_provider )
-chunk_fp(schema_summary)  = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
+chunk_fp(body)             = sha1( cache_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
+chunk_fp(row_text)         = sha1( upstream + text_fields + template_version )
+chunk_fp(thread_aggregate) = sha1( upstream + group_by + agg_template_version )
+chunk_fp(vlm_chunk)        = sha1( cache_fp(vlm_text) )
+chunk_fp(summary)          = sha1( cache_fp + summary_model + summary_prompt + summary_provider )
+chunk_fp(schema_summary)   = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
 chunk_fp(directory_summary)= sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
 
-embedding_fp              = sha1( chunk_fp + embedding_model + embedding_model_version )
+embedding_fp               = sha1( chunk_fp + embedding_model + embedding_model_version )
 ```
 
-每种 artifact 自己声明依赖的 input set，framework 自动算 fp。改任何一个 input → 对应 artifact 自动 stale。
+每种 artifact 声明自己依赖的 input set，framework 自动算 fp。改 chunker config / 换 embedding model / 升级 converter 时，对应层 fp 变 → 该层 stale → 自动 rebuild。
 
-### 5.2 Milvus 上的失效行为
+Connector 不参与这套逻辑，只提供 `upstream fingerprint`。
 
-**Milvus 不支持只更新一列**。任何 fingerprint 变化最终都走 **DELETE 该行 + INSERT 新行**。区别只在"上游有多少步可复用"：
+### 5.3 Milvus 上的失效行为
+
+Milvus 不支持只更新一列。任何 fingerprint 变化最终都走 **DELETE 该行 + INSERT 新行**。区别只在"上游有多少步可复用"：
 
 | 变化 | upstream read | converter | chunker | embedder | summary/vlm | Milvus 操作 |
 |---|---|---|---|---|---|---|
@@ -351,108 +389,79 @@ embedding_fp              = sha1( chunk_fp + embedding_model + embedding_model_v
 | vlm model 变 | 跳过 | 跳过 | 跳过 | 跳过 | ✓ (仅 vlm chunks) | DELETE + INSERT (仅 vlm 行) |
 | embedding model 变 | 跳过 | 跳过 | 跳过 | ✓ | 跳过 | DELETE + INSERT |
 
-实现上用 batch DELETE-by-filter + batch INSERT，比逐条 upsert 快得多。
+批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快得多。Milvus 行同时存 `chunk_fingerprint` 和 `embedding_fingerprint`，sync 时按 chunk_id 对比，相等就跳过整行。
 
-Milvus 行同时存 `chunk_fingerprint` 和 `embedding_fingerprint` 两个字段；sync 时按 chunk_id 对比，相等就跳过整行。
+### 5.4 Connector 实现策略参考
 
-### 5.3 每类 connector 的 fingerprint 算法
+**下面两张表是各类 connector 常见实现策略，仅供贡献者参考——framework 不规定怎么算变化、用什么 cursor、存什么 state。** 这些是经验性建议，每个 connector 实现时可自行调整。
 
-Connector plugin 必须实现 `fingerprint(path) -> str | None` 和 `change_set(since) -> ChangeSet`。
+**Fingerprint 算法（实现示例）**：
 
-| Connector | 粒度 | Fingerprint 算法 | 增量手段 |
-|---|---|---|---|
-| **file** | path | `size + mtime_ns` 快速判断；不等再算 `sha1(content)` | scan + manifest diff |
-| **web** | page | HTTP `ETag` 或 `Last-Modified`，否则 `sha1(html)` | recrawl 按 `revisit_interval` |
-| **github code** | branch | `commit_sha` | `compare` API |
-| | blob | `blob_sha` | tree API |
-| **github issues/pulls** | record | `updated_at` | `issues?since=$cursor&state=all` |
-| **gdrive** | file | `revision_id` | `changes.list?pageToken=$cursor` |
-| **feishu docs** | file | `version` | OpenAPI 增量 events |
-| **s3 / r2 / gcs** | object | `etag`；版本桶用 `version_id` | `ListObjectsV2?StartAfter=$cursor` |
-| **slack** | (channel, day) | 当天最后一条 message 的 `ts` | `conversations.history?oldest=$cursor` |
-| | thread | 最后一条 reply 的 `ts` | `conversations.replies` |
-| **discord** | (channel, day) | 最后 message id（snowflake 含时间） | `messages?after=$id` |
-| **gmail** | mailbox | `historyId` | `users.history.list?startHistoryId=$cursor` |
-| | thread | `thread.historyId` | `users.threads.get` |
-| **postgres / mysql** | table-level | `(table_oid, relpages, n_live_tup, last_analyze)` | 探测 schema/规模变化 |
-| | row-level | `(pk, updated_at)` | `WHERE updated_at > $cursor`；无字段时用 CDC 或 snapshot |
-| **mongodb** | document | `(_id, version)` 或 `updatedAt` | change streams 或 query |
-| **bigquery / snowflake** | partition | partition meta + row_count | `_PARTITIONTIME > $cursor` |
-| **linear / jira / notion** | record | `updatedAt` | API + 时间过滤 |
-| **zendesk** | record | `generated_timestamp` | incremental export |
-| **salesforce / hubspot** | record | `SystemModstamp` / `lastmodifieddate` | bulk API delta |
-| **ssh / generic remote fs** | path | `size + mtime`；可选 sha1 | rsync-style scan |
-
-### 5.4 ChangeSet 接口
-
-```python
-@dataclass
-class ChangeSet:
-    added:     list[str]      # 新出现
-    modified:  list[str]      # fingerprint 变化
-    deleted:   list[str]      # 消失
-    unchanged: list[str]      # 同 fingerprint，跳过
-    new_cursor: Cursor | None # 增量提交点；None = 该 connector 不用 cursor，每次全量 scan
-```
-
-cursor 只在 job 成功后提交；中途失败下次从旧 cursor 重试。
-
-`new_cursor` 的两种语义：
-
-- **有 cursor**（append-only / 时间递增数据流）：cursor 是 watermark，下次从这点续。`since` 参数对应这个 cursor。例：slack ts、postgres updated_at、gmail historyId、binlog 位置。
-- **None**（无 cursor / 随机变化数据）：connector 用 **scan + diff** 策略，不持久化 cursor，每次全量列举 + 跟上次 manifest 对比。例：file source、S3 list、DB schema 探测、gdrive 文件列表 fallback。
-
-### 5.5 每类 connector 的 ChangeSet 具体实现
-
-| Connector | 实现 | new_cursor |
+| Connector | 粒度 | Fingerprint 算法 |
 |---|---|---|
-| **file** | (1) os.walk 得 current paths；(2) 对每个 path 比 manifest 的 (size, mtime_ns)；(3) 不同则算 sha1；(4) manifest 有但 current 没有 → deleted；(5) 更新 manifest | `None`（scan + diff） |
-| **web** | 按 sitemap / `revisit_interval` 列 page URL；对每页 ETag / Last-Modified 检查；改了 → recrawl + 转 md | `None` |
-| **github code** | `compare $last_commit...HEAD` 取变化的 blob；blob_sha 不同 → modified | `commit_sha` |
-| **github issues/pulls** | `issues?since=$cursor&state=all`；按 updated_at 排；deleted 检测靠 cleanup pass | `max(updated_at)` |
-| **gdrive** | `changes.list?pageToken=$cursor` 取所有变更（含 delete） | `next_page_token` |
-| **feishu docs** | OpenAPI 增量 events | `event_offset` |
-| **s3** | `ListObjectsV2 StartAfter=$cursor`；etag 比对；deleted 检测周期全量 list 一次 | `last_key` 或 `None` |
-| **slack** | (1) 列 channel × day partition；(2) per day: `conversations.history?oldest=$ts`；(3) 新增 message → modified（per-day 重 chunk）；(4) thread reply 同理 | `max(ts) per channel` |
-| **discord** | `channels/{id}/messages?after=$id`（snowflake 含时间） | `last_message_id` |
-| **gmail** | `users.history.list?startHistoryId=$cursor` 取增量 thread 变化 | `historyId` |
-| **postgres rows** | (1) `SELECT pk,updated_at WHERE updated_at>$cursor LIMIT N`；(2) 写 modified；(3) 周期全量 `SELECT pk` 检测 deleted | `max(updated_at)` |
-| **postgres schema** | 探测 `pg_attribute` hash 变化；schema 变 → 重生成 schema.json | `None` |
-| **mongodb** | change streams（首选）或 `_id+version` 周期对比 | `resume_token` 或 `None` |
-| **bigquery / snowflake** | `WHERE _PARTITIONTIME > $cursor`；partition 粒度 | `max(_PARTITIONTIME)` |
-| **linear / jira / notion** | API + `updatedAfter=$cursor` | `max(updatedAt)` |
-| **zendesk** | incremental export API（`tickets?start_time=$cursor`） | `end_time` |
-| **salesforce / hubspot** | bulk API delta（按 SystemModstamp / lastmodifieddate） | `max(timestamp)` |
+| **file** | path | `size + mtime_ns` 快速判断；不等再算 `sha1(content)` |
+| **web** | page | HTTP `ETag` 或 `Last-Modified`，否则 `sha1(html)` |
+| **github code** | blob | `blob_sha` |
+| **github issues/pulls** | record | `updated_at` |
+| **gdrive** | file | `revision_id` |
+| **feishu docs** | file | `version` |
+| **s3 / r2 / gcs** | object | `etag`；版本桶用 `version_id` |
+| **slack** | (channel, day) | 当天最后一条 message 的 `ts` |
+| **discord** | (channel, day) | 最后 message id（snowflake 含时间） |
+| **gmail** | thread | `thread.historyId` |
+| **postgres / mysql** | row | `(pk, updated_at)` |
+| **mongodb** | document | `(_id, version)` 或 `updatedAt` |
+| **bigquery / snowflake** | partition | partition meta + row_count |
+| **linear / jira / notion** | record | `updatedAt` |
+| **zendesk** | record | `generated_timestamp` |
+| **salesforce / hubspot** | record | `SystemModstamp` / `lastmodifieddate` |
+| **ssh / generic remote fs** | path | `size + mtime`；可选 sha1 |
 
-### 5.6 file source 的 scan + manifest diff 详解
+**同步策略（实现示例）**：
+
+| Connector | 增量手段 | state 里存什么（举例） |
+|---|---|---|
+| **file** | scan 全量 + manifest diff | `{ path: (size, mtime_ns, sha1) }` 映射 |
+| **web** | `revisit_interval` 触发 recrawl；ETag 检查 | `{ url: etag }` |
+| **github code** | `compare $commit...HEAD` 拿变化 blob | `commit_sha` |
+| **github issues/pulls** | `issues?since=$cursor&state=all` | `max(updated_at)` |
+| **gdrive** | `changes.list?pageToken=$cursor` | `next_page_token` |
+| **feishu docs** | OpenAPI 增量 events | `event_offset` |
+| **s3** | `ListObjectsV2 StartAfter=$cursor`；周期全量 list 检测 delete | `last_key` |
+| **slack** | per channel × day: `conversations.history?oldest=$ts` | `{ channel: max(ts) }` |
+| **discord** | `messages?after=$id` | `{ channel: last_msg_id }` |
+| **gmail** | `users.history.list?startHistoryId=$cursor` | `historyId` |
+| **postgres rows** | `SELECT pk,updated_at WHERE updated_at>$cursor`；周期全量 pk diff 检 deleted | `max(updated_at)` |
+| **postgres schema** | 探测 `pg_attribute` hash 变化 | hash of pg_attribute snapshot |
+| **mongodb** | change streams（首选）或 `_id+version` 周期对比 | `resume_token` |
+| **bigquery / snowflake** | `WHERE _PARTITIONTIME > $cursor` | `max(_PARTITIONTIME)` |
+| **linear / jira / notion** | API + `updatedAfter=$cursor` | `max(updatedAt)` |
+| **zendesk** | incremental export `tickets?start_time=$cursor` | `end_time` |
+| **salesforce / hubspot** | bulk API delta | `max(SystemModstamp)` |
+
+cursor / state schema 在 connector 内部自定义，framework 不参与。Sync 失败时 connector 决定怎么回滚或保留状态。
+
+### 5.5 file connector 的实现示例
+
+完整流程：
 
 ```
 1. scan：os.walk(root) 应用 ignore rules（.gitignore + .mfsignore + 默认 binary 规则）
        → 得当前 paths 集合 current_paths
 
-2. 对每个 path 与 manifest 表对比（in metadata DB）：
-   - manifest 里有 + (size, mtime_ns) 完全一致 → unchanged，跳过
+2. 对每个 path 与 self.state 里的 manifest 对比：
+   - manifest 里有 + (size, mtime_ns) 完全一致 → 跳过
    - manifest 里有 + (size, mtime_ns) 变化 → 算 sha1(content)
-     - sha1 跟 manifest 一致 → unchanged（只是 touch 了 mtime）→ 更新 manifest.mtime_ns
-     - sha1 不一致 → modified → 入 worker queue
-   - manifest 里没有 → added → 入 worker queue
+     - sha1 跟 manifest 一致 → 只是 touch 了 mtime，更新 manifest.mtime_ns，跳过
+     - sha1 不一致 → yield ObjectChange(path, "modified")
+   - manifest 里没有 → yield ObjectChange(path, "added")
 
-3. manifest 里有但 current_paths 没有 → deleted → 入 worker queue（删 chunks）
+3. manifest 里有但 current_paths 没有 → yield ObjectChange(path, "deleted")
 
-4. 更新 manifest（写新 sha1 / size / mtime / last_seen）
-
-5. 输出 ChangeSet（new_cursor = None）
+4. 更新 self.state 里的 manifest（写新 sha1 / size / mtime）
 ```
 
-manifest 记录：
-
-```text
-path
-size
-mtime_ns
-sha1
-last_seen
-```
+manifest 是 file connector 自己定义的数据结构，存在 `self.state` 里。framework 不关心它的形状。其他 connector（postgres / slack / s3 / ...）按各自需要在 `self.state` 里存自己的 state。
 
 ## 6. Connector TOML 配置规则
 

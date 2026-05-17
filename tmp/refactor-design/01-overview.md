@@ -39,7 +39,7 @@ Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
             │  API routes  ─►  Engine  ─►  Connector      │
             │       │             │              │         │
             │       │             v              v         │
-            │       │      Object handlers   ChangeSet     │
+            │       │      Object handlers   ObjectChange  │
             │       │             │              │         │
             │       │             v              v         │
             │       └────►  Pipeline (embed / summary / VLM)│
