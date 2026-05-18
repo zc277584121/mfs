@@ -34,24 +34,25 @@
 │  └────────────┬─────────────────────────────────────────────────┘  │
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ Object handlers (objects/<kind>/)                            │  │
+│  │ Object Processors (processors/<kind>/)                       │  │
 │  │   document / code / table_rows / message_stream /            │  │
 │  │   record_collection / image / binary                         │  │
 │  └────────────┬─────────────────────────────────────────────────┘  │
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ Pipeline                                                     │  │
+│  │ Common Services                                              │  │
 │  │   embedding / summary / VLM / retrieval / export             │  │
 │  └────────────┬─────────────────────────────────────────────────┘  │
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ Worker queue                                                 │  │
-│  │   DB-backed: SQLite (local) or Postgres (remote)             │  │
+│  │ DB-backed queue                                              │  │
+│  │   connector_jobs + object_tasks tables                       │  │
 │  │   SELECT ... FOR UPDATE SKIP LOCKED 取 task                 │  │
+│  │   SQLite (local) or Postgres (remote)                        │  │
 │  └────────────┬─────────────────────────────────────────────────┘  │
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ Storage adapters                                             │  │
+│  │ Storage                                                      │  │
 │  │   Metadata DB (SQLite / Postgres)                            │  │
 │  │   Object store (local fs / S3 / R2 / MinIO)                  │  │
 │  │   Milvus (Lite / self-hosted / Zilliz Cloud)                 │  │
@@ -59,25 +60,53 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 术语速览
+### 术语速览（分 3 组）
 
-读后面章节前先建立这些词的心智边界：
+读不同章节需要的词不一样，**按受众分组**避免一次塞太多：
 
-| 术语 | 是什么 | 谁创建 |
-|---|---|---|
-| **Connector** | 一个注册的数据源插件实例（`postgres://prod` / `./repo`） | 用户 `mfs add` |
-| **Object** | connector 暴露的一条虚拟文件，有 path + media_type | connector 决定 |
-| **Cache** | 一个 object 的本地缓存字节（可选；让 cat/head/tail 不打回 connector） | framework 维护 |
-| **Chunk** | Milvus 一行：search/grep 召回的最小单元 | framework 生成 |
-| **Job**（`connector_jobs` 表） | 用户层操作记录：一次 `mfs add` / `mfs remove` 创建一个 | `mfs` 命令触发 |
-| **Task**（`object_tasks` 表） | sync job 内的单 object 处理任务 | job 派生 |
-| **Worker** | 跑 task 的 coroutine / 进程 | framework 调度 |
-| **Queue** | 角色概念——`connector_jobs` + `object_tasks` 两张表起队列作用 | DB schema 隐式 |
-| **Pipeline** | embedding / chunker / summary / VLM 等通用执行工具集 | framework 提供 |
-| **Profile** | client 侧 endpoint 配置（连哪个 server + workspace + token） | 用户 `mfs profile add` |
-| **Workspace** | 多 workspace 部署里的数据隔离边界（一般对应一个公司 / 组织） | 部署方分配 |
+#### A. 对外抽象（用户 + 开发者都用）— 7 个
 
-抽象关系：`Connector` 暴露多个 `Object`；每个 `Object` 可能有 `Cache`，可能产出多个 `Chunk` 进 Milvus。用户 `mfs add` 触发一个 `Job`，job 派生多个 per-object `Task`，`Worker` 从 queue 拉 task，内部调用 `Pipeline` 的组件做实际工作。`Profile` 决定 client 连哪个 server 和哪个 `Workspace`。
+| 术语 | 是什么 |
+|---|---|
+| **Connector** | 一个注册的数据源插件实例（`postgres://prod` / `./repo`） |
+| **Object** | connector 暴露的一条虚拟文件（URI + media_type） |
+| └─ **Cache** | object 的派生：字节缓存（可选；加速 cat / head / tail） |
+| └─ **Chunks** | object 的派生：Milvus 行（被 search / grep 召回） |
+| **Profile** | client 端 endpoint 配置（连哪个 server + workspace + token） |
+| **Workspace** | 多 workspace 部署的数据隔离边界（一般 = 一个组织 / 团队） |
+| **Job** | 用户操作记录：一次 `mfs add` / `mfs remove` → 一个 job（`connector_jobs` 表） |
+
+抽象关系：`Connector` 暴露多个 `Object`；每个 `Object` 可能有 `Cache` 和 `Chunks` 作为派生产物。`Profile` 决定 client 连哪个 server + 哪个 `Workspace`。用户每次操作（mfs add / remove）创建一个 `Job`。
+
+#### B. 队列系统（开发者读 §5 队列章节）— 2 个
+
+| 术语 | 是什么 |
+|---|---|
+| **Task** | Job 内的子单元——每个变化的 object → 一个 task（`object_tasks` 表） |
+| **Worker** | 跑 task 的 coroutine（业界标准词，跟 Sidekiq / Celery / Airflow / GHA 一致） |
+
+> 注：DB 表（`connector_jobs` + `object_tasks`）起到队列容器的作用——文档里说"DB-backed queue"做形容词用，**不把 Queue 当独立术语**。
+
+#### C. Server 代码层（开发者读 §11 工程目录）— 6 个
+
+| 层名 | 职责 |
+|---|---|
+| **HTTP API** | FastAPI routes（`/v1/...`） |
+| **Engine** | 业务编排：路由请求 → 创建 job → 调 connector；同一份代码兼容本机 / 远端两种部署 |
+| **Connectors** | per-source 插件（file / postgres / slack / github / ...） |
+| **Object Processors** | per-object_kind 加工（chunker / VLM 调用 / structure 构建） |
+| **Common Services** | 通用工具集（embedding / summary / vlm / retrieval / export） |
+| **Storage** | metadata DB / object store / Milvus 三套后端（adapter pattern 是实现细节） |
+
+读者范围：
+
+| 你是谁 | 需要学的术语 |
+|---|---|
+| **agent / 用户** | 只学 A 组（7 个） |
+| **后台 Python 开发者** | A + B 组（9 个） |
+| **读 server 架构 / 工程目录** | A + B + C 组（共 15 个，但 C 组只是层标签，自描述） |
+
+每组都有明确读者 + context，单次记忆负担不超过 7 个。
 
 ## 2. Profile 与存储后端是正交的
 
@@ -390,6 +419,11 @@ Install it with:
 默认**显式启动**（用户跑 `mfs serve start`）。`MFS_AUTOSTART=1` 时 CLI 检测不到本机 server 会自动 spawn 一次。
 
 ### 5.5 Job 队列：用关系型 DB 做队列
+
+> **本节用到的三个词**：
+> - **Job** = 用户层操作记录（一次 mfs add / mfs remove → 一行 `connector_jobs`）
+> - **Task** = Job 的子单元（每个变化的 object → 一行 `object_tasks`）
+> - **Worker** = 从 DB 拉 task 跑的 coroutine
 
 MFS 的 job 队列**直接用 metadata DB 表**（`connector_jobs` + `object_tasks`），不引入 Redis / RabbitMQ / Celery。
 
@@ -1326,10 +1360,16 @@ GitHub Actions 自动跑：
 │           │   ├── slack/
 │           │   ├── github/
 │           │   └── ...
-│           ├── objects/                       # object_kind handlers
-│           ├── pipeline/                      # embedding / summary / vlm / retrieval / export
-│           ├── storage/                       # metadata / object_store / queue / search (Milvus)
-│           └── runtime/
+│           ├── processors/                    # Object Processors：按 object_kind 加工
+│           │   ├── document/  code/  table_rows/  message_stream/
+│           │   ├── record_collection/  image/  binary/
+│           ├── common/                        # Common Services：通用工具集
+│           │   ├── embedding/  summary/  vlm/
+│           │   ├── retrieval/  export/
+│           └── storage/                       # metadata / object_store / queue / search (Milvus)
+│
+│   # 注：engine/ 内含本机 daemon 和远端 server 两种部署形态（局部分支判断），
+│   # 不再有独立的 runtime/ 目录。
 │
 ├── server-rs/                                 # ⭐ Rust 加速模块（PyO3 绑定）
 │   ├── Cargo.toml                             # workspace 声明子 crate
