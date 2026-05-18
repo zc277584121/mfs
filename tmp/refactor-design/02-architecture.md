@@ -60,7 +60,18 @@
 
 ## 2. Profile 与存储后端是正交的
 
-MFS 有两个独立维度，常被混淆：
+### 2.0 配置文件命名约定
+
+MFS 有**两个独立的配置文件**，各自负责不同身份的设置：
+
+| 文件 | 路径 | 内容 | 谁读 |
+|---|---|---|---|
+| client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token、tenant_id | `mfs` CLI |
+| server 配置 | `~/.mfs/server.toml`（本地 daemon）<br>`/etc/mfs/server.toml`（远端部署） | metadata backend / object_store / milvus / worker / embedding / chunker / cache / summary / vlm | `mfs-server` |
+
+只装 `mfs-cli` 的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
+
+下面分两个维度讨论 profile 和 server 后端——它们正交。
 
 ### 维度 A：profile.kind（client / server contract）
 
@@ -79,7 +90,7 @@ MFS 有两个独立维度，常被混淆：
 
 ### 维度 B：server 端存储后端
 
-跟 profile.kind 完全无关。server 端配置文件 `~/.mfs/daemon.toml`（或部署时的 server config）决定用什么后端：
+跟 profile.kind 完全无关。server 端配置文件 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）决定用什么后端：
 
 ```toml
 [metadata]
@@ -109,7 +120,7 @@ uri = "~/.mfs/milvus.db"                  # 或 http://localhost:19530 / https:/
 
 ### profile 配置
 
-`~/.mfs/config.toml`（client 侧）：
+`~/.mfs/client.toml`（client 侧）：
 
 ```toml
 [client]
@@ -244,11 +255,11 @@ MFS 的 server-side binary 是 **`mfs-server`**。`mfs serve` 是 client-side wr
 
 ```bash
 # 一体（demo / 小规模）
-mfs-server run --bind 0.0.0.0:8765 --config /etc/mfs/daemon.toml
+mfs-server run --bind 0.0.0.0:8765 --config /etc/mfs/server.toml
 
 # 拆分（生产）
-mfs-server api    --bind 0.0.0.0:8765 --config /etc/mfs/daemon.toml
-mfs-server worker --concurrency 8     --config /etc/mfs/daemon.toml
+mfs-server api    --bind 0.0.0.0:8765 --config /etc/mfs/server.toml
+mfs-server worker --concurrency 8     --config /etc/mfs/server.toml
 ```
 
 部署方式：
@@ -694,7 +705,7 @@ eviction = "lru"
 
 ### 6.3 Milvus
 
-一张 collection `mfs_chunks`，partition by connector。详见 [05-search-and-retrieval.md §1](05-search-and-retrieval.md#1-milvus-collection-schema)。
+一张 collection `mfs_chunks`，partition by connector。详见 [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
 
 backends：
 
@@ -703,6 +714,29 @@ backends：
 | Milvus Lite | `~/.mfs/milvus.db` | local daemon 默认；零运维；单 writer |
 | 自部署 Milvus | `http://host:19530` | self-host；多 writer；完整 BM25 |
 | Zilliz Cloud | `https://*.zillizcloud.com` + token | 托管；多 writer；完整 BM25 |
+
+**Backend 能力矩阵**：MFS v0.4 依赖几个 Milvus 特性，三种 backend 支持情况不同：
+
+| 能力 | Lite | 自部署 Milvus 2.5+ | Zilliz Cloud |
+|---|---|---|---|
+| `partition_key` 字段 | ⚠️ 简化版（按 hash 分区，无显式 partition 管理） | ✅ | ✅ |
+| `drop_partition` 快速删除 | ❌（fallback 到 delete by filter） | ✅ | ✅ |
+| `sparse_vec` + BM25 内建 | ✅（2.5+） | ✅ | ✅ |
+| `scalar index` on `connector_uri` / `chunk_kind` | ✅ | ✅ | ✅ |
+| `JSON` filter on `metadata` | ✅ | ✅ | ✅ |
+| 多 writer 并发 | ❌（单进程独占） | ✅ | ✅ |
+| 横向扩展 | ❌ | ✅（需配 Pulsar/Kafka） | ✅（托管） |
+| 备份 / 快照 | 文件 cp | manual / operator | 内建 |
+
+**实际影响**：
+
+- **Lite** 在 local daemon 场景够用。`mfs remove` 在 Lite 上走 `delete by filter` 而不是 `drop_partition`（慢但能用）；多 worker 并发受限，但 local daemon 默认就是单 worker pool。
+- **自部署 / Zilliz Cloud** 才能跑 `mfs-worker` 多 replica。
+- 文档默认假设 **Milvus 2.5+**（sparse_vec / BM25 必需）。
+
+切 backend 时数据迁移用 `mfs admin migrate-milvus --to <new-uri>`（roadmap 工具，v0.4 手动做）。
+
+如果用户用 Lite 起手，后期切自部署：drop_partition 突然变快，多 writer 解锁——无 schema 改动，纯 backend 替换。
 
 server 端配置：
 

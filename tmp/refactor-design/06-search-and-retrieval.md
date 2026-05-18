@@ -47,7 +47,7 @@ index_params = {
 
 ### tenant_id 字段是多租户预留
 
-v0.4 默认 `tenant_id = "default"`，所有查询自动 filter `tenant_id = current`。预留这个字段后，未来加多租户时不需要改 schema。详见 [06-architecture.md §9](06-architecture.md#9-多租户预留).
+v0.4 默认 `tenant_id = "default"`，所有查询自动 filter `tenant_id = current`。预留这个字段后，未来加多租户时不需要改 schema。详见 [02-architecture.md §9](02-architecture.md#9-多租户预留).
 
 ### 可选 collection 策略（server 端配置）
 
@@ -333,14 +333,32 @@ mfs search "..." <path> --top-k 10
   │       metadata.<field> = ... (optional --filter)
   │     }
   │     ranker  = RRF(dense_score, sparse_score)
-  │     limit   = top_k
+  │     limit   = top_k * over_fetch_ratio per partition
   │
   ├─ 4. 后处理:
-  │     - 同 object_uri 去重 / 保留 top-1（可选 --collapse）
-  │     - 按 score 排序
+  │     - 跨 partition merge：按 RRF score 全局排序，取 top_k
+  │     - 同 object_uri 去重（可选 --collapse object）
   │
   └─ 5. 渲染：{source, locator, content, score, metadata}
 ```
+
+### 跨 partition 合并语义
+
+`mfs search --all` 或 `mfs search <path>` 跨多个 connector 时：
+
+- **每 partition 取 `top_k * over_fetch_ratio`**（默认 ratio=3），避免漏掉某个 partition 真正高分的结果
+- **RRF 融合分数跨 partition 可比**：因为 RRF 公式 `1/(k + rank)` 跟绝对相似度无关，只跟 partition 内的排名有关；两个 partition 都按各自的相似度 rank 算 RRF 分。理论上仍然有些 bias（小 partition 排名分布密），但实测对 hybrid 召回影响小。
+- **全局 merge**：拿到所有 partition 的 over-fetch 结果后，按 RRF score 排序，取全局 top_k 返回给用户。
+
+`over_fetch_ratio` 在 server.toml 配置：
+
+```toml
+[search]
+over_fetch_ratio = 3              # 跨 partition 时每 partition 取 top_k * 3
+max_partitions_per_query = 32     # --all 时最多并行扫几个 partition
+```
+
+如果 connector 多到几十几百，single query 跨全部 partition 会慢；这时建议用户加 `--connector-type` filter 限定（例如 `mfs search "..." --kind body --all --connector-type postgres,slack`）。
 
 ### 模式
 
@@ -371,7 +389,7 @@ mfs search "session" ./src --top-k 5 --collapse object
 
 ## 8. Grep 流程
 
-详细派发见 [04-browse-and-read.md §6](04-browse-and-read.md#6-grep-的派发)。本节补充 Milvus 召回路径。
+详细派发见 [05-browse-and-read.md §6](05-browse-and-read.md#6-grep-的派发)。本节补充 Milvus 召回路径。
 
 对**已建 chunk 索引**的 object，`grep --mode index` 可走 Milvus sparse_vec（BM25）路径：
 
@@ -412,7 +430,7 @@ Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 co
 
 ## 10. Embedding & Summary providers
 
-framework 全局 `~/.mfs/config.toml` 配：
+framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
 
 ```toml
 [embedding]
@@ -437,7 +455,7 @@ prompt   = "Describe this image..."
 
 切换 summary / vlm 模型只影响对应 `chunk_kind` 的行（`summary` / `directory_summary` / `schema_summary` / `vlm_description`），其他 chunk 不动。通过 `chunk_kind` filter 做精准 DELETE。
 
-完整的 per-artifact fingerprint 设计见 [03-connector-and-ingest.md §5.1](03-connector-and-ingest.md#51-per-artifact-fingerprint-chain).
+完整的 per-artifact fingerprint 设计见 [04-connector-and-ingest.md §5.1](04-connector-and-ingest.md#51-per-artifact-fingerprint-chain).
 
 ## 11. 大对象索引控制
 
@@ -489,17 +507,30 @@ sample_rate = 0.01              # 1% 抽样
 
 ```text
 $ mfs add postgres://prod
-Estimated work:
-  scan: 12.4M rows across 38 tables
+Probing connector and sampling 1% of objects...
+
+Estimated work (based on sample, ±50% accuracy):
+  scan:      12.4M rows across 38 tables
   embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
-  duration: ~8h on 4 workers
-  storage: ~3.2GB index + cache
+  duration:  ~8h on 4 workers
+  storage:   ~3.2GB index + cache
+
+Note: actual cost may differ by up to 50%. Watch `mfs status` for real numbers.
 
 Continue? [y/N]
   Or limit scope:
     mfs add postgres://prod --tables-only public.tickets,public.accounts
     mfs add postgres://prod --schema-only
 ```
+
+估算引擎流程：
+
+1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
+2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
+3. 按抽样的 token/cost/duration 外推总成本
+4. 报告时明示"±50% 精度"，用户决定继续 / 限定范围 / 取消
+
+**不**承诺精确估算——embedding token 数依赖 tokenizer 和实际内容，事先精确算只能跑完才知道。文档默认表达"先打个底，actual cost 上线后看 `mfs status` 实测"。
 
 ## 12. 删除与一致性
 

@@ -75,7 +75,7 @@ CLI、SDK 是 client，所有重活在 server。server 有两种部署位置：
 
 `profile.kind = "local"` 的严格定义：**CLI 进程和 server 共享同一文件系统命名空间**——同一字符串路径在两边都解析到同一文件。Docker / SSH / WSL 等跨命名空间组合按 `remote` 处理。`kind` 字段自动按 URL host 推断（127.0.0.1 / localhost → local，其他 → remote），少数边界场景用 `--kind` 显式覆盖。
 
-**profile.kind 与存储后端正交**：local server 也可以用 Postgres + Zilliz Cloud + S3，跟 profile.kind 无关。详见 [06-architecture.md §2](06-architecture.md#2-profile-与存储后端是正交的).
+**profile.kind 与存储后端正交**：local server 也可以用 Postgres + Zilliz Cloud + S3，跟 profile.kind 无关。详见 [02-architecture.md §2](02-architecture.md#2-profile-与存储后端是正交的).
 
 ## 最小心智模型
 
@@ -104,27 +104,30 @@ mfs job list/inspect/cancel          看后台任务
 
 | 决策 | 详见 |
 |---|---|
-| `mfs add` 统一注册 + 同步入口（幂等），本地路径和外部 URI 共用 | [02-cli-commands.md §3](02-cli-commands.md#3-add-是统一入口) |
-| 对象名带 media type 后缀（`schema.json` / `rows.jsonl` / `messages.jsonl`） | [03-connector-and-ingest.md §3](03-connector-and-ingest.md#3-每类-connector-的-path-布局) |
-| 分页用 `--range A:B`，不需要 cursor token | [04-browse-and-read.md §4](04-browse-and-read.md#4-分页与大对象) |
-| Milvus 一张 collection，partition by connector；不同 chunk_kind 共用 | [05-search-and-retrieval.md §1](05-search-and-retrieval.md#1-milvus-collection-schema) |
-| 检索字段配置：text_fields / metadata_fields / locator_fields + chunk_strategy | [05-search-and-retrieval.md §4](05-search-and-retrieval.md#4-字段配置) |
-| Fingerprint 三层 chain（upstream / chunk_config / embedding_model）局部失效 | [03-connector-and-ingest.md §5](03-connector-and-ingest.md#5-fingerprint-与变化检测) |
-| HTTP 只走 control plane，文件/记录 bytes 都在 server 内部流动 | [06-architecture.md §3](06-architecture.md#3-control-plane-vs-data-plane) |
+| `mfs add` 统一注册 + 同步入口（幂等），本地路径和外部 URI 共用 | [03-cli-commands.md §3](03-cli-commands.md#3-add-是统一入口) |
+| 对象名带 media type 后缀（`schema.json` / `rows.jsonl` / `messages.jsonl`） | [04-connector-and-ingest.md §3](04-connector-and-ingest.md#3-每类-connector-的-path-布局) |
+| 分页用 `--range A:B`，不需要 cursor token | [05-browse-and-read.md §4](05-browse-and-read.md#4-分页与大对象) |
+| Milvus 一张 collection，partition by connector；不同 chunk_kind 共用 | [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema) |
+| 检索字段配置：text_fields / metadata_fields / locator_fields + chunk_strategy | [06-search-and-retrieval.md §4](06-search-and-retrieval.md#4-字段配置) |
+| Fingerprint 三层 chain（upstream / chunk_config / embedding_model）局部失效 | [04-connector-and-ingest.md §5](04-connector-and-ingest.md#5-fingerprint-与变化检测) |
+| HTTP 只走 control plane，文件/记录 bytes 都在 server 内部流动 | [02-architecture.md §3](02-architecture.md#3-control-plane-vs-data-plane) |
 | 社区贡献新 connector 约 1000 行代码，集中在 `connectors/<name>/` | [07-contributing-connector.md](07-contributing-connector.md) |
 
 ## 阅读顺序
 
-| 文档 | 内容 | 适合谁 |
-|---|---|---|
-| [01-overview.md](01-overview.md) | 本文：定位、抽象、系统图、决策索引 | 所有人 |
-| [02-cli-commands.md](02-cli-commands.md) | 16 个公开命令、行为契约、JSON envelope | 用户、agent 集成方 |
-| [03-connector-and-ingest.md](03-connector-and-ingest.md) | connector 注册、各类 connector 的 path 布局、fingerprint、ingest 流程 | 用户、贡献者 |
-| [04-browse-and-read.md](04-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、cache、大对象 | 用户、agent skill 作者 |
-| [05-search-and-retrieval.md](05-search-and-retrieval.md) | Milvus schema、chunk_kind、locator、字段配置、preset | 用户（高级配置）、贡献者 |
-| [06-architecture.md](06-architecture.md) | client/server、daemon、profile、存储、部署、多租户预留 | 运维、自部署用户、贡献者 |
-| [07-contributing-connector.md](07-contributing-connector.md) | connector 插件接口、骨架、对象命名规范、复用 vs 自写边界 | 贡献者 |
-| [18-project-structure-flow.html](18-project-structure-flow.html) | 可交互目录树和信息流（HTML） | 所有人 |
+按"从顶层 → 细节、从架构 → 命令、从用户 → 贡献者"递进。
+
+| # | 文档 | 内容 | 适合谁 |
+|---|---|---|---|
+| 01 | [01-overview.md](01-overview.md) | 本文：定位、抽象、系统图、决策索引 | 所有人 |
+| 02 | [02-architecture.md](02-architecture.md) | client/server、profile、存储、job 队列、一致性、并发、部署、多租户预留 | 所有人（建立心智模型）；运维、贡献者重点看 |
+| 03 | [03-cli-commands.md](03-cli-commands.md) | 16 个公开命令、行为契约、JSON envelope、错误码 | 用户、agent 集成方 |
+| 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、各类 path 布局、fingerprint、ingest 流程 | 用户、贡献者 |
+| 05 | [05-browse-and-read.md](05-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、cache、大对象 | 用户、agent skill 作者 |
+| 06 | [06-search-and-retrieval.md](06-search-and-retrieval.md) | Milvus schema、chunk_kind、locator、字段配置、preset、跨 partition 合并 | 用户（高级配置）、贡献者 |
+| 07 | [07-contributing-connector.md](07-contributing-connector.md) | connector 插件接口、骨架、对象命名规范、Layer 0/1/2 分层 | 贡献者 |
+| 08 | [08-agent-skill.md](08-agent-skill.md) | 给 LLM agent skill 作者：工作流、envelope 解读、反模式、错误处理 | Skill 作者、prompt 工程师 |
+| —  | [18-project-structure-flow.html](18-project-structure-flow.html) | 可交互目录树和信息流（HTML） | 所有人 |
 
 ## 与 Mirage 的关系
 

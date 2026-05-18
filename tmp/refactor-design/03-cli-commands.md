@@ -78,7 +78,10 @@ mfs connector probe postgres://prod --config x.toml
 $ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
-Estimated sync: ~2.4M tokens (~$48), ~8h on 4 workers, ~3.2GB
+Estimated sync (based on 1% probe sample, ±50% accuracy):
+  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
+  duration:  ~8h on 4 workers
+  storage:   ~3.2GB index + cache
 
 Continue? [y/N]
 ```
@@ -170,7 +173,7 @@ slack://eng/channels/incidents/2026-05-10/messages.jsonl
 118  {"ts":"1715320060.456","user":"U2","text":"api timeout is rising"}
 ```
 
-派发规则（详见 [04-browse-and-read.md §6](04-browse-and-read.md#6-grep-的派发)）：
+派发规则（详见 [05-browse-and-read.md §6](05-browse-and-read.md#6-grep-的派发)）：
 
 - connector 声明 `grep_pushdown=true` → 下推为 SQL `ILIKE` / Slack search API / S3 Select。
 - 有 cache → 扫 cache。
@@ -191,7 +194,7 @@ file  schema.json     application/json     2.1 KB
 file  rows.jsonl      application/x-ndjson ~1.2 GB   ~12.4M rows (lazy)
 ```
 
-- 数据从 metadata DB 取，stale 时后台 refresh（详见 [04-browse-and-read.md §1](04-browse-and-read.md#1-ls-与-tree-的后台行为)）。
+- 数据从 metadata DB 取，stale 时后台 refresh（详见 [05-browse-and-read.md §1](05-browse-and-read.md#1-ls-与-tree-的后台行为)）。
 - `--refresh` 强制刷新。
 - 无界目录（slack 几百频道、s3 海量 key）默认截断 100 项 + 提示。
 
@@ -216,7 +219,7 @@ mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100  # 区间
 mfs cat ./docs/diagram.png --meta                             # 看 VLM description
 ```
 
-- 完整 cat 大对象会被拒绝，提示用 head/tail/range/export。详见 [04-browse-and-read.md §4](04-browse-and-read.md#4-分页与大对象)。
+- 完整 cat 大对象会被拒绝，提示用 head/tail/range/export。详见 [05-browse-and-read.md §4](05-browse-and-read.md#4-分页与大对象)。
 
 ## 7. 密度视图 `--peek / --skim / --deep`
 
@@ -324,7 +327,7 @@ This will permanently delete:
 Continue? [y/N]
 ```
 
-confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 cache + 删 metadata → 注销 connector。详细并发协调见 [06-architecture.md §5.11](06-architecture.md#511-操作之间的并发协调)。
+confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 cache + 删 metadata → 注销 connector。详细并发协调见 [02-architecture.md §5.11](02-architecture.md#511-操作之间的并发协调)。
 
 幂等性：
 
@@ -341,7 +344,7 @@ mfs profile list
 mfs profile status
 ```
 
-`kind` 字段决定 client/server 是否共享文件系统命名空间，详见 [06-architecture.md §2](06-architecture.md#2-profile-与存储后端是正交的)。
+`kind` 字段决定 client/server 是否共享文件系统命名空间，详见 [02-architecture.md §2](02-architecture.md#2-profile-与存储后端是正交的)。
 
 ### `mfs serve`
 
@@ -352,7 +355,7 @@ mfs serve status
 mfs serve logs
 ```
 
-`mfs serve` 是 client-side 封装，本质是本机 spawn 一个 `mfs-server` 进程。服务端运维直接用 `mfs-server` binary（systemd / docker entrypoint），详见 [06-architecture.md §5](06-architecture.md#5-server-端启动).
+`mfs serve` 是 client-side 封装，本质是本机 spawn 一个 `mfs-server` 进程。服务端运维直接用 `mfs-server` binary（systemd / docker entrypoint），详见 [02-architecture.md §5](02-architecture.md#5-server-端启动).
 
 如果只装了 `mfs-cli` 没装 `mfs-server`：
 
@@ -407,7 +410,7 @@ mfs job cancel job_01HX...
 | `lines` | 文本对象时的 line range `[start, end]`，否则 null |
 | `content` | 召回 / 读取的文本 |
 | `score` | search/grep 才有；ls/cat 为 null |
-| `locator` | 容器内单元定位；schema per connector（见 [05-search §3](05-search-and-retrieval.md#3-locator-schema-per-connector)） |
+| `locator` | 容器内单元定位；schema per connector（见 [05-search §3](06-search-and-retrieval.md#3-locator-schema-per-connector)） |
 | `metadata` | 包含 `kind` (search/cat/...) / `chunk_kind` / `connector_type` / `media_type` / connector-specific `fields` |
 
 `cat --range A:B --json` 返回 `items` 数组 + `range` 信息：

@@ -156,7 +156,7 @@ mfs export <uri> <file>      # 完整导出到本地
 
 ### 4.4 大对象拒绝
 
-`cat` 不接受没有 `--range` 的大对象请求。阈值由 `~/.mfs/config.toml` 控制：
+`cat` 不接受没有 `--range` 的大对象请求。阈值由 server 端 `server.toml` 控制：
 
 ```toml
 [cat]
@@ -343,7 +343,7 @@ caches (
 
 ### 10.4 cache 淘汰
 
-`~/.mfs/config.toml`:
+server 端 `server.toml`：
 
 ```toml
 [cache]

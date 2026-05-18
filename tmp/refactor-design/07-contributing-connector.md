@@ -454,7 +454,7 @@ tickets/
 
 ### 10.3 单 record 的精确定位走 locator，不暴露成 path
 
-不要给单条 record / row / issue 分配独立 path。它们由搜索结果的 `locator` JSON 定位，详见 [05-search-and-retrieval.md §3](05-search-and-retrieval.md#3-locator-schema-per-connector).
+不要给单条 record / row / issue 分配独立 path。它们由搜索结果的 `locator` JSON 定位，详见 [06-search-and-retrieval.md §3](06-search-and-retrieval.md#3-locator-schema-per-connector).
 
 例外：单条对象天然有持久 path 且数量可控时可以暴露（如 GitHub PR `pulls/42/diff.patch`）。
 

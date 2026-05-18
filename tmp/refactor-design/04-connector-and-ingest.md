@@ -311,7 +311,7 @@ mfs add <target>
 | `local` | daemon 内 SQLite queue | daemon 内 worker pool |
 | `remote` | 服务端 Redis/Postgres queue | `mfs-worker` 进程 |
 
-数据流向：HTTP 只走 control plane（path / option / status），数据（文件 bytes、记录内容、chunk 文本）都在 server 内部完成。详见 [06-architecture.md §3](06-architecture.md#3-control-plane-vs-data-plane).
+数据流向：HTTP 只走 control plane（path / option / status），数据（文件 bytes、记录内容、chunk 文本）都在 server 内部完成。详见 [02-architecture.md §3](02-architecture.md#3-control-plane-vs-data-plane).
 
 ## 5. 变化检测
 
@@ -502,7 +502,7 @@ chunk_max = 100000                      # 硬上限
 
 `[[objects]]` array-of-tables：每条规则一段，按顺序匹配（先匹配优先），用 `match` 字段写 glob。比 quoted key 带星号的写法可读性好。
 
-字段含义详见 [05-search-and-retrieval.md §4](05-search-and-retrieval.md#4-字段配置).
+字段含义详见 [06-search-and-retrieval.md §4](06-search-and-retrieval.md#4-字段配置).
 
 Web connector 例：
 
@@ -526,7 +526,7 @@ match = "pages/**"
 chunk_strategy = "per_field_chunked"
 ```
 
-framework 全局配置（chunk size、embedding model 等）放 `~/.mfs/config.toml`，详见 [05-search-and-retrieval.md §10](05-search-and-retrieval.md#10-embedding--summary-providers).
+framework 全局配置（chunk size、embedding model 等）放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署），详见 [06-search-and-retrieval.md §10](06-search-and-retrieval.md#10-embedding--summary-providers).
 
 **两层覆盖**：framework 全局 + connector/object 配置。`mfs config show --effective <uri>` 打印某路径的最终生效配置。
 
@@ -541,7 +541,7 @@ credential_ref = "file:~/.mfs/secrets/pg-prod.toml" # 文件
 credential_ref = "vault:secret/data/mfs/pg-prod"    # Vault (remote)
 ```
 
-解析优先级和具体 schema 见 [06-architecture.md §7](06-architecture.md#7-凭据与认证).
+解析优先级和具体 schema 见 [02-architecture.md §7](02-architecture.md#7-凭据与认证).
 
 ## 8. Watch（本地路径专用）
 
@@ -614,7 +614,7 @@ daemon 内置简单 scheduler（基于 SQLite + APScheduler 风格），用户�
 
 ## 11. 错误恢复与重跑
 
-整套 sync 的正确性靠**三条一致性规则**保证；具体队列/恢复实现见 [06-architecture.md §5](06-architecture.md#55-job-队列用关系型-db-做队列)。
+整套 sync 的正确性靠**三条一致性规则**保证；具体队列/恢复实现见 [02-architecture.md §5](02-architecture.md#55-job-队列用关系型-db-做队列)。
 
 ### 11.1 三条一致性规则
 
@@ -674,7 +674,7 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 
 **不提供 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
 
-并发协调的完整语义表见 [06-architecture.md §5.11](06-architecture.md#511-操作之间的并发协调)。
+并发协调的完整语义表见 [02-architecture.md §5.11](02-architecture.md#511-操作之间的并发协调)。
 
 ### 11.4 单 object / 单 chunk 失败
 
