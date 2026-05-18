@@ -37,7 +37,7 @@ mfs ls postgres://prod/public/tickets        # 浏览
 mfs connector list                           # 看已注册的
 ```
 
-connector root URI 由 `scheme://<alias>` 组成。`alias` 是用户起的名（`prod` / `eng` / `acme-docs`），在 workspace 内唯一，会进入脚本和搜索结果；展示名放 `label`。本地路径的 connector URI 内部表示为 `file://./repo` 或 `file:///abs/path`，但用户日常写普通 path 即可。
+connector root URI 由 `scheme://<alias>` 组成。`alias` 是用户起的名（`prod` / `eng` / `acme-docs`），在当前 namespace 内唯一（v0.4 单 namespace 下即全局唯一），会进入脚本和搜索结果；展示名放 `label`。本地路径的 connector URI 内部表示为 `file://./repo` 或 `file:///abs/path`，但用户日常写普通 path 即可。
 
 ## 2. Connector 类型清单（v0.4 目标）
 

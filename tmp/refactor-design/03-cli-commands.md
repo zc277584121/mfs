@@ -377,7 +377,7 @@ confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 
 
 ```bash
 mfs profile add local --url http://127.0.0.1:8765
-mfs profile add prod  --url https://mfs.example.com --workspace acme-corp
+mfs profile add prod  --url https://mfs.example.com --token-env MFS_TOKEN_PROD
 mfs profile use local
 mfs profile list
 mfs profile status

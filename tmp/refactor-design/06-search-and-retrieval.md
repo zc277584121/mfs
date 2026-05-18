@@ -12,7 +12,7 @@ partition_key   = "connector_uri"        # 每个 connector 一个 partition，�
 
 fields = [
     Field("chunk_id",       VARCHAR(128),  primary=True),
-    Field("workspace_id",      VARCHAR(64),   index="scalar", default="default"),
+    Field("namespace_id",   VARCHAR(64),   index="scalar", default="default"),
     Field("connector_uri",  VARCHAR(256),  partition_key=True),
     Field("object_uri",     VARCHAR(1024), index="scalar"),
     Field("locator",        JSON),
@@ -45,9 +45,11 @@ index_params = {
 
 后改 partition key 需要数据迁移，所以一开始定下来。
 
-### workspace_id 字段是多租户预留
+### namespace_id 字段是物理分区主键
 
-v0.4 默认 `workspace_id = "default"`，所有查询自动 filter `workspace_id = current`。预留这个字段后，未来加多租户时不需要改 schema。详见 [02-architecture.md §9](02-architecture.md#9-多租户预留).
+所有 chunk 写入时带上 `namespace_id`，所有查询自动 filter `namespace_id IN (current_request_namespaces)`。v0.4 server 只有一个 `default` namespace，所有 chunk 都写 `"default"`，client 不需要关心。
+
+Workspace / User 等组织概念**不进 Milvus schema**——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02-architecture.md §9](02-architecture.md#9-多租户与-namespace-设计)。
 
 ### 可选 collection 策略（server 端配置）
 
@@ -56,7 +58,7 @@ v0.4 默认 `workspace_id = "default"`，所有查询自动 filter `workspace_id
 [milvus]
 collection_strategy = "single"          # 默认；所有 connector 一张 collection
 # collection_strategy = "per_connector" # 一 connector 一张 collection（隔离强；跨 search 多 RPC）
-# collection_strategy = "per_tenant"    # 多租户场景
+# collection_strategy = "per_namespace" # 强隔离场景：每 namespace 一张 collection
 ```
 
 v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
@@ -66,7 +68,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 | 字段 | 含义 |
 |---|---|
 | `chunk_id` | uuid 或 `sha1(object_uri + locator + chunk_kind)`；幂等写入 |
-| `workspace_id` | 多租户预留，v0.4 默认 `"default"` |
+| `namespace_id` | 物理分区主键；v0.4 恒为 `"default"`，多租户启用后由 server 注入 |
 | `connector_uri` | 包含该 chunk 的 connector root，如 `postgres://prod` |
 | `object_uri` | chunk 来自哪个 object，如 `postgres://prod/public/tickets/rows.jsonl` |
 | `locator` | object 内单元定位，per-connector schema（见 §3） |
@@ -326,7 +328,7 @@ mfs search "..." <path> --top-k 10
   │
   ├─ 3. Milvus hybrid search:
   │     filter = {
-  │       workspace_id     = current_workspace,
+  │       namespace_id  IN current_namespaces,
   │       connector_uri in [<partition>],
   │       object_uri    LIKE '<prefix>%' (optional),
   │       chunk_kind    in [...] (optional --kind),
@@ -395,7 +397,7 @@ mfs search "session" ./src --top-k 5 --collapse object
 
 ```
 Milvus sparse search:
-  filter: workspace_id = X AND connector_uri = Y AND object_uri = Z
+  filter: namespace_id IN current_namespaces AND connector_uri = Y AND object_uri = Z
   query : sparse vector from pattern
   返回带 chunk content 的 hits → 按行号在 chunk 内定位
 ```
@@ -537,7 +539,7 @@ Continue? [y/N]
 ingest 时如果对象消失：
 
 ```
-Milvus DELETE WHERE workspace_id = X
+Milvus DELETE WHERE namespace_id = X
                 AND connector_uri = Y
                 AND object_uri NOT IN (current_object_set)
 ```
@@ -545,7 +547,7 @@ Milvus DELETE WHERE workspace_id = X
 ingest 时如果对象内 record 消失（per_row 模式）：
 
 ```
-Milvus DELETE WHERE workspace_id = X
+Milvus DELETE WHERE namespace_id = X
                 AND connector_uri = Y
                 AND object_uri = Z
                 AND locator->>'id' NOT IN (current_pk_set)

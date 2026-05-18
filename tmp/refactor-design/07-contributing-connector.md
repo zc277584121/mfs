@@ -17,7 +17,7 @@ Connector 暴露两类方法：**必须实现**的 abstract method（不写就�
   search      — 默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
   chunk_plan  — 默认按 object_kind 推断；自定义 chunk strategy 时重写
   render      — 默认按 media_type 渲染；Parquet/ORC 等特殊格式可重写
-  acl         — 默认 None；多 workspace ACL 场景重写
+  acl         — 默认 None；多租户 ACL 场景重写
 ```
 
 写一个简单 connector**只实现 6 个 abstract method 就能跑**（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
@@ -134,7 +134,7 @@ class ConnectorPlugin(ABC):
         return None
 
     async def acl(self, path: str) -> dict | None:
-        """ACL 快照（多 workspace enterprise 场景）。v0.4 暂不启用。"""
+        """ACL 快照（多租户 enterprise 场景）。v0.4 暂不启用。"""
         return None
 ```
 
@@ -497,7 +497,7 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 | 让 cat 渲染特殊格式 | ✅ 在 `object_kind_of` 标个合适的 kind 用 framework 已有 handler |
 | 在 connector 里写 schedule cron | ❌ 用户写 connector TOML 的 `schedule` 字段，framework scheduler 调 |
 | 暴露不在 PROMPT.md 描述里的 path | ❌ 暴露 = 文档化 |
-| 自定义 `workspace_id` 行为 | ❌ workspace_id 由 framework 注入 |
+| 自定义 `namespace_id` 行为 | ❌ namespace_id 由 framework 注入 |
 | 在 `self.state` 里存任意 schema | ✅ schema 由 connector 自己定义（cursor / manifest / etag map 等），framework 不 introspect |
 
 ## 12. 写 connector 前的设计检查

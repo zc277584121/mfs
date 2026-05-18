@@ -64,7 +64,7 @@
 
 读不同章节需要的词不一样，**按受众分组**避免一次塞太多：
 
-#### A. 对外抽象（用户 + 开发者都用）— 7 个
+#### A. 对外抽象（用户 + 开发者都用）— 6 个
 
 | 术语 | 是什么 |
 |---|---|
@@ -72,11 +72,10 @@
 | **Object** | connector 暴露的一条虚拟文件（URI + media_type） |
 | └─ **Cache** | object 的派生：字节缓存（可选；加速 cat / head / tail） |
 | └─ **Chunks** | object 的派生：Milvus 行（被 search / grep 召回） |
-| **Profile** | client 端 endpoint 配置（连哪个 server + workspace + token） |
-| **Workspace** | 多 workspace 部署的数据隔离边界（一般 = 一个组织 / 团队） |
+| **Profile** | client 端 endpoint 配置（连哪个 server + token） |
 | **Job** | 用户操作记录：一次 `mfs add` / `mfs remove` → 一个 job（`connector_jobs` 表） |
 
-抽象关系：`Connector` 暴露多个 `Object`；每个 `Object` 可能有 `Cache` 和 `Chunks` 作为派生产物。`Profile` 决定 client 连哪个 server + 哪个 `Workspace`。用户每次操作（mfs add / remove）创建一个 `Job`。
+抽象关系：`Connector` 暴露多个 `Object`；每个 `Object` 可能有 `Cache` 和 `Chunks` 作为派生产物。`Profile` 决定 client 连哪个 server。用户每次操作（mfs add / remove）创建一个 `Job`。
 
 #### B. 队列系统（开发者读 §5 队列章节）— 2 个
 
@@ -98,13 +97,16 @@
 | **Common Services** | 通用工具集（embedding / summary / vlm / retrieval / export） |
 | **Storage** | metadata DB / object store / Milvus 三套后端（adapter pattern 是实现细节） |
 
+> **内部分区主键 `namespace_id`**（用户看不到）
+> 所有数据表 + Milvus partition + object store prefix 都按 `namespace_id` 切。v0.4 只有一个 `default` namespace，用户感知不到。未来加 Workspace / User / Project 时通过 mapping 表实现，**底层 namespace 不动**——详见 [§9](#9-多租户与-namespace-设计)。
+
 读者范围：
 
 | 你是谁 | 需要学的术语 |
 |---|---|
-| **agent / 用户** | 只学 A 组（7 个） |
-| **后台 Python 开发者** | A + B 组（9 个） |
-| **读 server 架构 / 工程目录** | A + B + C 组（共 15 个，但 C 组只是层标签，自描述） |
+| **agent / 用户** | 只学 A 组（6 个） |
+| **后台 Python 开发者** | A + B 组（8 个） |
+| **读 server 架构 / 工程目录** | A + B + C 组（共 14 个，但 C 组只是层标签，自描述） |
 
 每组都有明确读者 + context，单次记忆负担不超过 7 个。
 
@@ -116,7 +118,7 @@ MFS 有**两个独立的配置文件**，各自负责不同身份的设置：
 
 | 文件 | 路径 | 内容 | 谁读 |
 |---|---|---|---|
-| client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token、workspace_id | `mfs` CLI |
+| client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token | `mfs` CLI |
 | server 配置 | `~/.mfs/server.toml`（本地 daemon）<br>`/etc/mfs/server.toml`（远端部署） | metadata backend / object_store / milvus / worker / embedding / chunker / cache / summary / vlm | `mfs-server` |
 
 只装 CLI（`mfs` binary）的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
@@ -205,7 +207,6 @@ api_base_url = "http://127.0.0.1:8765"
 name = "prod"
 api_base_url = "https://mfs.example.com"
 credential_ref = "env:MFS_API_TOKEN"
-workspace = "acme-corp"           # 多 workspace 场景
 ```
 
 不需要写 `kind` 字段，CLI 跟 server 握手时自动判断 `is_local`，结果缓存到 client.toml。
@@ -213,31 +214,31 @@ workspace = "acme-corp"           # 多 workspace 场景
 profile 管理：
 
 ```bash
-mfs profile add <name> --url <url> [--workspace <id>]
+mfs profile add <name> --url <url>
 mfs profile use <name>
 mfs profile list
 mfs profile status               # 显示当前 profile 是否本地（machine-id 比对结果）
 ```
 
-### 多 workspace 走 profile 层
+### 多租户走 profile 层（v0.5+）
 
-`workspace` 放在 **profile 上**，不放 URI 里。connector URI 永远保持纯净（`postgres://prod`）。HTTP transport 自动按当前 profile 注入 `X-MFS-Workspace: <workspace>` header；server 端按这个 filter 数据，server schema 内部用 `workspace_id` 列名。
+v0.4 server 端只有一个隐式 `default` namespace，client 不需要任何租户配置。
+
+v0.5+ 引入多 namespace 后，namespace 选择**由 token 决定**——一个 token 在 server 端绑定一个或多个 namespace 的访问权限（详见 [§9](#9-多租户与-namespace-设计)）。client 端 profile 不需要新增字段，**用户通过切换 profile（= 换 token）切换租户**：
 
 ```toml
 [[profiles]]
 name = "acme-corp-prod"
 api_base_url = "https://mfs.example.com"
-workspace = "acme-corp"
-credential_ref = "env:MFS_TOKEN_ACME"
+credential_ref = "env:MFS_TOKEN_ACME"     # token 绑定 acme-corp 的 namespace
 
 [[profiles]]
 name = "globex-corp-prod"
 api_base_url = "https://mfs.example.com"
-workspace = "globex-corp"
-credential_ref = "env:MFS_TOKEN_GLOBEX"
+credential_ref = "env:MFS_TOKEN_GLOBEX"   # token 绑定 globex-corp 的 namespace
 ```
 
-`mfs profile use acme-corp-prod` 切换 = 切租户。同一台 client 可注册多个租户的 profile，按名字切换。
+`mfs profile use acme-corp-prod` 切换 = 切租户。同一台 client 可注册多个租户的 profile，按名字切换。connector URI 永远保持纯净（`postgres://prod`），不带租户信息。
 
 CLI 请求头：
 
@@ -757,18 +758,18 @@ Schema:
 ```sql
 connectors (
   id              VARCHAR PRIMARY KEY,
-  workspace_id       VARCHAR DEFAULT 'default',
+  namespace_id    VARCHAR DEFAULT 'default',   -- 物理分区主键；v0.4 恒为 'default'
   root_uri        VARCHAR,
   type            VARCHAR,
   label           VARCHAR,
-  status          VARCHAR DEFAULT 'active',   -- 'active' | 'removing'
+  status          VARCHAR DEFAULT 'active',    -- 'active' | 'removing'
   config_json     TEXT,
   config_hash     VARCHAR,
   credential_ref  VARCHAR,
   registered_at   TIMESTAMP,
   last_health     TIMESTAMP,
   health_status   VARCHAR,
-  UNIQUE (workspace_id, root_uri)
+  UNIQUE (namespace_id, root_uri)
 );
 
 objects (
@@ -801,7 +802,7 @@ caches (
 -- ===== Job 队列：统一所有 connector op =====
 connector_jobs (
   id                    VARCHAR PRIMARY KEY,
-  workspace_id             VARCHAR DEFAULT 'default',
+  namespace_id          VARCHAR DEFAULT 'default',
   connector_id          VARCHAR REFERENCES connectors(id),
   op_kind               VARCHAR,        -- 'sync' | 'force_sync' | 'remove' | 'update_config'
   trigger               VARCHAR,        -- 'manual' | 'scheduled' | 'watch'
@@ -868,7 +869,7 @@ upload_staging (                            -- 当前未 commit 的临时 upload
 );
 ```
 
-注意所有顶层表都预留 `workspace_id` 字段，默认 `'default'`，便于未来加多租户。
+所有顶层表都以 `namespace_id` 作为物理分区主键（v0.4 恒为 `'default'`）。Workspace / User / Project 等组织概念通过 mapping 表实现，**底层 schema 不动**——详见 [§9](#9-多租户与-namespace-设计)。
 
 ### 6.2 Object store (cache + upload staging)
 
@@ -951,7 +952,7 @@ eviction = "lru"
 max_bundle_size_mb = 500             # 单 bundle 上限；超过用独立单文件 PUT
 staging_path = "uploads/"            # object store 下的 staging 子路径
 staging_expiry_hours = 1             # 未 commit 的 staging zip 多久过期清理
-per_workspace_quota_gb = 0           # 0 = 不限；多 workspace 部署可设
+per_namespace_quota_gb = 0           # 0 = 不限；多租户部署可按 namespace 设
 ```
 
 ### 6.3 Milvus
@@ -997,7 +998,7 @@ uri = "~/.mfs/milvus.db"               # 默认 Lite（个人本机）
 # uri = "https://xxx.zillizcloud.com"  # CS / 商业化
 # token = "..."
 # uri = "http://localhost:19530"       # 自部署（不推荐，运维负担重）
-collection_strategy = "single"          # single | per_connector | per_workspace
+collection_strategy = "single"          # single | per_connector | per_namespace
 ```
 
 ## 7. 凭据与认证
@@ -1116,38 +1117,113 @@ helm install mfs ./charts/mfs \
   --set metadata.type=postgres
 ```
 
-## 9. 多租户预留
+## 9. 多租户与 namespace 设计
 
-v0.4 **不实现多租户**，但 schema 全部预留。多租户指**一个 MFS 实例服务多个 organization / workspace**——每个租户的数据完全物理隔离。
+### 9.1 核心决策：物理分区 ≠ 组织结构
 
-### 预留点
+借鉴 AWS（Account vs Organization）、GCP（Project vs Folder）、K8s（Namespace vs Project）的分层思路——**数据隔离边界和组织结构语义解耦**：
 
-- Metadata DB 所有顶层表加 `workspace_id` 字段（默认 `"default"`）
-- Milvus `mfs_chunks` 表加 `workspace_id` scalar field（默认 `"default"`）
-- 所有 query 默认 filter `workspace_id = current_workspace`
-- HTTP header 预留 `X-MFS-Workspace`（v0.4 忽略；多租户启用后由 profile 的 `workspace_id` 自动注入）
-- Profile 配置已支持 `workspace_id` 字段（v0.4 写了不报错，server 端忽略；启用多租户后生效）
+- **底层**：`namespace_id` 是唯一的物理分区主键。所有 DB 表 / Milvus partition / object store prefix 都按它切。namespace 是稳定的、不可重组的。
+- **上层**：Workspace / User / Project / Team 是产品概念，通过 **mapping 表**指向 namespace。组织关系演化（个人 → 团队、跨 workspace 共享）只改 mapping，**底层数据零迁移**。
 
-### 未来启用方案
+> 用户视角看不到 `namespace` 这个词——它纯粹是 server 内部的物理分区主键。对外暴露的概念（v0.5+ 引入）是 Workspace / User。
 
-启用时 Milvus 隔离方案（按隔离强度排序）：
+### 9.2 v0.4：单 namespace，零配置
 
-| 策略 | Milvus 实现 | 隔离强度 | 资源开销 |
-|---|---|---|---|
-| metadata filter | 共用 collection，每行带 `workspace_id`，查询时 filter | 弱（依赖 query 正确性） | 最小 |
-| partition by tenant | collection 内按 tenant 分 partition | 中 | 中 |
-| collection per tenant | 每 tenant 一张 collection | 强 | 大 |
-| database per tenant | 每 tenant 一个 Milvus database（2.4+） | 最强 | 最大 |
+v0.4 server 启动时自动创建一个 `default` namespace。所有数据写入都带 `namespace_id = "default"`，所有查询都 filter `namespace_id = "default"`。用户感知不到任何租户概念。
 
-推荐路径：v1.0 加多租户时切到 **collection per tenant**（`[milvus] collection_strategy = "per_tenant"`），通过迁移工具从 single → per_tenant。
+CLI 端：
 
-### 数据量大时的策略
+- `client.toml` profile 没有租户字段
+- HTTP 请求不带租户 header
+- token 隐式绑定 `default` namespace（本机模式 token 通常省略）
+
+### 9.3 v0.5+：加 Workspace + User mapping
+
+v0.5 引入认证 + 多租户时，**底层 namespace schema 不动**，只新增 mapping 表：
+
+```sql
+-- v0.5+ 新增表
+users (
+  id            VARCHAR PRIMARY KEY,
+  email         VARCHAR UNIQUE,
+  created_at    TIMESTAMP
+);
+
+workspaces (
+  id            VARCHAR PRIMARY KEY,
+  name          VARCHAR,
+  billing_id    VARCHAR,
+  created_at    TIMESTAMP
+);
+
+workspace_members (
+  workspace_id  VARCHAR REFERENCES workspaces(id),
+  user_id       VARCHAR REFERENCES users(id),
+  role          VARCHAR,       -- 'owner' | 'member' | 'viewer'
+  PRIMARY KEY (workspace_id, user_id)
+);
+
+-- mapping：namespace 归属
+workspace_namespaces (
+  workspace_id  VARCHAR REFERENCES workspaces(id),
+  namespace_id  VARCHAR REFERENCES namespaces(id),
+  PRIMARY KEY (workspace_id, namespace_id)
+);
+
+user_namespaces (
+  user_id       VARCHAR REFERENCES users(id),
+  namespace_id  VARCHAR REFERENCES namespaces(id),
+  role          VARCHAR,
+  PRIMARY KEY (user_id, namespace_id)
+);
+
+-- v0.4 已存在但 v0.5 才用 user_id
+namespaces (
+  id            VARCHAR PRIMARY KEY,    -- UUID
+  slug          VARCHAR UNIQUE,         -- 内部识别用
+  created_at    TIMESTAMP
+);
+```
+
+请求作用域解析：
+
+```
+token → user_id → 该 user 能访问的 namespace_id 集合
+  ↓
+所有 query: WHERE namespace_id IN (resolved_set)
+```
+
+### 9.4 这套设计能拼出来的产品形态
+
+| 产品概念 | mapping 表达 |
+|---|---|
+| 个人空间 | `user_namespaces (1:1)` |
+| 团队 workspace | `workspace_namespaces (1:1)` + `workspace_members` |
+| 一个 workspace 下多 project | `workspace_namespaces (1:N)`，每个 project 一个 namespace |
+| 跨 workspace 共享数据 | 同一 namespace_id 出现在多个 `workspace_namespaces` 行 |
+| 个人迁到团队 | 把 namespace 从 `user_namespaces` 移到 `workspace_namespaces`——**数据零迁移** |
+
+### 9.5 Milvus 隔离策略
+
+namespace 默认在 Milvus 层用 scalar filter (`namespace_id IN (...)`)。**当某个 namespace 数据量大或需要更强隔离**时，可按 `collection_strategy` 升级：
+
+| 策略 | Milvus 实现 | 隔离强度 | 资源开销 | 适用 |
+|---|---|---|---|---|
+| `single` (默认) | 一张 collection，按 `namespace_id` scalar filter | 弱 | 最小 | v0.4 / 小规模 |
+| `per_connector` | 一 connector 一张 collection | 中（连同 namespace filter） | 中 | 数据量大时按 connector 切 |
+| `per_namespace` | 一 namespace 一张 collection | 强 | 大 | 多租户强隔离 / 合规要求 |
+| `database_per_namespace` | 一 namespace 一 Milvus database | 最强 | 最大 | enterprise 合规 |
+
+切换 strategy 通过迁移工具完成（roadmap）。
+
+### 9.6 数据量分层策略
 
 | 量级 | 策略 |
 |---|---|
-| < 几百万 chunks | 默认 single collection 够 |
-| 几千万 chunks | 调 Milvus shard / 升级 HNSW 参数；考虑分 partition |
-| 亿级 chunks | 切 `per_connector` 或 `per_tenant` collection；冷热分层 |
+| < 几百万 chunks | 默认 `single` collection 够 |
+| 几千万 chunks | 调 Milvus shard / HNSW 参数；考虑分 partition |
+| 亿级 chunks | 切 `per_connector` 或 `per_namespace` collection；冷热分层 |
 
 ## 10. 发布与分发
 
@@ -1424,7 +1500,7 @@ GitHub Actions 自动跑：
 - JSON envelope。
 - connector URI 与对象命名约定（带 media type 后缀）。
 - connector TOML + chunk_kind 枚举 + locator schema。
-- Milvus collection schema（含 `workspace_id` 多租户预留字段）。
+- Milvus collection schema（含 `namespace_id` 分区主键字段）。
 - server image entrypoint。
 
 CLI/server 兼容关系写入 release note：
