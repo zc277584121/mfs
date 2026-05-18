@@ -16,7 +16,7 @@ MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名�
 | `mfs tree <path-or-uri>` | 树状浏览 |
 | `mfs cat <path-or-uri>` | 读取对象；大对象拒绝并提示 head/tail/range/export |
 | `mfs head <path-or-uri>` | 前 N 行/记录 |
-| `mfs tail <path-or-uri>` | 后 N 行/记录；`-f` 跟随 append-only |
+| `mfs tail <path-or-uri>` | 后 N 行/记录（v0.4 不支持 `-f` 流式跟随） |
 | `mfs export <path-or-uri> <file>` | 把对象写到本地文件 |
 | `mfs remove <path-or-uri>` | 注销 connector + 删 chunks / cache / state（destructive，默认 confirm） |
 
@@ -254,12 +254,11 @@ W/H/D 参数同样规则。
 ```bash
 mfs head -n 20 postgres://prod/public/tickets/rows.jsonl
 mfs tail -n 50 s3://logs/app/2026-05-10.jsonl
-mfs tail -f slack://eng/channels/incidents/today/messages.jsonl
 mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
 ```
 
 - `head -n N` / `tail -n N` 无状态。
-- `tail -f` 用 SSE / chunked stream，仅 connector 声明 `efficient_tail=true` 时可用。
+- v0.4 **不支持 `-f` 流式跟随**——流式跟随需要每个 connector 单独实现 push/poll 通道，工程成本高、受益场景窄。需要监控类用例可以脚本化 `mfs add <uri>` 周期同步 + `mfs head -n N` 看快照。
 - `export` 把对象完整写到本地文件——大对象遍历的标准做法。
 
 ## 9. Status 是统一状态入口
@@ -466,7 +465,6 @@ JSON：
 | `object_too_large_for_cat` | cat 大对象未带 `--range` |
 | `is_directory` | 对目录 cat |
 | `connector_unhealthy` | connector healthcheck 失败 |
-| `tail_unsupported` | connector 不支持 `tail -f` |
 | `density_unsupported` | 对结构化对象用 `--peek/--skim/--deep` |
 | `chunk_max_exceeded` | 该对象超过 `chunk_max`，部分索引 |
 | `local_server_unavailable` | local profile 但本机 server 进程不可达 |

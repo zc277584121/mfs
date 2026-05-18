@@ -123,7 +123,7 @@ slack://eng
 - cursor 是 stateful 复杂度，agent 难管，token 过期 / 兼容性问题多。
 - 真要遍历大对象用 `mfs export` 物化到本地再处理。
 - 大对象过滤用 `mfs grep`（server-side pushdown），不需要全量拉回。
-- 增量数据用 `tail -f`，不是 cursor。
+- 增量数据走"周期 `mfs add <uri>` + `mfs head -n N` 看快照"，v0.4 不做流式跟随。
 - DB query 结果不稳定靠 `export` 物化解决。
 
 ### 4.2 统一接口
@@ -131,7 +131,6 @@ slack://eng
 ```bash
 mfs head -n N <uri>          # 固定前 N 行/记录，无状态
 mfs tail -n N <uri>          # 固定后 N 行/记录，无状态
-mfs tail -f <uri>            # 流式跟随，仅 append-only connector
 mfs cat <uri>                # 完整对象；大对象拒绝并提示
 mfs cat <uri> --range A:B    # 按行/记录区间读取
 mfs export <uri> <file>      # 完整导出到本地
@@ -283,27 +282,26 @@ use head/tail/cat --range instead:
 
 W/H/D 参数同样规则。
 
-## 9. tail -f 流式跟随
+## 9. v0.4 不支持流式跟随 (`tail -f`)
+
+`tail -f` 不在 v0.4 范围。理由：
+
+- 实现一个真正有用的 `tail -f` 需要每个 connector 单独搭 push/poll 通道（slack events / discord WS / fs watcher / s3 list polling / DB CDC ...），工程成本高
+- 受益场景窄——日志监控、聊天跟随只是少数场景
+- 退化为"周期轮询"的伪流式没多大价值
+
+替代做法：
 
 ```bash
-mfs tail -f slack://eng/channels/incidents/today/messages.jsonl
-mfs tail -f s3://logs/app/today.jsonl
+# 周期同步 + 看快照
+mfs add slack://eng                              # 触发增量同步
+mfs head -n 50 slack://eng/.../messages.jsonl    # 看最新一批
+
+# 用 cron / watch 命令自己包一层
+watch -n 30 'mfs add slack://eng && mfs head -n 50 slack://eng/...'
 ```
 
-行为：
-
-- 只有声明 `efficient_tail = true` 的 connector 支持。
-- 服务端用 SSE（Server-Sent Events）或 chunked HTTP 推送增量记录。
-- 客户端 Ctrl+C 终止。
-- 不支持的对象返回 `tail_unsupported`：
-
-  ```text
-  tail -f not supported for: postgres://prod/public/tickets/rows.jsonl
-  Reason: postgres connector does not implement efficient_tail.
-  try:
-    mfs add postgres://prod          # incremental sync
-    mfs head -n 20 ...               # snapshot of head
-  ```
+之后视用户呼声决定是否在 v0.5+ 引入。届时优先支持 file connector 和 slack/discord 这种自带 push 的源。
 
 ## 10. Cache 层细节
 
@@ -400,13 +398,14 @@ mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
 jq 'select(.priority == "high")' ./tickets.jsonl | wc -l
 ```
 
-### 场景：跟随今天的 incidents 频道
+### 场景：周期跟随今天的 incidents 频道
 
 ```bash
 mfs tree slack://eng/channels -L 1                # 看有哪些频道
 mfs ls slack://eng/channels/incidents__C02         # 看分了哪些日期
-mfs head -n 10 slack://eng/channels/incidents__C02/today/messages.jsonl
-mfs tail -f slack://eng/channels/incidents__C02/today/messages.jsonl
+
+# 周期同步 + 看最新（v0.4 不内置 tail -f）
+watch -n 60 'mfs add slack://eng && mfs head -n 20 slack://eng/channels/incidents__C02/today/messages.jsonl'
 ```
 
 ### 场景：在 ./repo 里找 ERR_TOKEN_EXPIRED 怎么处理

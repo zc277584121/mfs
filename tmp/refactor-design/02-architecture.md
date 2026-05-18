@@ -14,7 +14,7 @@
 │  │ HTTP transport      │   profile.kind = local | remote            │
 │  └─────────┬──────────┘                                             │
 └────────────┼────────────────────────────────────────────────────────┘
-             │ HTTP /v1 (control plane only; SSE for tail -f)
+             │ HTTP /v1 (control plane only)
              v
 ┌─────────────────────────── Server side ────────────────────────────┐
 │  ┌──────────────────────────────────────────────────────────────┐  │
@@ -46,7 +46,8 @@
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │ Worker queue                                                 │  │
-│  │   local: SQLite queue       remote: Redis/Postgres queue     │  │
+│  │   DB-backed: SQLite (local) or Postgres (remote)             │  │
+│  │   SELECT ... FOR UPDATE SKIP LOCKED 取 task                 │  │
 │  └────────────┬─────────────────────────────────────────────────┘  │
 │               v                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
@@ -233,10 +234,6 @@ server 拿到 bytes 后跑标准 chunk pipeline
 ```
 
 这是唯一需要 client→server 传 data plane 的场景。v0.4 推荐的做法是**在 server 那台机器装 daemon，把本地文件放到 server 看得到的位置**，或者用 `kind=local` profile + 本机 daemon。
-
-### tail -f 是 server → client 的 data plane
-
-唯一例外：`mfs tail -f` 通过 SSE / chunked HTTP 把新增 record 推给 client。这是单向 control 触发 + 数据流，不构成"client 上传数据"。
 
 ## 4. 四种行为矩阵
 

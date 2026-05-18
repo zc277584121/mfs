@@ -15,7 +15,7 @@ Layer 0 (必须)
 Layer 1 (可选下推)
   grep_pushdown / search_pushdown / follow
   ─► 不实现 → framework 走 Layer 0 fallback
-  ─► 想要 SQL ILIKE 下推、provider search API、tail -f 时加
+  ─► 想要 SQL ILIKE 下推、provider search API 时加
   ─► +200-500 行
 
 Layer 2 (可选高级)
@@ -119,10 +119,6 @@ class ConnectorPlugin(ABC):
     ) -> AsyncIterator[Hit] | None:
         return None
 
-    async def follow(self, path: str) -> AsyncIterator[bytes] | None:
-        """tail -f 实现；不支持返回 None。"""
-        return None
-
     # ─────── Layer 2：可选高级 ─────────────────────────
     def chunk_overrides(self, path: str) -> dict | None:
         """覆盖 framework 默认 chunk strategy/preset。
@@ -155,7 +151,6 @@ class Capabilities:
     # object access
     grep_pushdown: bool = False
     search_pushdown: bool = False
-    efficient_tail: bool = False
     paged_cat: bool = True               # 是否支持 --range
     permission_snapshot: bool = False
 ```
@@ -260,7 +255,6 @@ class ExamplePlugin(ConnectorPlugin):
     CONFIG_SCHEMA = ExampleConfig
     CAPABILITIES = Capabilities(
         grep_pushdown=False,
-        efficient_tail=False,
         paged_cat=True,
     )
 

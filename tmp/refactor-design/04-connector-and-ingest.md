@@ -309,7 +309,7 @@ mfs add <target>
 | profile.kind | queue 位置 | worker |
 |---|---|---|
 | `local` | daemon 内 SQLite queue | daemon 内 worker pool |
-| `remote` | 服务端 Redis/Postgres queue | `mfs-worker` 进程 |
+| `remote` | server 侧 Postgres queue（同 metadata DB） | `mfs-worker` 进程 |
 
 数据流向：HTTP 只走 control plane（path / option / status），数据（文件 bytes、记录内容、chunk 文本）都在 server 内部完成。详见 [02-architecture.md §3](02-architecture.md#3-control-plane-vs-data-plane).
 
@@ -586,7 +586,6 @@ Continue? [y/N]
   },
   "object": {
     "grep_pushdown": true,
-    "efficient_tail": false,
     "paged_cat": true,
     "permission_snapshot": false
   },
@@ -597,7 +596,7 @@ Continue? [y/N]
 }
 ```
 
-framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL ILIKE，否则走线性扫；`efficient_tail=true` 才允许 `tail -f`。
+framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL ILIKE，否则走线性扫；`paged_cat=true` 才允许 `cat --range`。
 
 ## 10. Sync 策略矩阵
 

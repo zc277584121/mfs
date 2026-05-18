@@ -9,7 +9,7 @@ MFS 是 **Multi-source File-like Search**：让 agent 用一套 shell-native CLI
 
 一句话：
 
-> MFS lets agents search and inspect local files, repos, cloud docs, chats, tickets, databases, SaaS records, and web pages through one shell-native CLI. No mount, no SDK — just a binary on `$PATH`.
+> MFS lets agents search and inspect local files, repos, cloud docs, chats, tickets, databases, SaaS records, and web pages through one shell-native CLI. Shell-first — agents drive it via plain commands; SDKs (Python / TypeScript / Go / Java) are available when you need programmatic access.
 
 ## 四个核心抽象
 
@@ -88,7 +88,7 @@ mfs add <connector-uri>              已注册：再同步一次
 
 mfs ls / tree <path-or-uri>          浏览结构
 mfs cat <path-or-uri>                读取对象（大对象拒绝，提示用 head/tail/range）
-mfs head -n N / tail -n N            看端点；tail -f 跟随 append-only
+mfs head -n N / tail -n N            看端点
 mfs cat <uri> --range A:B            按行/记录区间
 mfs export <uri> <file>              完整导出到本地
 

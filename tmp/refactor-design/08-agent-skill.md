@@ -74,11 +74,12 @@ mfs cat linear://product/teams/Pricing/issues.jsonl
 mfs grep '"id":"LIN-88"' linear://product/teams/Pricing/issues.jsonl
 ```
 
-### 工作流 D：跟随实时数据流
+### 工作流 D：周期跟随数据（v0.4 不内置 tail -f）
 
 ```bash
-mfs tail -f slack://eng/channels/incidents/today/messages.jsonl
-mfs tail -f s3://logs/app/today.jsonl
+# 周期同步 + 看快照
+watch -n 60 'mfs add slack://eng && mfs head -n 20 slack://eng/.../today/messages.jsonl'
+watch -n 60 'mfs add s3://logs && mfs head -n 50 s3://logs/app/today.jsonl'
 ```
 
 ## 3. 怎么解读返回结果
@@ -165,7 +166,6 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 | `sync_already_running` | 同 connector 正在 sync | `mfs status <uri>` 看进度，或 `mfs job cancel` |
 | `connector_removing` | connector 正在 remove | 等清理完，或换 connector |
 | `connector_unhealthy` | connector 连不上 | 看 error.details；用户层凭据问题 |
-| `tail_unsupported` | connector 不支持 tail -f | 用 `head -n N` 拿快照 |
 | `density_unsupported` | 结构化对象不能用 `--peek/--skim/--deep` | 改用 `head` |
 | `since_unsupported` | connector 不支持 `--since` | 去掉 `--since`，直接 `mfs add` |
 | `range_unsupported` | 二进制对象不支持 `--range` | 用 `head -c` 字节或 `export` |
@@ -205,12 +205,11 @@ mfs stat <uri> --json                   # 单个对象的 capabilities (cat / gr
 {
   "cat": "denied_unless_range",
   "grep": "pushdown",
-  "tail": false,
   "range": true
 }
 ```
 
-agent 看到 `cat="denied_unless_range"` 就不要直接 cat，直接走 head 或 range。看到 `tail=false` 就不要试 `tail -f`。
+agent 看到 `cat="denied_unless_range"` 就不要直接 cat，直接走 head 或 range。看到 `grep="pushdown"` 就用 `mfs grep` 让 server 下推 SQL/API。
 
 这种动态发现让 agent **跟着新 connector 自动适应**——不用每加一个 source 就改 skill 文件。
 
