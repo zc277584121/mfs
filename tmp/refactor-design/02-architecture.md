@@ -453,10 +453,23 @@ DB 队列不阻止 batch，关键是 **batching layer** 显式分两层放：
 
 **第一层：worker 一次拉 N 个 task**（减少 DB round-trip + Milvus batch INSERT）
 
+worker 从 DB 拉 task 时**按 `priority` 升序**，相同 priority 按入队时间：
+
+```sql
+SELECT * FROM object_tasks
+WHERE status = 'pending' AND connector_job_id = $1
+ORDER BY priority ASC, started_at ASC NULLS FIRST
+FOR UPDATE SKIP LOCKED
+LIMIT $batch_size
+```
+
+`priority` 由 `connector.task_priority(change)` 在入队时一次性算出来写进 task 行——大多数 connector 默认 0（FIFO）。
+
 ```python
 async def worker_loop():
     while True:
         tasks = await db.fetch_pending(limit=BATCH_SIZE)   # SELECT ... FOR UPDATE SKIP LOCKED
+                                                            # ORDER BY priority ASC, started_at ASC
         if not tasks:
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
             continue
@@ -490,6 +503,31 @@ class BatchingEmbeddingClient:
 DataLoader pattern。embedding / summary / VLM 三类外部 API 都用这个模式。Milvus 不需要 client batcher（worker 显式 batch 写入）。
 
 **不引入 staging 表**（如 `chunks_pending`）。Staging 表会让 chunk lifecycle 从"object_task 内串行"变成"跨表状态机"，复杂度收益不值。
+
+#### Task 调度顺序：`priority` 列
+
+`object_tasks.priority` 列决定 worker 拉取顺序，**越小越先**。framework 在把 ObjectChange 入队时调一次 `connector.task_priority(change)` 算出 priority 写进 task 行，之后调度全靠 SQL `ORDER BY priority`。
+
+**默认行为**：connector 不重写 `task_priority` → 返回 0 → 整个 job 按入队顺序 (FIFO)。Postgres / Slack / GitHub 一般不需要重写——connector 产出 ObjectChange 的顺序（按表 / 按 channel 时间 / 按 issue 时间）本身就是有意义的。
+
+**file connector 重写它**，给关键文件更高优先级（值更小）：
+
+| 文件 / 路径特征 | 相对 priority |
+|---|---|
+| `README.md` / `CLAUDE.md` / `SKILL.md` / `INDEX.md` | 最先（-350） |
+| `pyproject.toml` / `package.json` / `Cargo.toml` / `go.mod` / ... | 很先（-260） |
+| `src/` / `lib/` / `app/` / `services/` 下 | 较先（-220） |
+| `docs/` / `guides/` 下 | 较先（-190） |
+| `tests/` / `fixtures/` 下 | 较后（+80） |
+| `dist/` / `build/` / `vendor/` / `generated/` 下 | 最后（+260） |
+
+**为什么需要这套规则**：
+
+1. **首屏可见**：用户 `mfs add .` 一个大 repo 后，sync 跑到 30% 时，README + 配置 + 核心源码已经索引完——agent 立刻能 `grep "ROUTING"` / `search "auth flow"` 拿到结果。如果先跑 tests / build artifacts，前半截 search 体感很差。
+2. **graceful degradation**：跑到一半挂了，至少关键文件已经索引；剩下没跑完的多半是 tests / generated，影响最小。
+3. **重跑顺序一致**：重试失败的 task 时，重要的还是先被重试——最快恢复"能搜到核心内容"的状态。
+
+**幂等性不依赖顺序**：chunk_id = `sha1(object_uri + locator + chunk_kind)`，跟处理顺序无关。priority 只影响**用户体感和调度便利性**，不影响正确性。
 
 ### 5.7 一致性三条规则
 
@@ -826,12 +864,13 @@ object_tasks (
   object_uri            VARCHAR,
   change_kind           VARCHAR,        -- 'added' | 'modified' | 'deleted'
   status                VARCHAR,        -- 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  priority              INTEGER DEFAULT 0,   -- 越小越先；connector.task_priority() 注入，默认 0 (FIFO)
   attempts              INTEGER DEFAULT 0,
   last_error            TEXT,
   started_at            TIMESTAMP,
   finished_at           TIMESTAMP,
-  INDEX (connector_job_id, status),
-  INDEX (status, started_at) WHERE status = 'running'   -- 心跳超时检测
+  INDEX (connector_job_id, status, priority),                -- worker 调度索引
+  INDEX (status, started_at) WHERE status = 'running'        -- 心跳超时检测
 );
 
 -- ===== Connector 内部 state =====

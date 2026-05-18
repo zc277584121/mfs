@@ -13,11 +13,12 @@ Connector 暴露两类方法：**必须实现**的 abstract method（不写就�
   object_kind_of                   ← 路径→object 类型映射
 
 可选重写（基类有默认；重写就走你的逻辑）
-  grep        — 默认线性扫；postgres/slack 可重写做下推
-  search      — 默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
-  chunk_plan  — 默认按 object_kind 推断；自定义 chunk strategy 时重写
-  render      — 默认按 media_type 渲染；Parquet/ORC 等特殊格式可重写
-  acl         — 默认 None；多租户 ACL 场景重写
+  grep          — 默认线性扫；postgres/slack 可重写做下推
+  search        — 默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
+  chunk_plan    — 默认按 object_kind 推断；自定义 chunk strategy 时重写
+  render        — 默认按 media_type 渲染；Parquet/ORC 等特殊格式可重写
+  task_priority — 默认 0 (FIFO)；有"首屏可见"诉求的 connector（如 file）可重写
+  acl           — 默认 None；多租户 ACL 场景重写
 ```
 
 写一个简单 connector**只实现 6 个 abstract method 就能跑**（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
@@ -132,6 +133,13 @@ class ConnectorPlugin(ABC):
     def render(self, path: str, media_type: str) -> str | None:
         """默认按 media_type 渲染（cat 输出）；Parquet/ORC 等可自定义。"""
         return None
+
+    def task_priority(self, change: ObjectChange) -> int:
+        """返回该 object_task 在队列里的优先级，越小越先处理。
+        默认 0 (FIFO within the job)。只有有"首屏可见"诉求的 connector
+        需要重写——例如 file connector 让 README / 配置 / src/ 先索引。
+        Postgres / Slack / GitHub 一般保留默认即可。"""
+        return 0
 
     async def acl(self, path: str) -> dict | None:
         """ACL 快照（多租户 enterprise 场景）。v0.4 暂不启用。"""
@@ -499,6 +507,7 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 | 暴露不在 PROMPT.md 描述里的 path | ❌ 暴露 = 文档化 |
 | 自定义 `namespace_id` 行为 | ❌ namespace_id 由 framework 注入 |
 | 在 `self.state` 里存任意 schema | ✅ schema 由 connector 自己定义（cursor / manifest / etag map 等），framework 不 introspect |
+| 通过 `task_priority` 控制 object 索引顺序 | ✅ 可选；返回 int，越小越先；不写默认 FIFO |
 
 ## 12. 写 connector 前的设计检查
 
