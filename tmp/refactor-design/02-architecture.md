@@ -72,6 +72,17 @@ MFS 有**两个独立的配置文件**，各自负责不同身份的设置：
 
 只装 `mfs-cli` 的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
 
+**server.toml 查找优先级**（第一个找到就用，不合并）：
+
+1. `--config <path>` 命令行参数
+2. `$MFS_SERVER_CONFIG` 环境变量
+3. `./server.toml`（当前 cwd，开发调试）
+4. `~/.mfs/server.toml`（个人本机）
+5. `/etc/mfs/server.toml`（系统部署）
+6. 内置默认值（兜底）
+
+`mfs serve start`（client wrapper）发现 `~/.mfs/server.toml` 不存在时自动生成最小默认配置；`mfs-server run`（运维直接用）找不到就报错退出。client.toml 用类似的查找顺序，没有第 5 项。
+
 下面分两个维度讨论 profile 和 server 后端——它们正交。
 
 ### 维度 A：client / server 是否共享文件系统（自动判断）
