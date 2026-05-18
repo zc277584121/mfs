@@ -2,30 +2,27 @@
 
 本文写给想给 MFS 加新 connector 的开发者。社区贡献的工作量目标：**约 500-1500 行 Python，集中在 `connectors/<name>/`**，按你实现到哪一层而定。
 
-## 0. 三层 opt-in 深度
+## 0. 必须实现 vs 可选重写
 
-Connector 实现是分层的。你可以**只写 Layer 0**做出能用的版本，需要性能/能力时再向上加。
+Connector 暴露两类方法：**必须实现**的 abstract method（不写就跑不起来），和**可选重写**的 method（基类有默认实现，重写就用你的）。
 
 ```
-Layer 0 (必须)
-  list / stat / read / fingerprint / change_set / object_kind_of
-  ─► framework 自动给你 cat / head / tail / grep（线性扫）/ search（如有 chunks）
-  ─► 约 500 行 Python，简单 connector 就够了
+必须实现（6 个 abstract method）
+  stat / list / read              ← 核心 IO
+  fingerprint / sync               ← 变化检测
+  object_kind_of                   ← 路径→object 类型映射
 
-Layer 1 (可选下推)
-  grep_pushdown / search_pushdown / follow
-  ─► 不实现 → framework 走 Layer 0 fallback
-  ─► 想要 SQL ILIKE 下推、provider search API 时加
-  ─► +200-500 行
-
-Layer 2 (可选高级)
-  chunk_overrides / custom_renderer / permission_snapshot
-  ─► 不实现 → framework 用默认
-  ─► 想自定义 chunk 拼接模板、特殊格式渲染、ACL 快照时加
-  ─► +200-500 行
+可选重写（基类有默认；重写就走你的逻辑）
+  grep        — 默认线性扫；postgres/slack 可重写做下推
+  search      — 默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
+  chunk_plan  — 默认按 object_kind 推断；自定义 chunk strategy 时重写
+  render      — 默认按 media_type 渲染；Parquet/ORC 等特殊格式可重写
+  acl         — 默认 None；多 workspace ACL 场景重写
 ```
 
-不暴露更深的扩展点（自定义 chunker、自定义 cache 格式、直接写 Milvus 等）——开太多 layer 会让 framework 难维护，也让贡献者负担过重。这些底层完全由 framework 接管。
+写一个简单 connector**只实现 6 个 abstract method 就能跑**（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
+
+不暴露更深的扩展点（自定义 chunker 内部、自定义 cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
 
 ## 1. 你需要写什么（vs 不需要写什么）
 
@@ -85,22 +82,28 @@ class ConnectorPlugin(ABC):
     async def close(self) -> None: ...
     async def healthcheck(self) -> HealthStatus: ...
 
-    # ─────── Layer 0：核心 IO（必须实现）───────────────────
+    # ─────── 必须实现：核心 IO（abstract method）───────────────
+    @abstractmethod
     async def stat(self, path: str) -> FileStat: ...
+    @abstractmethod
     async def list(self, path: str) -> list[Entry]: ...
+    @abstractmethod
     async def read(self, path: str, range: Range | None = None) -> bytes | AsyncIterator[bytes]: ...
 
-    # ─────── Layer 0：变化检测（必须实现）──────────────────
+    # ─────── 必须实现：变化检测（abstract method）──────────────
+    @abstractmethod
     async def fingerprint(self, path: str) -> str | None:
         """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。
         framework 用这个跟自己存的对比，决定 cache / chunk / embedding 哪层失效。"""
 
+    @abstractmethod
     async def sync(self) -> AsyncIterator[ObjectChange]:
         """同步：流式 yield 每个变化的 object。
         cursor / manifest / etag / state schema 都在 connector 内部，
         通过 self.state（KV store）持久化，framework 不 introspect。"""
 
-    # ─────── Layer 0：路径分类（必须实现）──────────────────
+    # ─────── 必须实现：路径分类（abstract method）──────────────
+    @abstractmethod
     def object_kind_of(self, path: str) -> ObjectKind:
         """把虚拟 path 映射到 object_kind。
         例：rows.jsonl → "table_rows"
@@ -108,32 +111,34 @@ class ConnectorPlugin(ABC):
             schema.json → "table_schema"
             真实 .md/.py/.png → 按扩展名"""
 
-    # ─────── Layer 1：可选下推（默认 None / False）─────────
-    async def grep_pushdown(
+    # ─────── 可选重写：基类有默认实现 ──────────────────
+    async def grep(
         self, pattern: str, path: str, options: GrepOptions
     ) -> AsyncIterator[GrepMatch] | None:
+        """默认走 framework 线性扫；postgres/slack 等可重写做下推。
+        返回 None = 用 framework default。"""
         return None
 
-    async def search_pushdown(
+    async def search(
         self, query: str, path: str, options: SearchOptions
     ) -> AsyncIterator[Hit] | None:
+        """默认 None = framework 走 Milvus 召回；某些 connector 可重写用 provider search API。"""
         return None
 
-    # ─────── Layer 2：可选高级 ─────────────────────────
-    def chunk_overrides(self, path: str) -> dict | None:
-        """覆盖 framework 默认 chunk strategy/preset。
-        90% 的 connector 不需要 override。"""
+    def chunk_plan(self, path: str) -> dict | None:
+        """默认按 object_kind 推断；自定义 chunk strategy/preset 时重写。"""
         return None
 
-    def custom_renderer(self, path: str, media_type: str) -> str | None:
-        """自定义 cat 渲染格式（例如 parquet → table）。
-        不实现 → framework 按 media_type 默认渲染。"""
+    def render(self, path: str, media_type: str) -> str | None:
+        """默认按 media_type 渲染（cat 输出）；Parquet/ORC 等可自定义。"""
         return None
 
-    async def permission_snapshot(self, path: str) -> dict | None:
-        """ACL 快照（多租户 enterprise 场景）。v0.4 暂不启用。"""
+    async def acl(self, path: str) -> dict | None:
+        """ACL 快照（多 workspace enterprise 场景）。v0.4 暂不启用。"""
         return None
 ```
+
+> **术语**：方法签名里的 `path: str` 是 **connector root 内的相对路径**（如 `/public/tickets/rows.jsonl`），不是完整 URI。framework 调用前已经剥掉 URI 的 scheme + alias 前缀。用户面看到的 `<uri>`（如 `postgres://prod/public/tickets/rows.jsonl`）和 connector 方法收到的 `path` 是两个层级，详见 [02-architecture.md §1 术语速览](02-architecture.md#术语速览)。
 
 `Capabilities`：
 
@@ -148,11 +153,11 @@ class Capabilities:
     full_scan: bool = True
     delete_detection: bool = True
 
-    # object access
-    grep_pushdown: bool = False
-    search_pushdown: bool = False
-    paged_cat: bool = True               # 是否支持 --range
-    permission_snapshot: bool = False
+    # object access（声明 connector 是否重写了对应方法、有更高效的实现）
+    grep_pushdown: bool = False          # 重写了 grep()，做 SQL ILIKE / provider search / S3 Select
+    search_pushdown: bool = False        # 重写了 search()，用 provider search API
+    paged_cat: bool = True               # 支持 cat --range 区间读取
+    acl: bool = False                    # 重写了 acl()，提供 ACL 快照
 ```
 
 `mfs connector inspect <root>` 直接 dump 这个。
@@ -255,7 +260,9 @@ class ExamplePlugin(ConnectorPlugin):
     CONFIG_SCHEMA = ExampleConfig
     CAPABILITIES = Capabilities(
         grep_pushdown=False,
+        search_pushdown=False,
         paged_cat=True,
+        acl=False,
     )
 
     def __init__(self, config, credential):

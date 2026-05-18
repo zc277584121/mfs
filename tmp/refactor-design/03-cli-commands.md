@@ -8,27 +8,39 @@ MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名�
 
 | 命令 | 作用 |
 | --- | --- |
-| `mfs add <path-or-uri>` | 注册并同步本地路径或外部 connector。**幂等**：再跑等于"再同步" |
+| `mfs add <uri>` | 注册并同步本地路径或外部 connector。**幂等**：再跑等于"再同步" |
 | `mfs status [<uri>]` | 看 daemon / profile / connector / freshness / job |
 | `mfs search <query> <path>` | 语义 + 关键词混合搜索 |
 | `mfs grep <pattern> <path>` | 精确搜索，能下推 connector 时下推 |
-| `mfs ls <path-or-uri>` | 列子节点 |
-| `mfs tree <path-or-uri>` | 树状浏览 |
-| `mfs cat <path-or-uri>` | 读取对象；大对象拒绝并提示 head/tail/range/export |
-| `mfs head <path-or-uri>` | 前 N 行/记录 |
-| `mfs tail <path-or-uri>` | 后 N 行/记录（v0.4 不支持 `-f` 流式跟随） |
-| `mfs export <path-or-uri> <file>` | 把对象写到本地文件 |
-| `mfs remove <path-or-uri>` | 注销 connector + 删 chunks / cache / state（destructive，默认 confirm） |
+| `mfs ls <uri>` | 列子节点 |
+| `mfs tree <uri>` | 树状浏览 |
+| `mfs cat <uri>` | 读取对象；大对象拒绝并提示 head/tail/range/export |
+| `mfs head <uri>` | 前 N 行/记录 |
+| `mfs tail <uri>` | 后 N 行/记录（v0.4 不支持 `-f` 流式跟随） |
+| `mfs export <uri> <file>` | 把对象写到本地文件 |
+| `mfs remove <uri>` | 注销 connector + 删 chunks / cache / state（destructive，默认 confirm） |
 
 ### 名词管理命令
 
 | 命令 | 子命令 |
 | --- | --- |
-| `mfs connector` | `list / inspect / update / remove` — 管理已注册 connector |
+| `mfs connector` | `add / probe / list / inspect / update / remove` — 注册和管理 connector |
 | `mfs profile` | `add / use / list / status` — client endpoint profile |
 | `mfs serve` | `start / stop / status / logs` — 本机起一个 server 进程 |
 | `mfs job` | `list / inspect / cancel` — 后台任务 |
 | `mfs config` | `show / set` — 查看与修改配置 |
+
+### URI 写法约定
+
+所有命令 `<uri>` 参数都是 connector URI。**本地路径是 file scheme URI 的简写**：
+
+| 用户写 | CLI 内部规范化 |
+|---|---|
+| `./repo` （相对路径） | `file:///<resolved-abs-path>/repo` |
+| `/abs/path` （绝对路径） | `file:///abs/path` |
+| `file:///abs/path` | 不变（标准 URI 形式） |
+| `file://./repo` | ❌ 报错（违反 URI 规范，相对路径不能跟 `file://` 一起用） |
+| `postgres://prod` 等 | 不变（按 scheme 路由到对应 connector） |
 
 ## 2. 设计原则
 
@@ -38,9 +50,24 @@ MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名�
 - **隐藏复杂度**：单条 issue / row / message 通过 `locator` 表达，不让用户构造伪路径。
 - **大对象有 guard**：`cat` 默认拒绝大对象并给替代建议。
 
-## 3. `mfs add` 是统一入口
+## 3. `mfs add` 是 `mfs connector add` 的高频别名
 
-`mfs add` 注册并同步一个 connector。**本地路径是 file connector**（scheme=`file`，用户写普通 path 即可，无需 `file://` 前缀）；外部 connector 首次需要 `--config <toml>`。命令是幂等的：再跑一次 = 再同步一次。
+所有"对 connector 的写操作"集中在 `mfs connector` 子树下；`mfs add` 是其中最高频的 `connector add` 的 **alias**（日常用）。其他 connector 操作（probe / list / inspect / update / remove）都直接走 `mfs connector` 子命令。
+
+```bash
+# 主入口（显式，所有操作齐全）
+mfs connector add <uri> [--config <toml>]      # 注册并同步
+mfs connector probe <uri> [--config <toml>]    # 试连接，不写状态
+mfs connector list
+mfs connector inspect <uri>
+mfs connector update <uri> --config <toml>
+mfs connector remove <uri>
+
+# 高频简写（仅注册 + 同步走 alias）
+mfs add <uri>                                  # alias = mfs connector add <uri>
+```
+
+`mfs add` 注册并同步一个 connector。**本地路径是 file scheme URI 的简写**（`./repo` 等价于 `file:///<resolved-abs-path>`，CLI 自动展开）；外部 connector 首次需要 `--config <toml>`。命令是幂等的：再跑一次 = 再同步一次。
 
 ```bash
 # 本地路径（file connector）
@@ -297,17 +324,24 @@ Search:  available
 
 ## 10. Connector / Profile / Daemon / Job 管理
 
-### `mfs connector`（管理类）
+### `mfs connector`（所有 connector 操作的主入口）
 
 ```bash
+# 注册并同步（也可用高频简写 mfs add）
+mfs connector add postgres://prod --config .mfs/connectors/prod-postgres.toml
+mfs connector add ./repo                                                   # 本地，CLI 自动转 file://
+
+# 试连接，不写任何状态
+mfs connector probe postgres://prod --config .mfs/connectors/prod-postgres.toml
+
+# 看 / 改 / 删
 mfs connector list
-mfs connector inspect postgres://prod                                     # 配置、能力声明、暴露的对象
-mfs connector probe postgres://prod --config .mfs/connectors/prod-postgres.toml   # 试连接，不写状态
+mfs connector inspect postgres://prod                                      # 配置、能力声明、暴露的对象
 mfs connector update postgres://prod --config .mfs/connectors/prod-postgres.toml
 mfs connector remove postgres://prod
 ```
 
-注册和同步走 `mfs add <uri> --config X`，不在这里。`probe` 用来在正式 `mfs add` 之前验证凭据和连通性。
+`mfs add <uri>` 是 `mfs connector add <uri>` 的 alias（日常用）。其他子命令没有 alias，因为使用频率低，直接走显式子命令更清楚。
 
 ### `mfs remove`（destructive，默认 confirm）
 

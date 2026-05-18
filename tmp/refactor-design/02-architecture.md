@@ -518,29 +518,48 @@ DB 队列没有传统 FIFO 的"出队"动作。任务靠 `status` 字段流转�
 pending → running → succeeded / failed / cancelled
 ```
 
-worker 只 `SELECT ... WHERE status='pending' FOR UPDATE SKIP LOCKED`，看不到 succeeded 行。succeeded 的 row 留在表里几天，供 `mfs job list` / `mfs job inspect` 查历史。
+worker 只 `SELECT ... WHERE status='pending' FOR UPDATE SKIP LOCKED`，看不到 succeeded 行。终态行（succeeded / failed / cancelled）留在表里几天，供 `mfs job list` / `mfs job inspect` 查历史。
 
-server 启动一个 housekeeping coroutine，每天清理过期行：
-
-```sql
-DELETE FROM connector_jobs
-WHERE status IN ('succeeded','failed','cancelled')
-  AND finished_at < now() - interval '30 days';
-
-DELETE FROM object_tasks
-WHERE connector_job_id IN (DELETE 的 jobs);
-```
-
-可配置：
+按 status 分级 retention（debug 用的失败任务保留更久）：
 
 ```toml
 # server.toml
-[jobs]
-retention_days = 30          # 完成 N 天后归档/删除
-archive_to = ""              # 可选：导出到 audit 表/文件再删（v0.4 不实现）
+[jobs.retention]
+succeeded_days = 7              # 成功的留 7 天
+failed_days = 30                # 失败的留 30 天（方便 debug）
+cancelled_days = 7              # 用户主动取消的留 7 天
+running_timeout_hours = 24      # running 超过 24h 视为僵尸，标 failed
 ```
 
-比 Redis 自动过期还简单（就是个 SQL DELETE）。不需要换队列后端。
+server 启动一个 housekeeping coroutine，每天跑两步：
+
+**步骤 1：把僵尸 running 标 failed**（worker 崩溃没及时清理 heartbeat 的）：
+
+```sql
+UPDATE connector_jobs
+SET status = 'failed',
+    error  = 'stale (heartbeat timeout)',
+    finished_at = now()
+WHERE status = 'running'
+  AND heartbeat < now() - interval '24 hours';
+```
+
+**步骤 2：按 status 分级删除（按 `finished_at` 过期）**：
+
+```sql
+DELETE FROM connector_jobs
+WHERE (status = 'succeeded' AND finished_at < now() - interval '7 days')
+   OR (status = 'failed'    AND finished_at < now() - interval '30 days')
+   OR (status = 'cancelled' AND finished_at < now() - interval '7 days');
+
+-- object_tasks 走外键 ON DELETE CASCADE 自动级联，或显式：
+DELETE FROM object_tasks
+WHERE connector_job_id NOT IN (SELECT id FROM connector_jobs);
+```
+
+为什么按 `finished_at` 而不是 `created_at`：长 sync 的 created_at 可能是 8 小时前，但完成才是历史归档的基准。
+
+比 Redis 自动过期还简单（就是个 SQL DELETE）。不构成换队列后端的理由。
 
 ### 5.9 重跑语义
 

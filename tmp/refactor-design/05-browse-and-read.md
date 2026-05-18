@@ -207,7 +207,7 @@ mfs grep "ERR_TIMEOUT" <path>
   ├─ 1. 解析 path → 拿到 object 元信息 + capabilities
   │
   ├─ 2a. capabilities.grep == "pushdown"：
-  │       connector.grep_pushdown(pattern, path) → 流式 yield matches
+  │       connector.grep(pattern, path) → 流式 yield matches（重写了下推实现）
   │       例：postgres → SQL ILIKE；slack → search.messages；s3 → S3 Select
   │
   ├─ 2b. object 在 Milvus 里（chunks 已建索引）且 --mode index：

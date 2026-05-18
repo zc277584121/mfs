@@ -177,9 +177,27 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 
 所有错误都有 `suggestions` 字段——优先按 suggestion 行动，不要试错。
 
-## 6. Skill 文件应该有什么
+## 6. Skill 目录结构
 
-写一个 `skill.md` / SKILL 文档给 agent 时，建议包含：
+MFS 发布一个 agent skill 包，结构如下：
+
+```
+skills/mfs/
+├── SKILL.md                      # 主体：心智模型 + 命令清单 + 工作流 + 反模式
+└── references/
+    ├── connectors/               # ⭐ 每个 connector 一份 PROMPT
+    │   ├── file.md               # ← 来自 connectors/file/PROMPT.md
+    │   ├── postgres.md           # ← 来自 connectors/postgres/PROMPT.md
+    │   ├── slack.md              # ← 来自 connectors/slack/PROMPT.md
+    │   ├── github.md
+    │   ├── web.md
+    │   └── ...                   # 所有已发布的 connector
+    ├── error-codes.md            # 错误码表（从 protocol/errors.md 生成）
+    ├── json-envelope.md          # JSON envelope schema 详解
+    └── workflows.md              # 工作流示例库
+```
+
+**`SKILL.md` 主体内容**：
 
 1. **MFS 是什么**（1 段）：file-like shell-native CLI，agent 直接用 shell 命令搜/读各种数据源
 2. **命令清单 + 用途**（一张表）：参考 [03-cli-commands.md](03-cli-commands.md)
@@ -187,9 +205,36 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 4. **结果 envelope** + 怎么从结果回到对象（本文 §3）
 5. **反模式列表**（本文 §4）
 6. **错误码处理**（本文 §5）
-7. **本 agent 配置的 connector 清单**（运行时 `mfs connector list --json` 注入）
+7. **指向 `references/connectors/<name>.md`**：agent 看到某 connector URI 就读对应的 reference 了解暴露的对象布局
 
-skill 文件不需要包含贡献者文档、架构文档——那些跟 agent 推理无关。
+### `mfs skill build` 自动收纳 connector PROMPT
+
+每个 connector 在自己目录里写 `PROMPT.md`（详见 [07-contributing-connector.md §5](07-contributing-connector.md#5-promptmd-范本)）。MFS 提供一个构建命令把这些 PROMPT 自动收纳到 skill 的 references 目录：
+
+```bash
+# CLI 内置子命令
+mfs skill build --output ./skills/mfs/
+
+# 实际做的事：
+# 1. 扫所有已注册的 ConnectorPlugin
+# 2. 把每个 connector 的 PROMPT.md → skills/mfs/references/connectors/<name>.md
+# 3. 把 protocol/errors.md → skills/mfs/references/error-codes.md
+# 4. 在 SKILL.md 里更新 connector 索引（哪些 connector 可用）
+```
+
+发布到 agent ecosystem 时，整个 `skills/mfs/` 作为一个包。Anthropic Skills / Cursor Rules / Cline 等都可以直接消费这种格式。
+
+### 运行时 query
+
+agent 即使没读 references 也能动态发现：
+
+```bash
+mfs connector list --json                       # 看哪些 connector 已注册
+mfs connector inspect <root> --json             # 看具体一个 connector 的 PROMPT + capabilities + 暴露的对象
+mfs stat <uri> --json                           # 看单个对象的 capabilities
+```
+
+`connector inspect` 返回的 PROMPT 字段就是 connector 的 `PROMPT.md` 内容——跟 skill references 里的同一份内容，运行时拉取作为兜底。
 
 ## 7. 让 agent 自己发现能力
 

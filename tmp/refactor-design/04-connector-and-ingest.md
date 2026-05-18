@@ -595,8 +595,9 @@ Continue? [y/N]
   },
   "object": {
     "grep_pushdown": true,
+    "search_pushdown": false,
     "paged_cat": true,
-    "permission_snapshot": false
+    "acl": false
   },
   "credentials": {
     "required": true,

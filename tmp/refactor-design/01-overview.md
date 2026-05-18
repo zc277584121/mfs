@@ -86,8 +86,8 @@ mfs add .                            注册并同步本地 file connector（小�
 mfs add <connector-uri> --config X   首次注册外部 connector（含估算 + confirm）
 mfs add <connector-uri>              已注册：再同步一次
 
-mfs ls / tree <path-or-uri>          浏览结构
-mfs cat <path-or-uri>                读取对象（大对象拒绝，提示用 head/tail/range）
+mfs ls / tree <uri>          浏览结构
+mfs cat <uri>                读取对象（大对象拒绝，提示用 head/tail/range）
 mfs head -n N / tail -n N            看端点
 mfs cat <uri> --range A:B            按行/记录区间
 mfs export <uri> <file>              完整导出到本地
@@ -125,7 +125,7 @@ mfs job list/inspect/cancel          看后台任务
 | 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、各类 path 布局、fingerprint、ingest 流程 | 用户、贡献者 |
 | 05 | [05-browse-and-read.md](05-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、cache、大对象 | 用户、agent skill 作者 |
 | 06 | [06-search-and-retrieval.md](06-search-and-retrieval.md) | Milvus schema、chunk_kind、locator、字段配置、preset、跨 partition 合并 | 用户（高级配置）、贡献者 |
-| 07 | [07-contributing-connector.md](07-contributing-connector.md) | connector 插件接口、骨架、对象命名规范、Layer 0/1/2 分层 | 贡献者 |
+| 07 | [07-contributing-connector.md](07-contributing-connector.md) | connector 插件接口、骨架、对象命名规范、必须实现 vs 可选重写 | 贡献者 |
 | 08 | [08-agent-skill.md](08-agent-skill.md) | 给 LLM agent skill 作者：工作流、envelope 解读、反模式、错误处理 | Skill 作者、prompt 工程师 |
 | —  | [18-project-structure-flow.html](18-project-structure-flow.html) | 可交互目录树和信息流（HTML） | 所有人 |
 
