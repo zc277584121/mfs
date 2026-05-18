@@ -11,7 +11,7 @@
 │        │     parse args · profile resolve · HTTP transport          │
 │        v                                                            │
 │  ┌────────────────────┐                                             │
-│  │ HTTP transport      │   profile.kind = local | remote            │
+│  │ HTTP transport      │   is_local: auto-detected by machine-id   │
 │  └─────────┬──────────┘                                             │
 └────────────┼────────────────────────────────────────────────────────┘
              │ HTTP /v1 (control plane only)
@@ -67,31 +67,41 @@ MFS 有**两个独立的配置文件**，各自负责不同身份的设置：
 
 | 文件 | 路径 | 内容 | 谁读 |
 |---|---|---|---|
-| client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token、tenant_id | `mfs` CLI |
+| client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token、workspace_id | `mfs` CLI |
 | server 配置 | `~/.mfs/server.toml`（本地 daemon）<br>`/etc/mfs/server.toml`（远端部署） | metadata backend / object_store / milvus / worker / embedding / chunker / cache / summary / vlm | `mfs-server` |
 
 只装 `mfs-cli` 的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
 
 下面分两个维度讨论 profile 和 server 后端——它们正交。
 
-### 维度 A：profile.kind（client / server contract）
+### 维度 A：client / server 是否共享文件系统（自动判断）
 
-`kind` 字段决定 **client 和 server 是否共享文件系统命名空间**：
+决定 **client 和 server 是否共享同一文件系统命名空间**——也决定本地路径请求是 server 直接读、还是走 upload 流。
 
-| kind | 含义 |
-|---|---|
-| `local` | CLI 进程和 daemon 共享同一文件系统命名空间；本地路径请求由 daemon 直接读文件 |
-| `remote` | 跨命名空间（跨网络 / 跨容器 / 跨用户）；本地路径请求返回 `remote_server_cannot_read_local_path` |
+**自动判断**：CLI 和 server 握手时比对 machine-id。**用户不需要手动配 `kind` 字段**。
 
-**以下场景不算 local，应该按 `remote` 处理**：
+```python
+# CLI 启动 / 首次连一个 profile 时
+client_machine_id = read_machine_id()     # /etc/machine-id (Linux/WSL) / ioreg (Mac) / registry (Windows)
+server_resp = await client.get(profile.url + "/v1/server/info")
+profile.is_local = (client_machine_id == server_resp["machine_id"])    # cached in client.toml
+```
 
-- daemon 跑在 Docker 容器，CLI 在 host（除非显式 bind mount 整个相关目录树）。
-- daemon 跑在 WSL，CLI 在 Windows host。
-- daemon 跑在 SSH 远端 box，CLI 在笔记本（即使 port forward 把 127.0.0.1 指过去）。
+各种场景自动判断结果：
+
+| 场景 | machine-id 比对 | 模式 |
+|---|---|---|
+| 同机 `mfs serve start` | 一致 | local（直接读本机） |
+| 远端 https server | 不一致 | remote（走 upload） |
+| Docker 容器（容器独立 machine-id） | 不一致 | remote |
+| WSL2（独立 machine-id） | 不一致 | remote |
+| SSH port forward | 不一致 | remote |
+
+**Override（极少用）**：调试 upload 流时 `export MFS_FORCE_REMOTE=1` 强制 remote。
 
 ### 维度 B：server 端存储后端
 
-跟 profile.kind 完全无关。server 端配置文件 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）决定用什么后端：
+跟 client / server 是否共享 fs 完全无关。server 端配置文件 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）决定用什么后端：
 
 ```toml
 [metadata]
@@ -109,15 +119,15 @@ uri = "~/.mfs/milvus.db"                  # 或 http://localhost:19530 / https:/
 
 ### 维度 A × 维度 B 自由组合
 
-| profile.kind | metadata | object_store | milvus | 说明 |
+| 是否共享 fs | metadata | object_store | milvus | 说明 |
 |---|---|---|---|---|
-| local | sqlite | local fs | Lite | 默认；个人本机最简 |
-| local | postgres | local fs | Lite | 个人开发，跟生产 metadata 一致 |
-| local | postgres | s3 | Zilliz | 个人 dogfood 生产配置 |
-| remote | postgres | s3 | Zilliz | 团队部署 |
-| remote | postgres | r2 | self-hosted | 自部署 |
+| 共享 | sqlite | local fs | Lite | 默认；个人本机最简 |
+| 共享 | postgres | local fs | Lite | 个人开发，跟生产 metadata 一致 |
+| 共享 | postgres | s3 | Zilliz | 个人 dogfood 生产配置 |
+| 不共享 | postgres | s3 | Zilliz | 团队部署 |
+| 不共享 | postgres | r2 | self-hosted | 自部署 |
 
-「本地 daemon 又想用 PG / S3 / Zilliz」完全 OK，改 daemon 配置即可。
+「本机 server 又想用 PG / S3 / Zilliz」完全 OK，改 server 配置即可。
 
 ### profile 配置
 
@@ -130,70 +140,44 @@ default_profile = "local"
 [[profiles]]
 name = "local"
 api_base_url = "http://127.0.0.1:8765"
-# kind 自动推断为 local；可省略
 
 [[profiles]]
 name = "prod"
 api_base_url = "https://mfs.example.com"
-# kind 自动推断为 remote
 credential_ref = "env:MFS_API_TOKEN"
-tenant_id = "tenant-a"      # 多租户场景
-
-[[profiles]]
-name = "docker-dev"
-api_base_url = "http://127.0.0.1:8765"
-kind = "remote"             # 显式覆盖：daemon 在 Docker，不共享文件系统
+workspace = "acme-corp"           # 多 workspace 场景
 ```
 
-### kind 字段自动推断
-
-`kind` 字段决定 path 处理逻辑，但 **99% 场景不用写**：
-
-| URL host | 默认 kind |
-|---|---|
-| `127.0.0.1`、`localhost`、`::1` | `local` |
-| 其他 | `remote` |
-
-需要 `--kind` 显式覆盖的边界场景：
-
-- daemon 跑在 Docker 容器，CLI 在 host
-- daemon 跑在 SSH 远端 box，CLI 端用 port forward 把 `127.0.0.1:8765` 转过去
-- daemon 跑在 WSL，CLI 在 Windows host
-
-```bash
-mfs profile add local --url http://127.0.0.1:8765                # 自动 local
-mfs profile add prod  --url https://mfs.example.com              # 自动 remote
-mfs profile add docker-dev --url http://127.0.0.1:8765 --kind remote   # 显式
-```
+不需要写 `kind` 字段，CLI 跟 server 握手时自动判断 `is_local`，结果缓存到 client.toml。
 
 profile 管理：
 
 ```bash
-mfs profile add <name> --url <url> [--kind local|remote] [--tenant <id>]
+mfs profile add <name> --url <url> [--workspace <id>]
 mfs profile use <name>
 mfs profile list
-mfs profile status
+mfs profile status               # 显示当前 profile 是否本地（machine-id 比对结果）
 ```
 
-### 多租户走 profile 层
+### 多 workspace 走 profile 层
 
-tenant_id 放在 **profile 上**，不放 URI 里。connector URI 永远保持纯净（`postgres://prod`）。HTTP transport 自动按当前 profile 注入 `X-MFS-Tenant: <tenant_id>` header；server 端按这个 filter 数据。
+`workspace` 放在 **profile 上**，不放 URI 里。connector URI 永远保持纯净（`postgres://prod`）。HTTP transport 自动按当前 profile 注入 `X-MFS-Workspace: <workspace>` header；server 端按这个 filter 数据，server schema 内部用 `workspace_id` 列名。
 
 ```toml
 [[profiles]]
-name = "tenant-a-prod"
+name = "acme-corp-prod"
 api_base_url = "https://mfs.example.com"
-tenant_id = "tenant-a"
-credential_ref = "env:MFS_TOKEN_A"
+workspace = "acme-corp"
+credential_ref = "env:MFS_TOKEN_ACME"
 
 [[profiles]]
-name = "tenant-b-prod"
+name = "globex-corp-prod"
 api_base_url = "https://mfs.example.com"
-tenant_id = "tenant-b"
-credential_ref = "env:MFS_TOKEN_B"
+workspace = "globex-corp"
+credential_ref = "env:MFS_TOKEN_GLOBEX"
 ```
 
-`mfs profile use tenant-a-prod` 切换 = 切租户。同一台 client 可注册多个租户的 profile，按名字切换。
+`mfs profile use acme-corp-prod` 切换 = 切租户。同一台 client 可注册多个租户的 profile，按名字切换。
 
 CLI 请求头：
 
@@ -205,44 +189,122 @@ MFS-API-Version: v1
 
 ## 3. Control plane vs data plane
 
-**HTTP API 只走 control plane**：path / option / status / 元数据 / 搜索结果。**数据本身**（文件 bytes、external system 拉取的记录、chunk 文本、embedding）**都在 server 内部流动**，不经过 client。
+**HTTP API 大部分走 control plane**（path / option / status / 元数据 / 搜索结果），数据在 server 内部流动。**唯一例外**是 remote profile 下处理本地文件——client 需要把 bytes 上传到 server，详见 §3.5。
 
 ### 同步场景的数据流
 
-| profile + 输入 | 数据流 | HTTP 传什么 |
-|---|---|---|
-| `local` + 本地路径 | daemon 直接读本机文件 → 内部 chunk → 内部写 Milvus | 仅 path + options |
-| `local` + 外部 URI | connector 调外部 API → 内部 chunk → 内部写 Milvus | 仅 URI + options |
-| `remote` + 本地路径 | **拒绝** (`remote_server_cannot_read_local_path`) | 错误码 |
-| `remote` + 外部 URI | 远端 server 调外部 API → server 内部 chunk → server 内部写 Milvus | 仅 URI + options |
+| 是否共享 fs | 输入 | 数据流 | HTTP 传什么 |
+|---|---|---|---|
+| 共享 fs | 本地路径 | server 直接读本机文件 → 内部 chunk → 内部写 Milvus | 仅 path + options |
+| 共享 fs | 外部 URI | connector 调外部 API → 内部 chunk → 内部写 Milvus | 仅 URI + options |
+| 不共享 | 本地路径 | client manifest diff → upload 变化的 bytes → server 处理 | **bytes**（§3.5） |
+| 不共享 | 外部 URI | 远端 server 调外部 API → server 内部 chunk → server 内部写 Milvus | 仅 URI + options |
 
-### Client 不需要传 chunk 级数据
+### 大部分场景 client 不传 bytes
 
-设计上 client 永远不需要做：
+除了 §3.5 的"本地文件 → remote server"这一条路径，其他场景 client 都不需要：
 
-- 算文件 hash 给 server 比对（server 在本地路径下自己读、自己 hash）
+- 算文件 hash 给 server 比对（server 自己读、自己 hash）
 - 拆 chunk 上传（chunk 是 server 内部产物）
 - 上传 embedding（embedder 在 server 内部）
 
-### 想用 remote server 处理本地文件？
+### 3.5 本地文件 upload flow（不共享 fs 场景）
 
-走显式 **upload API**（v0.4 不开放，归商业化）：
+当 client 和 server 不共享文件系统，`mfs add ./repo` 走 **manifest diff + zip bundle + temp_file_id + commit** 四步协议。
 
-```text
-client 算本地文件 hash → diff server 已有 hash → 只 upload 变化的 bytes
-server 拿到 bytes 后跑标准 chunk pipeline
+#### 协议四步
+
+```
+① client 端：scan + 本地 manifest cache (~/.mfs/clients/<server>/<connector>/manifest.db)
+              得到 current_paths（不含已删除的文件）
+
+② POST /v1/files/manifest
+   body: {
+     connector_uri: "file://<machine-id>/abs/path/repo",
+     paths: [{path, size, mtime_ns, sha1}, ...]
+   }
+   server 对照自己的 manifest（上次 commit 成功后的），返回:
+     {
+       missing:    [client 端新增的 path],
+       stale:      [client 端 hash 变了的 path],
+       extra:      [server 有但 client 没有的 path]     ← 这些是用户本地删了的
+     }
+
+③ client 把 missing + stale 文件打包成一个 zip bundle，发送：
+   PUT /v1/files/upload?connector_uri=...  (multipart, streaming)
+   body: <bundle.zip bytes>
+   返回: { temp_file_id }
+   server 把字节落到 staging area:
+     object_store://uploads/<connector_uri>/<temp_file_id>.zip
+
+④ POST /v1/files/commit
+   body: {
+     connector_uri,
+     temp_file_id,
+     deletions: [extra...]              ← server 删除这些 path 对应的所有数据
+   }
+   返回: { job_id }
+   
+   server 在 commit 处理里：
+     - 解压 staging zip 到 staging://files/<connector_uri>/
+     - 对每个 deletions[i]:
+         · 删 staging://files/.../<path>
+         · DELETE FROM mfs_chunks WHERE object_uri LIKE 'file://.../<path>%'
+         · DELETE FROM objects   WHERE object_uri = '...<path>'
+     - 触发 file connector sync（扫 staging area → chunk → embed → 写 Milvus）
+     - 更新 server-side manifest 为 client 提交的 paths
+     - bundle.zip 处理完删除（staging files 树保留作为 cache）
 ```
 
-这是唯一需要 client→server 传 data plane 的场景。v0.4 推荐的做法是**在 server 那台机器装 daemon，把本地文件放到 server 看得到的位置**，或者用 `kind=local` profile + 本机 daemon。
+#### 一致性契约
+
+**每次 `mfs add` 上传完成后，server 端 file connector 的状态（cache files + Milvus chunks + objects 表）与 client 端的目录树结构完全一致**：本地新增 / 修改 → 上传，本地删除 → 通过 commit deletions 同步删除。
+
+简单说：sync 后 server 的 file connector "看到的"目录树 = client 当前目录树。
+
+#### 海量小文件 / 巨大单文件
+
+- **海量小文件**：打包成 zip bundle 一次上传，HTTP roundtrip 数量恒定（不随文件数线性增长）。
+- **巨大单文件**：单文件 size 超过 `max_bundle_size_mb` 时**不打包**，独立 multipart streaming PUT。
+- 不做 chunk-level rsync / 断点续传（复杂度 vs v0.4 范围内的收益不划算）。
+- 大于 `max_bundle_size_mb` 单文件 server 端 staging path 独立。
+
+#### connector_uri 的构造
+
+client 端发的 `connector_uri` 形如 `file://<client-machine-id>/<abs-path>`。`<client-machine-id>` 是 client 端 machine-id，让多个 client 不会撞同一 alias。一个 `connector_uri` 一辈子绑定一个 client（v0.4 禁止"多 client 共写同一 connector"——避免 manifest race）。
+
+用户面仍然是 `mfs add ./repo`，CLI 自动规范化成 `file://...`。
+
+#### 错误恢复（简化版，先不考虑灾难）
+
+- ③ 上传到一半失败：bundle.zip 没传完，server 不写任何状态；下次 `mfs add` 重新 manifest diff + 上传
+- ④ commit 没成功：server staging zip 留着但没解压、deletions 未应用；下次 `mfs add` 会发现 client manifest 跟 server manifest 还不一致，重新走流程
+- 断网 / 中途挂等灾难恢复细节是 P2，v0.4 简化版即可
+
+#### Client 端的 manifest cache
+
+`~/.mfs/clients/<server-id>/<connector-uri-hash>/manifest.db`（SQLite）：
+
+```sql
+manifest (
+  path        VARCHAR PRIMARY KEY,
+  size        INTEGER,
+  mtime_ns    BIGINT,
+  sha1        VARCHAR,
+  last_seen   TIMESTAMP
+);
+```
+
+client 启动时不每次全量重 hash，只 stat 比对 `size + mtime_ns`，相等就复用旧 sha1。差不多 zero-overhead 的 incremental scan。
 
 ## 4. 四种行为矩阵
 
-| profile.kind | 输入类型 | 行为 |
+| 是否共享 fs | 输入类型 | 行为 |
 |---|---|---|
-| `local` | 本地路径 `./repo` | 支持。CLI/SDK 通过 HTTP 调本机 daemon，daemon 读本机文件 |
-| `local` | 外部 URI `postgres://prod` | 支持。connector 在本机 daemon 里跑，索引写本机存储 |
-| `remote` | 本地路径 `./repo` | 返回 `remote_server_cannot_read_local_path` |
-| `remote` | 外部 URI `postgres://prod` | 支持。connector 在远端 server/worker 里跑，索引写远端存储 |
+| 共享 | 本地路径 `./repo` | server 直接读本机文件，scan + chunk + 写 Milvus 都在 server 内部完成 |
+| 共享 | 外部 URI `postgres://prod` | connector 在 server 内执行，索引写本机存储 |
+| 不共享 | 本地路径 `./repo` | 走 upload flow（§3.5）：client manifest diff + zip bundle + commit |
+| 不共享 | 外部 URI `postgres://prod` | connector 在远端 server/worker 内执行，索引写远端存储 |
 
 ## 5. Server 端启动
 
@@ -579,7 +641,7 @@ Schema:
 ```sql
 connectors (
   id              VARCHAR PRIMARY KEY,
-  tenant_id       VARCHAR DEFAULT 'default',
+  workspace_id       VARCHAR DEFAULT 'default',
   root_uri        VARCHAR,
   type            VARCHAR,
   label           VARCHAR,
@@ -590,7 +652,7 @@ connectors (
   registered_at   TIMESTAMP,
   last_health     TIMESTAMP,
   health_status   VARCHAR,
-  UNIQUE (tenant_id, root_uri)
+  UNIQUE (workspace_id, root_uri)
 );
 
 objects (
@@ -623,7 +685,7 @@ caches (
 -- ===== Job 队列：统一所有 connector op =====
 connector_jobs (
   id                    VARCHAR PRIMARY KEY,
-  tenant_id             VARCHAR DEFAULT 'default',
+  workspace_id             VARCHAR DEFAULT 'default',
   connector_id          VARCHAR REFERENCES connectors(id),
   op_kind               VARCHAR,        -- 'sync' | 'force_sync' | 'remove' | 'update_config'
   trigger               VARCHAR,        -- 'manual' | 'scheduled' | 'watch'
@@ -666,38 +728,96 @@ connector_state (
 
 watch_grants (
   path            VARCHAR PRIMARY KEY,
-  granted_at      TIMESTAMP,
-  profile_kind    VARCHAR
+  granted_at      TIMESTAMP
+);
+
+-- ===== Upload flow（client → server 上传本地文件） =====
+upload_manifests (                          -- server 端存的 client manifest 快照
+  connector_id    VARCHAR REFERENCES connectors(id),
+  path            VARCHAR,
+  size            INTEGER,
+  mtime_ns        BIGINT,
+  sha1            VARCHAR,
+  last_commit_at  TIMESTAMP,                -- 最后一次 commit 成功时间
+  PRIMARY KEY (connector_id, path)
+);
+
+upload_staging (                            -- 当前未 commit 的临时 upload
+  temp_file_id    VARCHAR PRIMARY KEY,
+  connector_id    VARCHAR,
+  storage_path    VARCHAR,                  -- object_store://uploads/<connector_id>/<temp_file_id>.zip
+  size_bytes      INTEGER,
+  uploaded_at     TIMESTAMP,
+  expires_at      TIMESTAMP                 -- 自动清理过期未 commit 的（默认 1h）
 );
 ```
 
-注意所有顶层表都预留 `tenant_id` 字段，默认 `'default'`，便于未来加多租户。
+注意所有顶层表都预留 `workspace_id` 字段，默认 `'default'`，便于未来加多租户。
 
-### 6.2 Object store (cache)
+### 6.2 Object store (cache + upload staging)
 
-local: `~/.mfs/cache/`
-remote: S3 / R2 / MinIO
+object store 同时存两类东西：
 
-目录布局：
+- **cache 文件**：connector 拉取的对象缓存（converted_md / page_cache / vlm_text / schema_dump 等）
+- **upload staging**：client 上传的 zip bundle + 解压后的真实文件树（仅 §3.5 upload flow 用）
+
+#### 默认后端：本地文件系统
+
+**默认 `backend = local`**，最快、零运维：
 
 ```
 ~/.mfs/cache/
-  <sha1(object_uri)>/
+  caches/<sha1(object_uri)>/
     converted_md
     page_cache.jsonl
     head_cache.jsonl
     vlm_text
     schema_dump.json
+  uploads/
+    <connector_id>/
+      <temp_file_id>.zip                # bundle，commit 后删
+  files/
+    <connector_id>/                     # 解压后的真实文件树，连续作为 cache
+      src/cli.py
+      README.md
+      ...
 ```
 
-`caches` 表存 `(object_uri, cache_kind) → storage_path` 映射。
+`caches` 表存 `(object_uri, cache_kind) → storage_path` 映射；`upload_staging` 表存 temp_file_id → 路径。
 
-淘汰：
+#### 后端选择 trade-off
+
+| 后端 | first byte 延迟 | 多 worker 共享 | 持久化 | 适合 |
+|---|---|---|---|---|
+| `local` （fs） | ~1ms | ❌（仅同进程） | 跟随 disk | 个人本机、单容器 server |
+| `minio` | ~5-10ms | ✅ | 跟随 volume | Docker Compose 多 worker |
+| `s3` / `r2` / `gcs` | ~50-100ms | ✅ | HA、跨实例 | K8s 生产部署 |
+
+S3 延迟看起来比本地 fs 慢，但仍**远比 connector 重新拉取外部 API（100ms+）快**。对 throughput 影响小（streaming）。
+
+**部署建议**：
+
+| 部署形态 | object_store backend |
+|---|---|
+| 个人本机 `mfs serve` | `local` |
+| Docker 单容器 server | `local`（bind volume `/data/cache`） |
+| Docker Compose 多 worker | `minio`（容器间共享） |
+| K8s 生产 | `s3` / `r2`（HA + 多 replica） |
+
+不做"S3 + 本机磁盘两级 cache"——v0.4 范围用户察觉不到 50ms 区别，复杂度收益不值。
+
+#### 淘汰与配额
 
 ```toml
 [cache]
 max_size_gb = 10
 eviction = "lru"
+
+[upload]
+max_bundle_size_mb = 500             # 单 bundle 上限；超过用独立单文件 PUT
+staging_path = "uploads/"            # object store 下的 staging 子路径
+staging_expiry_hours = 1             # 未 commit 的 staging zip 多久过期清理
+per_workspace_quota_gb = 0           # 0 = 不限；多 workspace 部署可设
 ```
 
 ### 6.3 Milvus
@@ -774,7 +894,6 @@ credential_ref = "vault:secret/data/mfs/pg-prod"
 [[profiles]]
 name = "prod"
 api_base_url = "https://mfs.example.com"
-kind = "remote"
 credential_ref = "env:MFS_API_TOKEN"
 ```
 
@@ -794,7 +913,7 @@ Authorization: Bearer <token>
 uv tool install mfs-cli
 uv tool install mfs-server
 mfs serve start
-mfs profile add local --url http://127.0.0.1:8765 --kind local
+mfs profile add local --url http://127.0.0.1:8765
 mfs profile use local
 mfs add .
 ```
@@ -831,7 +950,7 @@ services:
 
 ```bash
 docker compose up -d
-mfs profile add prod --url https://mfs.example.com --kind remote
+mfs profile add prod --url https://mfs.example.com
 mfs add postgres://prod --config ...
 ```
 
@@ -852,11 +971,11 @@ v0.4 **不实现多租户**，但 schema 全部预留。多租户指**一个 MFS
 
 ### 预留点
 
-- Metadata DB 所有顶层表加 `tenant_id` 字段（默认 `"default"`）
-- Milvus `mfs_chunks` 表加 `tenant_id` scalar field（默认 `"default"`）
-- 所有 query 默认 filter `tenant_id = current_tenant`
-- HTTP header 预留 `X-MFS-Tenant`（v0.4 忽略；多租户启用后由 profile 的 `tenant_id` 自动注入）
-- Profile 配置已支持 `tenant_id` 字段（v0.4 写了不报错，server 端忽略；启用多租户后生效）
+- Metadata DB 所有顶层表加 `workspace_id` 字段（默认 `"default"`）
+- Milvus `mfs_chunks` 表加 `workspace_id` scalar field（默认 `"default"`）
+- 所有 query 默认 filter `workspace_id = current_workspace`
+- HTTP header 预留 `X-MFS-Workspace`（v0.4 忽略；多租户启用后由 profile 的 `workspace_id` 自动注入）
+- Profile 配置已支持 `workspace_id` 字段（v0.4 写了不报错，server 端忽略；启用多租户后生效）
 
 ### 未来启用方案
 
@@ -864,7 +983,7 @@ v0.4 **不实现多租户**，但 schema 全部预留。多租户指**一个 MFS
 
 | 策略 | Milvus 实现 | 隔离强度 | 资源开销 |
 |---|---|---|---|
-| metadata filter | 共用 collection，每行带 `tenant_id`，查询时 filter | 弱（依赖 query 正确性） | 最小 |
+| metadata filter | 共用 collection，每行带 `workspace_id`，查询时 filter | 弱（依赖 query 正确性） | 最小 |
 | partition by tenant | collection 内按 tenant 分 partition | 中 | 中 |
 | collection per tenant | 每 tenant 一张 collection | 强 | 大 |
 | database per tenant | 每 tenant 一个 Milvus database（2.4+） | 最强 | 最大 |
@@ -1031,7 +1150,7 @@ mfs-server[all]
 - JSON envelope。
 - connector URI 与对象命名约定（带 media type 后缀）。
 - connector TOML + chunk_kind 枚举 + locator schema。
-- Milvus collection schema（含 `tenant_id` 多租户预留字段）。
+- Milvus collection schema（含 `workspace_id` 多租户预留字段）。
 - server image entrypoint。
 
 CLI/server 兼容关系写入 release note：

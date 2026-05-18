@@ -12,7 +12,7 @@ partition_key   = "connector_uri"        # 每个 connector 一个 partition，�
 
 fields = [
     Field("chunk_id",       VARCHAR(128),  primary=True),
-    Field("tenant_id",      VARCHAR(64),   index="scalar", default="default"),
+    Field("workspace_id",      VARCHAR(64),   index="scalar", default="default"),
     Field("connector_uri",  VARCHAR(256),  partition_key=True),
     Field("object_uri",     VARCHAR(1024), index="scalar"),
     Field("locator",        JSON),
@@ -45,9 +45,9 @@ index_params = {
 
 后改 partition key 需要数据迁移，所以一开始定下来。
 
-### tenant_id 字段是多租户预留
+### workspace_id 字段是多租户预留
 
-v0.4 默认 `tenant_id = "default"`，所有查询自动 filter `tenant_id = current`。预留这个字段后，未来加多租户时不需要改 schema。详见 [02-architecture.md §9](02-architecture.md#9-多租户预留).
+v0.4 默认 `workspace_id = "default"`，所有查询自动 filter `workspace_id = current`。预留这个字段后，未来加多租户时不需要改 schema。详见 [02-architecture.md §9](02-architecture.md#9-多租户预留).
 
 ### 可选 collection 策略（server 端配置）
 
@@ -66,7 +66,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 | 字段 | 含义 |
 |---|---|
 | `chunk_id` | uuid 或 `sha1(object_uri + locator + chunk_kind)`；幂等写入 |
-| `tenant_id` | 多租户预留，v0.4 默认 `"default"` |
+| `workspace_id` | 多租户预留，v0.4 默认 `"default"` |
 | `connector_uri` | 包含该 chunk 的 connector root，如 `postgres://prod` |
 | `object_uri` | chunk 来自哪个 object，如 `postgres://prod/public/tickets/rows.jsonl` |
 | `locator` | object 内单元定位，per-connector schema（见 §3） |
@@ -326,7 +326,7 @@ mfs search "..." <path> --top-k 10
   │
   ├─ 3. Milvus hybrid search:
   │     filter = {
-  │       tenant_id     = current_tenant,
+  │       workspace_id     = current_tenant,
   │       connector_uri in [<partition>],
   │       object_uri    LIKE '<prefix>%' (optional),
   │       chunk_kind    in [...] (optional --kind),
@@ -395,7 +395,7 @@ mfs search "session" ./src --top-k 5 --collapse object
 
 ```
 Milvus sparse search:
-  filter: tenant_id = X AND connector_uri = Y AND object_uri = Z
+  filter: workspace_id = X AND connector_uri = Y AND object_uri = Z
   query : sparse vector from pattern
   返回带 chunk content 的 hits → 按行号在 chunk 内定位
 ```
@@ -537,7 +537,7 @@ Continue? [y/N]
 ingest 时如果对象消失：
 
 ```
-Milvus DELETE WHERE tenant_id = X
+Milvus DELETE WHERE workspace_id = X
                 AND connector_uri = Y
                 AND object_uri NOT IN (current_object_set)
 ```
@@ -545,7 +545,7 @@ Milvus DELETE WHERE tenant_id = X
 ingest 时如果对象内 record 消失（per_row 模式）：
 
 ```
-Milvus DELETE WHERE tenant_id = X
+Milvus DELETE WHERE workspace_id = X
                 AND connector_uri = Y
                 AND object_uri = Z
                 AND locator->>'id' NOT IN (current_pk_set)

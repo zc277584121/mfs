@@ -152,6 +152,7 @@ jq 'select(.id == 12)' /tmp/data.jsonl
 | 拼构造 path 取单 record（如 `tickets/12.json`） | 用 search/grep 的结果 + `locator` |
 | 用 pipe 传递 source 元信息 | 直接传 path 参数：`mfs search "..." <path>` |
 | `mfs add <uri>` 然后假设立刻 search 可用 | `mfs status <uri>` 看 sync 进度，等 search=available |
+| 在 remote profile 下用大目录 `mfs add ./repo`（会触发上传，可能很慢） | 先 `mfs add --register-only`（仅探测，不上传）看 dry-run，再决定 |
 | 用 `mfs cat` 看图片 | `mfs cat <img> --meta` 看 VLM description |
 | 在 `--all` 上跑没有 filter 的 query | 加 `--top-k` 限制 / 加 path 缩小范围 |
 
@@ -170,7 +171,8 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 | `since_unsupported` | connector 不支持 `--since` | 去掉 `--since`，直接 `mfs add` |
 | `range_unsupported` | 二进制对象不支持 `--range` | 用 `head -c` 字节或 `export` |
 | `chunk_max_exceeded` | 对象太大，部分索引 | search 仍然可用但召回不全；建议用户加 `filter_expr` |
-| `remote_server_cannot_read_local_path` | remote profile 收到本地 path | 切 local profile，或用 source URI |
+| `upload_rejected` | 用户加了 `--no-upload` 拒绝上传 | 去掉 flag 或切换 local profile |
+| `upload_bundle_too_large` | 单次 bundle 太大 | 加 ignore 规则缩小范围，或拆分目录 |
 | `field_missing` | text_fields 配的字段不存在 | 用户层配置问题；提示用户改 connector TOML |
 
 所有错误都有 `suggestions` 字段——优先按 suggestion 行动，不要试错。

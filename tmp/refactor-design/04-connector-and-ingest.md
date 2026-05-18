@@ -65,6 +65,15 @@ connector root URI 由 `scheme://<alias>` 组成。`alias` 是用户起的名（
 
 代码、文档、图片、JSON、CSV 都按各自扩展名进入对应处理器。`mfs ls ./repo` 看到的就是真实目录。
 
+**两种 scope**：file connector 实现复用同一份代码，根据 client / server 是否共享文件系统注入不同 scope：
+
+| client/server 是否共享 fs | scope | 数据来源 |
+|---|---|---|
+| 共享 | `LocalFS(path)` | server 直接读 client 端写的真实路径 |
+| 不共享 | `StagingArea(connector_id)` | server 读 client 通过 upload flow 上传的解压目录 |
+
+file connector 代码上**抽象为"扫一个目录 root"**，不关心 root 是真本机 fs 还是 object_store 中的 staging 子目录。详见 [02-architecture.md §3.5](02-architecture.md#35-本地文件-upload-flow不共享-fs-场景) 和 [07-contributing-connector.md §3](07-contributing-connector.md#3-connectorplugin-契约)。
+
 ### Web connector
 
 抓取网页并转 markdown 缓存。配置见 §6。
@@ -306,12 +315,12 @@ mfs add <target>
 
 执行位置：
 
-| profile.kind | queue 位置 | worker |
+| 部署 | queue 位置 | worker |
 |---|---|---|
-| `local` | daemon 内 SQLite queue | daemon 内 worker pool |
-| `remote` | server 侧 Postgres queue（同 metadata DB） | `mfs-worker` 进程 |
+| 本机 server（共享 fs） | server 内 SQLite queue | server 内 worker pool |
+| 远端 server | server 侧 Postgres queue（同 metadata DB） | `mfs-worker` 进程 |
 
-数据流向：HTTP 只走 control plane（path / option / status），数据（文件 bytes、记录内容、chunk 文本）都在 server 内部完成。详见 [02-architecture.md §3](02-architecture.md#3-control-plane-vs-data-plane).
+数据流向：HTTP 主要走 control plane（path / option / status），唯一例外是 remote profile 下本地文件 upload（client 上传 zip bundle 到 server）。详见 [02-architecture.md §3](02-architecture.md#3-control-plane-vs-data-plane).
 
 ## 5. 变化检测
 
@@ -701,7 +710,7 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 uv tool install --upgrade mfs-cli
 uv tool install mfs-server
 mfs serve start
-mfs profile add local --url http://127.0.0.1:8765 --kind local
+mfs profile add local --url http://127.0.0.1:8765
 mfs profile use local
 mfs add . --force         # 重建本地索引（schema 升级）
 ```

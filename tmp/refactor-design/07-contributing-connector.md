@@ -490,7 +490,7 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 | 让 cat 渲染特殊格式 | ✅ 在 `object_kind_of` 标个合适的 kind 用 framework 已有 handler |
 | 在 connector 里写 schedule cron | ❌ 用户写 connector TOML 的 `schedule` 字段，framework scheduler 调 |
 | 暴露不在 PROMPT.md 描述里的 path | ❌ 暴露 = 文档化 |
-| 自定义 `tenant_id` 行为 | ❌ tenant_id 由 framework 注入 |
+| 自定义 `workspace_id` 行为 | ❌ workspace_id 由 framework 注入 |
 | 在 `self.state` 里存任意 schema | ✅ schema 由 connector 自己定义（cursor / manifest / etag map 等），framework 不 introspect |
 
 ## 12. 写 connector 前的设计检查

@@ -112,14 +112,20 @@ Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
 Worker running in background. Run `mfs status` to check progress.
 ```
 
-remote profile 下传本地路径返回明确错误：
+remote profile（不共享 fs）下处理本地路径**自动走 upload flow**——CLI 端 scan + manifest diff + zip bundle 上传 + commit。默认 confirm：
 
 ```text
-Local path requires local profile: ./repo
-Run `mfs profile use <local-profile>` and `mfs serve start` for local files.
+$ mfs add ./repo                                     # active profile = remote (https://mfs.example.com)
+Scanning ./repo ... 184 files, 28 MB
+Manifest diff against server: 37 changed, 2 deleted, 145 unchanged
+Estimated upload: 8.3 MB (changes only)
+
+Continue? [y/N]
 ```
 
-错误码：`remote_server_cannot_read_local_path`。
+`--yes` 跳过 confirm；`--no-upload` 显式拒绝上传（报错而不是发数据）。
+
+upload 完成后 server 跑标准 chunk → embed → 写 Milvus 流程。`mfs status ./repo` 看进度。详见 [02-architecture.md §3.5](02-architecture.md#35-本地文件-upload-flow不共享-fs-场景)。
 
 ## 4. Search 行为
 
@@ -277,7 +283,7 @@ mfs status --watch                      # 列正在 watch 的目录（仅 local 
 
 ```text
 $ mfs status
-Profile: local (kind=local)
+Profile: local (is_local=true, machine-id matched)
 Daemon:  running (pid=4112, port=8765, version=0.4.0)
 Connectors: 3 active
   ./repo                    last_add=2026-05-14T09:21:00Z   index=fresh
@@ -336,8 +342,8 @@ confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 
 ### `mfs profile`
 
 ```bash
-mfs profile add local --url http://127.0.0.1:8765 --kind local
-mfs profile add prod  --url https://mfs.example.com --kind remote
+mfs profile add local --url http://127.0.0.1:8765
+mfs profile add prod  --url https://mfs.example.com --workspace acme-corp
 mfs profile use local
 mfs profile list
 mfs profile status
@@ -461,7 +467,8 @@ JSON：
 
 | code | 含义 |
 |---|---|
-| `remote_server_cannot_read_local_path` | remote profile 收到本地 path |
+| `upload_rejected` | 用户显式 `--no-upload` 但本地路径 + remote profile 触发了 upload |
+| `upload_bundle_too_large` | 单 bundle 超过 `max_bundle_size_mb` 阈值，建议过滤范围或拆分 |
 | `object_too_large_for_cat` | cat 大对象未带 `--range` |
 | `is_directory` | 对目录 cat |
 | `connector_unhealthy` | connector healthcheck 失败 |

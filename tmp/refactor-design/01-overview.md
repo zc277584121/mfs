@@ -68,14 +68,14 @@ Metadata DB / Object store / Milvus 的具体后端由 server 配置决定，跟
 
 CLI、SDK 是 client，所有重活在 server。server 有两种部署位置：
 
-| 部署位置 | profile.kind | 用途 |
-|---|---|---|
-| local daemon | `local` | 个人本机；CLI 和 daemon 共享同一文件系统命名空间 |
-| remote server | `remote` | 团队/云端；通过 HTTPS 访问 |
+| 部署位置 | 用途 |
+|---|---|
+| 本机 server（`mfs serve`） | 个人本机；CLI 和 server 共享同一文件系统命名空间 |
+| 远端 server | 团队/云端；通过 HTTPS 访问 |
 
-`profile.kind = "local"` 的严格定义：**CLI 进程和 server 共享同一文件系统命名空间**——同一字符串路径在两边都解析到同一文件。Docker / SSH / WSL 等跨命名空间组合按 `remote` 处理。`kind` 字段自动按 URL host 推断（127.0.0.1 / localhost → local，其他 → remote），少数边界场景用 `--kind` 显式覆盖。
+**client 跟 server 是否共享 fs 由 machine-id 自动比对**——用户不需要配 `kind` 字段。同 machine-id 视为 local（server 直接读本机路径），不同视为 remote（本地路径走 upload flow，详见 [02-architecture.md §3.5](02-architecture.md#35-本地文件-upload-flow不共享-fs-场景)）。Docker / SSH / WSL 等场景因为 machine-id 不同会自动判 remote。
 
-**profile.kind 与存储后端正交**：local server 也可以用 Postgres + Zilliz Cloud + S3，跟 profile.kind 无关。详见 [02-architecture.md §2](02-architecture.md#2-profile-与存储后端是正交的).
+**是否共享 fs 与存储后端正交**：本机 server 也可以用 Postgres + Zilliz Cloud + S3。详见 [02-architecture.md §2](02-architecture.md#2-profile-与存储后端是正交的).
 
 ## 最小心智模型
 
