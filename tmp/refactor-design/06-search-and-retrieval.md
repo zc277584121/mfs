@@ -326,7 +326,7 @@ mfs search "..." <path> --top-k 10
   │
   ├─ 3. Milvus hybrid search:
   │     filter = {
-  │       workspace_id     = current_tenant,
+  │       workspace_id     = current_workspace,
   │       connector_uri in [<partition>],
   │       object_uri    LIKE '<prefix>%' (optional),
   │       chunk_kind    in [...] (optional --kind),
