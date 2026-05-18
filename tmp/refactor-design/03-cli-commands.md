@@ -362,7 +362,7 @@ mfs serve logs
 
 `mfs serve` 是 client-side 封装，本质是本机 spawn 一个 `mfs-server` 进程。服务端运维直接用 `mfs-server` binary（systemd / docker entrypoint），详见 [02-architecture.md §5](02-architecture.md#5-server-端启动).
 
-如果只装了 `mfs-cli` 没装 `mfs-server`：
+如果只装了 `mfs` CLI 没装 `mfs-server`：
 
 ```text
 mfs serve requires mfs-server package.

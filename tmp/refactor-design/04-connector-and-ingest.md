@@ -707,8 +707,8 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 升级动作：
 
 ```bash
-uv tool install --upgrade mfs-cli
-uv tool install mfs-server
+brew install mfs           # CLI（Rust binary）
+uv tool install mfs-server # server（Python）
 mfs serve start
 mfs profile add local --url http://127.0.0.1:8765
 mfs profile use local

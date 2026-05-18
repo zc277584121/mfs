@@ -59,6 +59,26 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 术语速览
+
+读后面章节前先建立这些词的心智边界：
+
+| 术语 | 是什么 | 谁创建 |
+|---|---|---|
+| **Connector** | 一个注册的数据源插件实例（`postgres://prod` / `./repo`） | 用户 `mfs add` |
+| **Object** | connector 暴露的一条虚拟文件，有 path + media_type | connector 决定 |
+| **Cache** | 一个 object 的本地缓存字节（可选；让 cat/head/tail 不打回 connector） | framework 维护 |
+| **Chunk** | Milvus 一行：search/grep 召回的最小单元 | framework 生成 |
+| **Job**（`connector_jobs` 表） | 用户层操作记录：一次 `mfs add` / `mfs remove` 创建一个 | `mfs` 命令触发 |
+| **Task**（`object_tasks` 表） | sync job 内的单 object 处理任务 | job 派生 |
+| **Worker** | 跑 task 的 coroutine / 进程 | framework 调度 |
+| **Queue** | 角色概念——`connector_jobs` + `object_tasks` 两张表起队列作用 | DB schema 隐式 |
+| **Pipeline** | embedding / chunker / summary / VLM 等通用执行工具集 | framework 提供 |
+| **Profile** | client 侧 endpoint 配置（连哪个 server + workspace + token） | 用户 `mfs profile add` |
+| **Workspace** | 多 workspace 部署里的数据隔离边界（一般对应一个公司 / 组织） | 部署方分配 |
+
+抽象关系：`Connector` 暴露多个 `Object`；每个 `Object` 可能有 `Cache`，可能产出多个 `Chunk` 进 Milvus。用户 `mfs add` 触发一个 `Job`，job 派生多个 per-object `Task`，`Worker` 从 queue 拉 task，内部调用 `Pipeline` 的组件做实际工作。`Profile` 决定 client 连哪个 server 和哪个 `Workspace`。
+
 ## 2. Profile 与存储后端是正交的
 
 ### 2.0 配置文件命名约定
@@ -70,7 +90,7 @@ MFS 有**两个独立的配置文件**，各自负责不同身份的设置：
 | client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token、workspace_id | `mfs` CLI |
 | server 配置 | `~/.mfs/server.toml`（本地 daemon）<br>`/etc/mfs/server.toml`（远端部署） | metadata backend / object_store / milvus / worker / embedding / chunker / cache / summary / vlm | `mfs-server` |
 
-只装 `mfs-cli` 的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
+只装 CLI（`mfs` binary）的用户只接触 `client.toml`；只装 `mfs-server`（运维端）的人只接触 `server.toml`；两者都装（个人本机）的人各自维护。两个文件不会混在一起，schema 不会冲突。
 
 **server.toml 查找优先级**（第一个找到就用，不合并）：
 
@@ -349,12 +369,14 @@ mfs serve status                   # pid / port / version / uptime / health
 mfs serve logs                     # ~/.mfs/server.log
 ```
 
-如果只装了 `mfs-cli` 没装 `mfs-server`：
+如果只装了 `mfs` CLI 没装 `mfs-server`：
 
 ```text
 mfs serve requires mfs-server package.
 Install it with:
   uv tool install mfs-server
+# 或
+  mfs serve install
 ```
 
 ### 5.3 本地鉴权
@@ -487,6 +509,38 @@ UPDATE object_tasks SET status='pending'
 connector_state 因为没被 commit（state_snapshot 在 connector_jobs 里随 job 失败一起作废），下次 `mfs add` 自然从上一个成功的 state 接续。
 
 **没有 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
+
+### 5.8.1 完成 job 的归档（DB 队列的"出队"）
+
+DB 队列没有传统 FIFO 的"出队"动作。任务靠 `status` 字段流转：
+
+```
+pending → running → succeeded / failed / cancelled
+```
+
+worker 只 `SELECT ... WHERE status='pending' FOR UPDATE SKIP LOCKED`，看不到 succeeded 行。succeeded 的 row 留在表里几天，供 `mfs job list` / `mfs job inspect` 查历史。
+
+server 启动一个 housekeeping coroutine，每天清理过期行：
+
+```sql
+DELETE FROM connector_jobs
+WHERE status IN ('succeeded','failed','cancelled')
+  AND finished_at < now() - interval '30 days';
+
+DELETE FROM object_tasks
+WHERE connector_job_id IN (DELETE 的 jobs);
+```
+
+可配置：
+
+```toml
+# server.toml
+[jobs]
+retention_days = 30          # 完成 N 天后归档/删除
+archive_to = ""              # 可选：导出到 audit 表/文件再删（v0.4 不实现）
+```
+
+比 Redis 自动过期还简单（就是个 SQL DELETE）。不需要换队列后端。
 
 ### 5.9 重跑语义
 
@@ -769,32 +823,50 @@ upload_staging (                            -- 当前未 commit 的临时 upload
 
 object store 同时存两类东西：
 
-- **cache 文件**：connector 拉取的对象缓存（converted_md / page_cache / vlm_text / schema_dump 等）
+- **cache 文件**：每个有 cache 的 object 各自的产物（每个 object 通常只对应一个 cache_kind）
 - **upload staging**：client 上传的 zip bundle + 解压后的真实文件树（仅 §3.5 upload flow 用）
 
-#### 默认后端：本地文件系统
+#### cache_kind ↔ object 类型对应
 
-**默认 `backend = local`**，最快、零运维：
+**一个 object 通常只有 1 个适用的 cache_kind**，不是每个 object 都有所有 cache。具体看 object 类型：
+
+| object 类型 | cache_kind | 例 |
+|---|---|---|
+| PDF / DOCX 等可转 markdown 的文档 | `converted_md` | `manual.pdf` 的 markdown 缓存 |
+| DB rows / API records 集合 | `page_cache.jsonl` | `postgres://.../rows.jsonl` 的物化页 |
+| DB rows 的 head 预拉取 | `head_cache.jsonl` | 前 100 行预 cache，加速 head 命中 |
+| 图片 | `vlm_text` | `diagram.png` 的 VLM description |
+| DB schema / 元数据 dump | `schema_dump.json` | postgres `schema.json` 的物化 |
+| markdown / code / 纯文本真实文件 | **无 cache** | 直接 read，没必要 cache |
+
+实际目录布局（每个 sha1 子目录通常只 1 个文件）：
 
 ```
 ~/.mfs/cache/
-  caches/<sha1(object_uri)>/
-    converted_md
-    page_cache.jsonl
-    head_cache.jsonl
-    vlm_text
-    schema_dump.json
-  uploads/
+  caches/
+    <sha1(./repo/manual.pdf)>/
+      converted_md                     ← PDF 转 markdown
+    <sha1(postgres://prod/.../rows.jsonl)>/
+      page_cache.jsonl                 ← DB 物化页
+    <sha1(./repo/diagram.png)>/
+      vlm_text                         ← 图片 VLM 描述
+    <sha1(postgres://prod/.../schema.json)>/
+      schema_dump.json                 ← DB schema 物化
+  uploads/                             ← §3.5 upload flow 用
     <connector_id>/
-      <temp_file_id>.zip                # bundle，commit 后删
+      <temp_file_id>.zip               ← bundle，commit 后删
   files/
-    <connector_id>/                     # 解压后的真实文件树，连续作为 cache
+    <connector_id>/                    ← 解压后的真实文件树，作为 cache 保留
       src/cli.py
       README.md
       ...
 ```
 
 `caches` 表存 `(object_uri, cache_kind) → storage_path` 映射；`upload_staging` 表存 temp_file_id → 路径。
+
+#### 默认后端：本地文件系统
+
+**默认 `backend = local`**，最快、零运维。但**CS 部署需要按规模选择**：
 
 #### 后端选择 trade-off
 
@@ -808,12 +880,12 @@ S3 延迟看起来比本地 fs 慢，但仍**远比 connector 重新拉取外部
 
 **部署建议**：
 
-| 部署形态 | object_store backend |
-|---|---|
-| 个人本机 `mfs serve` | `local` |
-| Docker 单容器 server | `local`（bind volume `/data/cache`） |
-| Docker Compose 多 worker | `minio`（容器间共享） |
-| K8s 生产 | `s3` / `r2`（HA + 多 replica） |
+| 部署形态 | object_store backend | 备注 |
+|---|---|---|
+| 个人本机 `mfs serve` | `local` | 默认；零配置 |
+| Docker 单容器 server（demo / 小规模） | `local` | 必须 `-v /data/cache` bind volume 持久化 |
+| Docker Compose 多 worker | `minio` | 容器间共享 |
+| K8s / 商业化生产 | **S3 / R2 / GCS** | 首选；HA + 跨 replica |
 
 不做"S3 + 本机磁盘两级 cache"——v0.4 范围用户察觉不到 50ms 区别，复杂度收益不值。
 
@@ -835,46 +907,46 @@ per_workspace_quota_gb = 0           # 0 = 不限；多 workspace 部署可设
 
 一张 collection `mfs_chunks`，partition by connector。详见 [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
 
-backends：
+backends（推荐优先级 ↓）：
 
-| 后端 | URI | 适合 |
-|---|---|---|
-| Milvus Lite | `~/.mfs/milvus.db` | local daemon 默认；零运维；单 writer |
-| 自部署 Milvus | `http://host:19530` | self-host；多 writer；完整 BM25 |
-| Zilliz Cloud | `https://*.zillizcloud.com` + token | 托管；多 writer；完整 BM25 |
-
-**Backend 能力矩阵**：MFS v0.4 依赖几个 Milvus 特性，三种 backend 支持情况不同：
-
-| 能力 | Lite | 自部署 Milvus 2.5+ | Zilliz Cloud |
+| 后端 | URI | 适合 | v0.4 推荐度 |
 |---|---|---|---|
-| `partition_key` 字段 | ⚠️ 简化版（按 hash 分区，无显式 partition 管理） | ✅ | ✅ |
-| `drop_partition` 快速删除 | ❌（fallback 到 delete by filter） | ✅ | ✅ |
-| `sparse_vec` + BM25 内建 | ✅（2.5+） | ✅ | ✅ |
-| `scalar index` on `connector_uri` / `chunk_kind` | ✅ | ✅ | ✅ |
-| `JSON` filter on `metadata` | ✅ | ✅ | ✅ |
-| 多 writer 并发 | ❌（单进程独占） | ✅ | ✅ |
-| 横向扩展 | ❌ | ✅（需配 Pulsar/Kafka） | ✅（托管） |
-| 备份 / 快照 | 文件 cp | manual / operator | 内建 |
+| **Milvus Lite 3.0+** | `~/.mfs/milvus.db` | 个人本机；零运维 | ⭐ 个人首选 |
+| **Zilliz Cloud** | `https://*.zillizcloud.com` + token | CS 部署、商业化场景 | ⭐ CS 首选 |
+| 自部署 Milvus 3.0+ | `http://host:19530` | 自有数据中心 / 不能上云的场景 | 可选 |
+
+v0.4 主推 **Lite（个人）+ Zilliz Cloud（CS 部署）** 两条路。自部署 Milvus 因为它本身就是 Docker Compose 多容器（含 etcd / pulsar / object store），运维负担重，不作为默认推荐。
+
+**Backend 能力矩阵**：
+
+| 能力 | Lite 3.0 | Zilliz Cloud | 自部署 Milvus 3.0+ |
+|---|---|---|---|
+| `partition_key` 字段 | ⚠️ 待 verify（Lite 3.0 是 Python 全重写，能力跟历史版本不一定一致） | ✅ | ✅ |
+| `drop_partition` 快速删除 | ⚠️ 待 verify | ✅ | ✅ |
+| `sparse_vec` + 内建 BM25 | ⚠️ 待 verify | ✅ | ✅ |
+| `scalar index` 字段 | ✅ | ✅ | ✅ |
+| JSON metadata filter | ✅ | ✅ | ✅ |
+| 多 writer 并发 | ❌ | ✅ | ✅ |
+| 横向扩展 | ❌ | ✅（托管） | ✅（需配 Pulsar/Kafka） |
+| 备份 / 快照 | 文件 cp | 内建 | manual / operator |
+
+> **⚠️ Caveat**：Milvus Lite 3.0 是大版本重构（Python 全重写），上面 Lite 列基于 2.x 资料的推断，**实现 v0.4 时需要按 Lite 3.0 / Milvus 3.0 最新代码实测重校准**。如果 Lite 3.0 不支持 sparse_vec 或 partition_key，需要降级方案（如个人本机退回 single-collection + scalar filter）。
 
 **实际影响**：
 
-- **Lite** 在 local daemon 场景够用。`mfs remove` 在 Lite 上走 `delete by filter` 而不是 `drop_partition`（慢但能用）；多 worker 并发受限，但 local daemon 默认就是单 worker pool。
-- **自部署 / Zilliz Cloud** 才能跑 `mfs-worker` 多 replica。
-- 文档默认假设 **Milvus 2.5+**（sparse_vec / BM25 必需）。
-
-切 backend 时数据迁移用 `mfs admin migrate-milvus --to <new-uri>`（roadmap 工具，v0.4 手动做）。
-
-如果用户用 Lite 起手，后期切自部署：drop_partition 突然变快，多 writer 解锁——无 schema 改动，纯 backend 替换。
+- **Lite** 在个人本机场景够用，但能力略弱（多 worker 受限——本机本来就单 worker，不是问题）。
+- **Zilliz Cloud** 是 CS 部署默认；商业化路径 = Zilliz Cloud。
+- 文档默认假设 **Milvus 3.0+**（sparse_vec / BM25 / partition_key 必需）。
 
 server 端配置：
 
 ```toml
 [milvus]
-uri = "~/.mfs/milvus.db"               # 默认 Lite
-# uri = "http://localhost:19530"
-# uri = "https://xxx.zillizcloud.com"
+uri = "~/.mfs/milvus.db"               # 默认 Lite（个人本机）
+# uri = "https://xxx.zillizcloud.com"  # CS / 商业化
 # token = "..."
-collection_strategy = "single"          # single | per_connector | per_tenant
+# uri = "http://localhost:19530"       # 自部署（不推荐，运维负担重）
+collection_strategy = "single"          # single | per_connector | per_workspace
 ```
 
 ## 7. 凭据与认证
@@ -921,8 +993,15 @@ Authorization: Bearer <token>
 ### 8.1 个人本机
 
 ```bash
-uv tool install mfs-cli
-uv tool install mfs-server
+# CLI（Rust 单 binary）
+brew install mfs                          # macOS / Linux
+# 或 scoop install mfs                    # Windows
+# 或 cargo install mfs                    # 通过 cargo
+# 或 curl -fsSL https://mfs.dev/install.sh | sh   # 直接下载 binary
+
+# Server（Python）
+uv tool install mfs-server                # 跑本机 server
+
 mfs serve start
 mfs profile add local --url http://127.0.0.1:8765
 mfs profile use local
@@ -947,16 +1026,24 @@ docker run --rm -p 8765:8765 \
 
 容器内 API + worker 同进程；存储用容器内 SQLite + Milvus Lite。
 
-### 8.3 Docker Compose（正式自部署）
+### 8.3 Docker Compose + Zilliz Cloud（推荐 CS 部署）
+
+mfs 本身的 API + worker 用 Docker Compose 起；Milvus 用 **Zilliz Cloud**（托管），不自部署：
 
 ```yaml
 services:
-  postgres:    image: postgres:16
-  minio:       image: minio/minio
-  redis:       image: redis:7
-  milvus:      image: milvusdb/milvus:v2.5.0
+  postgres:    image: postgres:16              # MFS metadata
+  minio:       image: minio/minio              # object_store
   mfs-api:     image: ghcr.io/zilliztech/mfs-api:0.4.0
   mfs-worker:  image: ghcr.io/zilliztech/mfs-worker:0.4.0
+```
+
+server.toml 指向 Zilliz Cloud：
+
+```toml
+[milvus]
+uri = "https://xxx.zillizcloud.com"
+token = "<env:ZILLIZ_TOKEN>"
 ```
 
 ```bash
@@ -964,6 +1051,8 @@ docker compose up -d
 mfs profile add prod --url https://mfs.example.com
 mfs add postgres://prod --config ...
 ```
+
+> Milvus 本身是多容器拓扑（etcd / pulsar / object store 自带），自部署运维成本高。v0.4 默认假设用 Zilliz Cloud。如果你**必须**自部署 Milvus，去 milvus.io 找官方 docker compose；MFS 不重新发布 Milvus 容器组合。
 
 ### 8.4 Kubernetes
 
@@ -1011,18 +1100,39 @@ v0.4 **不实现多租户**，但 schema 全部预留。多租户指**一个 MFS
 
 ## 10. 镜像与包
 
-| 交付物 | 内容 | 入口 |
-|---|---|---|
-| PyPI `mfs-cli` | CLI、Python SDK、HTTP transport、profile、输出 | `mfs` |
-| PyPI `mfs-server` | API、daemon、worker、engine、connectors、objects、pipeline、storage | `mfs-server` |
-| Docker `mfs-server` | 单容器：API + worker | demo / 小规模 |
-| Docker `mfs-api` | 只跑 API | 正式部署 |
-| Docker `mfs-worker` | 只跑 worker | 正式部署 |
+| 交付物 | 实现语言 | 内容 | 入口 / 包名 |
+|---|---|---|---|
+| **mfs CLI binary** | Rust | CLI、HTTP transport、profile、输出 | `mfs` (单 binary，多平台) |
+| `mfs-sdk` PyPI | Python | Python SDK（程序化集成，独立于 CLI） | `import mfs` |
+| `@mfs/sdk` npm | TypeScript | JS/TS SDK | OpenAPI 生成 |
+| Go SDK | Go module | OpenAPI 生成 | `github.com/zilliztech/mfs-sdk-go` |
+| Java SDK | Maven | OpenAPI 生成 | `io.zilliz.mfs:mfs-sdk` |
+| PyPI `mfs-server` | Python (+ Rust PyO3) | API、worker、engine、connectors、objects、pipeline、storage | `mfs-server` |
+| Docker `mfs-server-aio` | — | 单容器：API + worker | demo / 小规模 |
+| Docker `mfs-api` | — | 只跑 API | 正式部署 |
+| Docker `mfs-worker` | — | 只跑 worker | 正式部署 |
 
-便利 extra：
+CLI 多平台分发：
 
 ```bash
-uv tool install "mfs-cli[local]"     # 自动连带 mfs-server
+# 用户面安装（CLI 是 Rust binary，跟 server 解耦）
+brew install mfs                              # macOS / Linux Homebrew
+scoop install mfs                              # Windows
+cargo install mfs                              # 通过 cargo（任何平台）
+curl -fsSL https://mfs.dev/install.sh | sh    # 直接下载 binary
+```
+
+Server 端（Python）：
+
+```bash
+uv tool install mfs-server                     # 跑本机 server
+# 或运维端走 Docker / K8s（见 §8）
+```
+
+便利组合（个人本机一次装两个）：
+
+```bash
+mfs serve install                              # CLI 内置子命令，自动 uv tool install mfs-server
 ```
 
 server optional extras（按 connector 安装）：
@@ -1059,46 +1169,39 @@ mfs-server[all]
 
 ## 11. 工程目录结构
 
+多语言混合：CLI 用 Rust（单 binary 体验），server 主体 Python，server 内部 hot path 用 Rust 通过 PyO3 绑定，多语言 SDK 走 OpenAPI 生成。
+
 ```
 .
-├── clients/
-│   └── python/                              # PyPI: mfs-cli
-│       └── src/mfs_client/
-│           ├── cli/
-│           │   └── commands/
-│           │       ├── add.py
-│           │       ├── connector.py
-│           │       ├── profile.py
-│           │       ├── daemon.py
-│           │       ├── job.py
-│           │       └── ...                  # search/grep/ls/tree/cat/head/tail/export/status/remove/config
-│           ├── sdk/
-│           ├── transport/
-│           ├── models/
-│           └── config/
+├── cli/                                       # ⭐ Rust CLI（单 binary 分发）
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── main.rs                            # CLI entry
+│   │   ├── commands/                          # add / search / grep / ls / cat / ... 每条命令一个模块
+│   │   ├── transport/                         # HTTP client（reqwest）+ machine-id 探测
+│   │   ├── client_config/                     # client.toml 解析
+│   │   ├── output/                            # 人类可读 + JSON envelope
+│   │   └── models/                            # 从 protocol/openapi.yaml 生成
+│   └── tests/
 │
-├── protocol/
-│   ├── openapi.yaml
-│   ├── schemas/
-│   └── errors.md
+├── protocol/                                  # 跨语言契约
+│   ├── openapi.yaml                           # client ↔ server HTTP API
+│   ├── schemas/                               # JSON schema 共享
+│   └── errors.md                              # 错误码表
 │
 ├── server/
-│   └── python/                              # PyPI: mfs-server
+│   └── python/                                # PyPI: mfs-server
+│       ├── pyproject.toml
 │       └── src/mfs_server/
 │           ├── api/
 │           │   ├── app.py
-│           │   ├── routes/
-│           │   │   ├── add.py
-│           │   │   ├── connectors.py
-│           │   │   ├── objects.py
-│           │   │   ├── search.py
-│           │   │   └── jobs.py
+│           │   ├── routes/                    # add / connectors / objects / search / jobs / files (upload)
 │           │   └── middleware/
-│           ├── daemon/                       # mfs-server daemon entrypoint
-│           ├── worker/                       # mfs-server worker entrypoint
+│           ├── server/                        # mfs-server CLI entrypoint (run / api / worker)
+│           ├── worker/
 │           ├── engine/
-│           ├── connectors/                   # 每类 connector 自包含
-│           │   ├── base.py                   # ConnectorPlugin 抽象
+│           ├── connectors/                    # 每类 connector 自包含
+│           │   ├── base.py
 │           │   ├── registry.py
 │           │   ├── file/
 │           │   ├── web/
@@ -1106,45 +1209,45 @@ mfs-server[all]
 │           │   ├── slack/
 │           │   ├── github/
 │           │   └── ...
-│           ├── objects/                      # object_kind handlers
-│           │   ├── base.py
-│           │   ├── document/
-│           │   ├── code/
-│           │   ├── table_rows/
-│           │   ├── message_stream/
-│           │   ├── record_collection/
-│           │   ├── image/
-│           │   └── binary/
-│           ├── pipeline/
-│           │   ├── embedding/
-│           │   ├── summary/
-│           │   ├── vlm/
-│           │   ├── retrieval/
-│           │   └── export/
-│           ├── storage/
-│           │   ├── metadata/
-│           │   ├── object_store/
-│           │   ├── queue/
-│           │   └── search/                   # Milvus adapter
+│           ├── objects/                       # object_kind handlers
+│           ├── pipeline/                      # embedding / summary / vlm / retrieval / export
+│           ├── storage/                       # metadata / object_store / queue / search (Milvus)
 │           └── runtime/
-│               ├── local_daemon.py
-│               └── remote_server.py
+│
+├── server-rs/                                 # ⭐ Rust 加速模块（PyO3 绑定）
+│   ├── Cargo.toml
+│   ├── mfs-scan/                              # 大目录扫描 + manifest hash
+│   ├── mfs-jsonl/                             # JSONL / CSV / Parquet 流处理（polars 或自实现）
+│   └── mfs-grep/                              # 高并发线性 grep
+│   # build: maturin develop / pip install . → 生成 mfs_server_rs.<ext> 给 Python import
+│
+├── sdks/                                      # 多语言 SDK（OpenAPI 生成）
+│   ├── python/                                # PyPI: mfs-sdk（程序化集成用，独立于 CLI）
+│   ├── typescript/                            # npm
+│   ├── go/
+│   └── java/
 │
 ├── deployments/
-│   ├── docker/
+│   ├── docker/                                # mfs-api / mfs-worker / mfs-server-aio images
 │   ├── compose/
 │   └── helm/
 │
 ├── tests/
-│   ├── client/
-│   ├── server/
+│   ├── cli/                                   # Rust 测试
+│   ├── server/                                # Python 测试
 │   ├── connectors/
-│   ├── e2e/
+│   ├── e2e/                                   # CLI + server 联调
 │   └── fixtures/
 │
 ├── docs/
-└── skills/
+└── skills/                                    # agent skill（pure markdown）
 ```
+
+**关键设计决策**：
+
+- **CLI 跟 server 通过 HTTP 通信**，没有 import 关系——所以 CLI 用什么语言完全自由，跟 server 解耦。
+- **Rust 加速模块通过 PyO3 暴露给 Python**——maturin 编译成 wheel，`pip install .` 后 Python 直接 `from mfs_server_rs import scan_dir`。跟 polars / pydantic-core / ruff 同套路。
+- **多语言 SDK 都从 `protocol/openapi.yaml` 生成**——Python SDK 独立于 CLI（CLI 是 Rust，SDK 是 Python 给程序集成用）。
 
 ## 12. 版本策略
 
@@ -1190,42 +1293,67 @@ operation log 存 `~/.mfs/audit.log` (local) 或 server 侧 audit table。
 
 ## 14. 实现语言选择
 
-**主体 Python + 性能模块 Rust 的混合方案**。
+**Rust CLI + Python server + Rust 加速模块（PyO3） + 多语言 SDK**。
 
 | 模块 | 语言 | 理由 |
 |---|---|---|
-| CLI / Python SDK | Python | 跟 server 统一；启动慢用 lazy import |
-| API server / engine | Python + FastAPI + asyncio | IO-bound 为主；asyncio + FastAPI 性能足够 |
-| Connectors | Python | 所有外部 SDK（postgres / slack / github / gdrive / openai / anthropic / google 等）first-class 是 Python |
+| **CLI** (`mfs` binary) | **Rust** | 单 binary 分发（brew / scoop / direct download），cold start 几十 ms，用户体验跟 docker / kubectl / git / ripgrep 一致 |
+| API server / engine | Python + FastAPI + asyncio | IO-bound 为主；asyncio + FastAPI 性能足够；ecosystem 全 |
+| Connectors | Python | 所有外部 SDK（postgres / slack / github / gdrive / openai / anthropic / google ...）first-class 是 Python |
 | Embedding / LLM / VLM 调用 | Python | provider SDK 都是 Python first-class |
 | Milvus 客户端 | pymilvus | 官方 |
-| 大目录扫描 + hash | Rust（PyO3 绑定） | 千万文件场景，Python `os.walk` 太慢 |
-| 大 JSONL / CSV / Parquet 流处理 | Rust（polars / pyarrow） | 内存稳定，零拷贝 |
+| 大目录扫描 + hash | **Rust（PyO3 绑定）** | 千万文件场景，Python `os.walk` 太慢 |
+| 大 JSONL / CSV / Parquet 流处理 | **Rust（polars / 自实现）** | 内存稳定，零拷贝 |
 | AST tree-sitter 切分 | 已经 Rust | 沿用 tree-sitter 官方绑定 |
 | 高并发 grep 线性扫 | Rust（可选优化） | 性能敏感场景 |
-| 多语言 SDK（贡献者用） | TypeScript / Go / Java | 基于 `protocol/openapi.yaml` 生成 |
+| Python SDK（程序化集成） | Python | 给写脚本的用户 |
+| TypeScript / Go / Java SDK | 从 OpenAPI 生成 | 给跨语言用户 |
 
-### 不推荐的方案
+### 为什么 CLI 走 Rust
 
-- **Go 主体**：connector SDK 不齐（slack / linear 等 SaaS 有但 LLM/embedding 是二级公民），写起来比 Python 慢。
-- **Rust 整体重写**：开发速度太慢；社区贡献 connector 的门槛太高（每个 connector 多了 1-2 天学习成本）。
+用户安装 CLI 的体验对比：
 
-### CLI 启动速度
+| 维度 | Python CLI (`uv tool install mfs-cli`) | Rust binary |
+|---|---|---|
+| 安装产物 | 一堆 `.py` 源码 + 几十个依赖包 | 一个 binary 文件 |
+| 安装大小 | 100-300 MB（含 Python runtime） | ~30-50 MB |
+| cold start | 200-500 ms | 几十 ms |
+| 用户心智 | "我装了一个 Python 工具" | "我装了一个工具" |
+| 分发方式 | PyPI / uv | brew / scoop / cargo / direct download |
 
-Python CLI 冷启动通常 200-500ms。缓解：
+CLI 跟 server 走 HTTP，**不需要 import server 代码**——选什么语言完全自由。Rust 单 binary 体验远好于 Python 工具链。这跟 docker / kubectl / git / ripgrep / fd 一致——agent 用户对单 binary 工具的预期。
 
-- lazy import：CLI 入口只 import argparse + 命令分发，子命令的 heavy import 延迟到执行时。
-- 编译单 binary：`pyapp` / `pex` 把 Python 运行时和依赖打包成单 binary。
-- 后期可出 Rust CLI launcher（轻量 binary，fork 出 Python worker 处理真请求）。
+### Python / Rust 互操作（PyO3 + maturin）
 
-v0.4 直接 Python ship；性能瓶颈出现后再插 Rust 模块。
+业界主流玩法，非常成熟。例子：
+
+- **polars**（数据处理）：Rust + PyO3
+- **pydantic v2**：Rust 核心 (`pydantic-core`) + PyO3
+- **ruff** / **uv** / **rye**：Rust 实现 + Python 包装
+- **tokenizers** (HuggingFace)：Rust + PyO3
+
+工作流：
+
+```bash
+# server-rs/ 目录下
+maturin develop          # 编译 Rust + 安装到当前 Python 环境
+# 然后 Python 代码里
+from mfs_server_rs import scan_dir, hash_files, parse_jsonl_stream
+```
+
+发布：`maturin build --release` 出 wheel，用户 `pip install mfs-server` 时**自动下载预编译 wheel**（manylinux / macOS / Windows 三套），不需要本地编 Rust。
 
 ### 性能模块的边界
 
-Rust 模块封装在 server 内部，**不影响 connector 贡献者**——connector 全 Python。Rust 只在以下边界出现：
+Rust 模块封装在 server 内部，**connector 贡献者完全感知不到**——connector 全 Python，调 `from mfs_server_rs import scan_dir` 跟调普通 Python 函数一样。Rust 只在这几个 hot path 出现：
 
-- `mfs_server.io.scan` — 大目录扫描
-- `mfs_server.io.jsonl` — JSONL/CSV 流式处理
-- `mfs_server.grep.linear` — 线性扫优化
+- `mfs_server_rs.scan_dir` — 大目录扫描 + manifest
+- `mfs_server_rs.parse_jsonl_stream` — JSONL/CSV 流式处理
+- `mfs_server_rs.linear_grep` — 高并发线性 grep
 
-这些模块对外是普通 Python 函数（PyO3 绑定），调用方无感。
+### 不推荐的方案
+
+- **CLI 用 Python + pyapp/pex 编译 binary**：binary 仍 50-80 MB，cold start 100+ ms，劣于 Rust。
+- **CLI 用 TypeScript + bun compile**：binary ~30-50 MB，cold start 比 Python 快但比 Rust 慢；TS 写 CLI 速度快但用户面体验不如 Rust。
+- **Go 主体 server**：connector SDK 不齐（slack / linear 等 SaaS 有但 LLM/embedding 二级公民），开发速度低于 Python。
+- **Rust 整体重写**：开发速度慢；社区贡献 connector 门槛太高。
