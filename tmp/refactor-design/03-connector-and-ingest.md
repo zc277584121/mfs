@@ -612,13 +612,72 @@ framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL
 
 daemon 内置简单 scheduler（基于 SQLite + APScheduler 风格），用户可在 connector TOML 里写 `schedule = "*/15 * * * *"` cron 表达式。
 
-## 11. 错误恢复
+## 11. 错误恢复与重跑
 
-- ingest 失败 → 写 `jobs` 表 status=failed + error，cursor 不前进。
-- 用户重跑 `mfs add <uri>` → 从旧 cursor 续。
-- daemon 崩溃恢复 → 启动时 scan jobs 表，将 running 的标 stale，按 cursor 重新调度。
-- chunk 写 Milvus 失败 → 单条重试 N 次，超限标 failed，继续其他 chunk。
-- 部分 chunk 失败的对象在 `mfs status --verbose <uri>` 里可见，下次 sync 重试。
+整套 sync 的正确性靠**三条一致性规则**保证；具体队列/恢复实现见 [06-architecture.md §5](06-architecture.md#55-job-队列用关系型-db-做队列)。
+
+### 11.1 三条一致性规则
+
+**① Chunk-level 幂等**
+
+```
+chunk_id = sha1(object_uri + locator + chunk_kind)    ← 确定性 hash
+写 chunk = DELETE WHERE chunk_id = X + INSERT new row
+```
+
+任何 worker / 重试 / 并发，对同 chunk_id 的写都等效。
+
+**② Per-object 原子**
+
+```
+object_task.status = 'succeeded'
+   ↔ 该 object 的所有 chunks 写入 Milvus 且 cache 已更新
+```
+
+中途任一步失败 → object_task 保持 'running' 或退 'failed'，下次 sync 重试整个 object。
+
+**③ Connector state 末尾提交**
+
+connector 在 `sync()` 过程中通过 `self.state.set()` 写入的 state，**framework 暂存在 `sync_jobs.state_snapshot`**；只有 sync_job 所有 task 成功才 commit 到 `connector_state` 表。
+
+中途崩溃 → state 不 commit → 下次 sync 从上一个成功的 state 接续。`connector.sync()` 必须 idempotent。
+
+framework 不暴露 `commit()` 给 connector——commit 时机由 framework 控制。
+
+### 11.2 故障恢复
+
+daemon / worker 重启时扫一次：
+
+```sql
+UPDATE sync_jobs   SET status='failed', error='interrupted'
+  WHERE status='running' AND heartbeat < now() - interval '5 minutes';
+
+UPDATE object_tasks SET status='pending'
+  WHERE status='running'
+    AND sync_job_id IN (SELECT id FROM sync_jobs WHERE status='failed');
+```
+
+object_tasks 重置为 pending → worker 重新取走重跑。chunk-level 幂等 + per-object 原子保证重跑结果一致。
+
+connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状态接续。
+
+### 11.3 重跑语义
+
+| 命令 | 行为 |
+|---|---|
+| `mfs add <uri>` 已注册 | 新 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
+| `mfs add <uri> --force` | 同上但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
+| `mfs add <uri>` 在前次失败后 | 前次 state 未 commit；从上一个成功的 state 重跑——失败的 object 自然再次出现 |
+| 第二次 `mfs add <uri>` 在前次还 running | 返回 `sync_already_running, see job <id>`（被 sync_jobs UNIQUE 约束拒绝） |
+
+**不提供 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
+
+### 11.4 单 object / 单 chunk 失败
+
+- worker 处理单 object 时，可恢复错误（429 / timeout）自动 retry N 次（指数退避）。
+- 超限 → object_task 标 'failed'，**整 sync_job 继续跑其他 task**（不因单个对象失败放弃全部）。
+- 失败 task 在 `mfs status --verbose <uri>` 和 `mfs job inspect <id>` 可见。
+- 下次 `mfs add` 重新出 ObjectChange → 重新创建 task → 再试一次。
 
 ## 12. 从当前代码版本迁移
 

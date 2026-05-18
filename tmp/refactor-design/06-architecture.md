@@ -288,6 +288,163 @@ Install it with:
 
 默认**显式启动**（用户跑 `mfs serve start`）。`MFS_AUTOSTART=1` 时 CLI 检测不到本机 server 会自动 spawn 一次。
 
+### 5.5 Job 队列：用关系型 DB 做队列
+
+MFS 的 job 队列**直接用 metadata DB 表**（`sync_jobs` + `object_tasks`），不引入 Redis / RabbitMQ / Celery。
+
+理由：
+
+| 维度 | DB 队列（Postgres + SKIP LOCKED） | 外部 broker（Redis/RabbitMQ/Celery） |
+|---|---|---|
+| 部署组件 | 零额外（复用 metadata DB） | 多一个 broker（装/监控/HA） |
+| 一致性 | 事务内 enqueue + state 一起 commit | 跨系统，需要 outbox 才一致 |
+| 持久化 | ACID 天然 | Redis 默认非持久；要配 AOF |
+| 可观测 | SQL 直接查 job 表 | Redis MONITOR / RabbitMQ UI |
+| Schema 演进 | 加字段 / 加索引 | 改 JSON 结构 / 改 hash key |
+| 吞吐上限 | Postgres 单实例几千-几万 op/s | Redis 几十万 op/s |
+| 本地 daemon | SQLite 直接复用 | 用户要装 Redis ❌ |
+| Celery 绑 Python | n/a | 跨语言 worker（如 Rust）受限 |
+
+业界先例：GitLab / Sentry / Trigger.dev / Inngest / Hatchet 都用 Postgres + `SKIP LOCKED`；专用库有 `pgmq`、River。Airflow / Dagster 任务调度也用关系型 DB。
+
+MFS 的瓶颈不是队列吞吐——**embedding API rate limit、LLM 速率、Milvus 写入吞吐**才是上限。任务规模典型每天几十到几万 task，远低于 Postgres 上限。
+
+**未来 escape hatch**：`sync_jobs` + `object_tasks` 表当稳定 API；如果真撑不住，broker 换 Redis / NATS 作为中间派发器，**表 schema 不变**，迁移路径可控。
+
+### 5.6 Worker 模型与 batching
+
+DB 队列不阻止 batch，关键是 **batching layer** 显式分两层放：
+
+**第一层：worker 一次拉 N 个 task**（减少 DB round-trip + Milvus batch INSERT）
+
+```python
+async def worker_loop():
+    while True:
+        tasks = await db.fetch_pending(limit=BATCH_SIZE)   # SELECT ... FOR UPDATE SKIP LOCKED
+        if not tasks:
+            await asyncio.sleep(POLL_INTERVAL_MS / 1000)
+            continue
+
+        all_chunks = []
+        for t in tasks:
+            chunks = await chunk_object(t)                  # read + cache + chunk
+            all_chunks.extend(chunks)
+
+        # batch embedding（API 一次或几次调用）
+        vecs = await embedding_client.batch_embed([c.content for c in all_chunks])
+        for c, v in zip(all_chunks, vecs):
+            c.dense_vec = v
+
+        # batch Milvus INSERT（一次 RPC 写几百到几千行）
+        await milvus.batch_upsert(all_chunks)
+
+        await db.mark_succeeded([t.id for t in tasks])
+```
+
+**第二层：API client 内的 micro-batcher**（处理高并发的小请求合并）
+
+```python
+class BatchingEmbeddingClient:
+    """攒到 max_batch 或超时就 flush，对 worker 透明。
+    多个 asyncio 并发 await embed() 会自动合并成一次 API 调用。
+    """
+    async def embed(self, text: str) -> Vector: ...
+```
+
+DataLoader pattern。embedding / summary / VLM 三类外部 API 都用这个模式。Milvus 不需要 client batcher（worker 显式 batch 写入）。
+
+**不引入 staging 表**（如 `chunks_pending`）。Staging 表会让 chunk lifecycle 从"object_task 内串行"变成"跨表状态机"，复杂度收益不值。
+
+### 5.7 一致性三条规则
+
+整套 sync 的正确性靠这三条保证：
+
+**1. Chunk-level 幂等**
+
+```
+chunk_id = sha1(object_uri + locator + chunk_kind)    ← 确定性 hash
+写 chunk = DELETE WHERE chunk_id = X + INSERT new row
+```
+
+任何 worker / 任何重试 / 任何并发，对同 chunk_id 的写都等效。
+
+**2. Per-object 原子**
+
+```
+object_task.status = 'succeeded'
+   ↔ 该 object 的所有 chunks 都写入 Milvus 且 cache 已更新
+```
+
+中途任一步失败 → object_task 保持 'running' 或退 'failed'，下次 sync 重试整个 object。
+
+**3. State 末尾提交**
+
+```
+connector.sync() 过程中的 self.state.set(...) 写入暂存（sync_jobs.state_snapshot）
+只有当 sync_job 所有 object_task 成功时才 commit 到 connector_state 表
+```
+
+中途崩溃 → state 不 commit → 下次 sync 从上次成功的 state 重启。`connector.sync()` 必须 idempotent（同 state 输入 → 同 ObjectChange 输出，加上新数据）。
+
+framework 不暴露 `commit()` 给 connector——commit 时机由 framework 控制。
+
+### 5.8 故障恢复
+
+daemon / worker 重启时扫一次：
+
+```sql
+-- 心跳超时的 sync_job 标 failed
+UPDATE sync_jobs   SET status='failed', error='interrupted'
+  WHERE status='running' AND heartbeat < now() - interval '5 minutes';
+
+-- 对应 object_tasks 重置为 pending（依赖幂等性，再次被 worker 拉走重跑）
+UPDATE object_tasks SET status='pending'
+  WHERE status='running'
+    AND sync_job_id IN (SELECT id FROM sync_jobs WHERE status='failed');
+```
+
+connector_state 因为没被 commit（state_snapshot 在 sync_jobs 里随 job 失败一起作废），下次 `mfs add` 自然从上一个成功的 state 接续。
+
+**没有 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
+
+### 5.9 重跑语义
+
+| 命令 | 行为 |
+|---|---|
+| `mfs add <uri>` 已注册 | 新建 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
+| `mfs add <uri> --force` | 同上，但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
+| `mfs add <uri>` 在前一个 sync 失败后 | 前次 state 没 commit；从上上次的 state 重跑——失败的 object 自然重新出现在流里 |
+| 第二次 `mfs add <uri>` 在前一个 sync 还 running | 返回 `sync_already_running, see job <id>`（被 UNIQUE 约束拒绝） |
+
+### 5.10 Worker 并发与 batch 配置
+
+`/etc/mfs/server.toml`（或 `~/.mfs/server.toml`）：
+
+```toml
+[worker]
+concurrency = 4                  # 同时跑几个 worker（asyncio task）
+batch_size = 50                  # 一个 worker 一次拉多少 object_task
+poll_interval_ms = 200           # 队列空时轮询间隔
+heartbeat_interval_s = 30        # worker 心跳频率
+
+[embedding]
+batch_size = 100                 # micro-batch 满 100 chunks 触发
+batch_max_wait_ms = 100          # 或等 100ms
+
+[summary]
+batch_size = 20
+batch_max_wait_ms = 500
+
+[vlm]
+batch_size = 10
+batch_max_wait_ms = 500
+
+[milvus]
+insert_batch_size = 1000         # 单次 INSERT 上限
+```
+
+worker 自适应：根据上一轮平均 chunk 数动态调 `batch_size`，避免极大对象（单 task 出 10 万 chunks）和极小对象（单 task 1 chunk）的两种极端。
+
 ## 6. 存储层
 
 三套存储，职责清晰；每套的具体后端独立可换。
@@ -342,33 +499,46 @@ caches (
   PRIMARY KEY (object_uri, cache_kind)
 );
 
-jobs (
-  id              VARCHAR PRIMARY KEY,
-  tenant_id       VARCHAR DEFAULT 'default',
-  kind            VARCHAR,
-  target_uri      VARCHAR,
-  status          VARCHAR,
-  progress_json   TEXT,
-  started_at      TIMESTAMP,
-  finished_at     TIMESTAMP,
-  error           TEXT
+-- ===== Job 队列：两层模型 =====
+sync_jobs (
+  id                    VARCHAR PRIMARY KEY,
+  tenant_id             VARCHAR DEFAULT 'default',
+  connector_id          VARCHAR REFERENCES connectors(id),
+  trigger               VARCHAR,        -- 'manual' | 'scheduled' | 'watch'
+  status                VARCHAR,        -- 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  started_at            TIMESTAMP,
+  finished_at           TIMESTAMP,
+  heartbeat             TIMESTAMP,      -- worker 心跳，用于检测 crash
+  total_objects         INTEGER,
+  succeeded_objects     INTEGER,
+  failed_objects        INTEGER,
+  cancelled_objects     INTEGER,
+  error                 TEXT,           -- 顶层失败原因
+  state_snapshot        TEXT,           -- pending：暂存的 connector state，sync 末尾才 commit
+  -- 关键约束：同 connector 同时只能有一个 running/queued
+  UNIQUE (connector_id) WHERE status IN ('queued', 'running')
 );
 
-manifest (
-  connector_id    VARCHAR,
-  path            VARCHAR,
-  size            INTEGER,
-  mtime_ns        BIGINT,
-  hash            VARCHAR,
-  last_seen       TIMESTAMP,
-  PRIMARY KEY (connector_id, path)
+object_tasks (
+  id                    VARCHAR PRIMARY KEY,
+  sync_job_id           VARCHAR REFERENCES sync_jobs(id),
+  object_uri            VARCHAR,
+  change_kind           VARCHAR,        -- 'added' | 'modified' | 'deleted'
+  status                VARCHAR,        -- 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  attempts              INTEGER DEFAULT 0,
+  last_error            TEXT,
+  started_at            TIMESTAMP,
+  finished_at           TIMESTAMP,
+  INDEX (sync_job_id, status),
+  INDEX (status, started_at) WHERE status = 'running'   -- 心跳超时检测
 );
 
-cursors (
-  connector_id    VARCHAR,
-  key             VARCHAR,
-  value           VARCHAR,
-  updated_at      TIMESTAMP,
+-- ===== Connector 内部 state =====
+connector_state (
+  connector_id          VARCHAR,
+  key                   VARCHAR,        -- connector 自定义的 key（cursor/manifest 等）
+  value                 TEXT,           -- JSON-serializable，schema 由 connector 自定义
+  updated_at            TIMESTAMP,
   PRIMARY KEY (connector_id, key)
 );
 

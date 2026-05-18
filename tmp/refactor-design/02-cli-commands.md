@@ -440,6 +440,7 @@ JSON：
 | `field_missing` | connector 数据缺 text_fields 配置的字段 |
 | `since_unsupported` | 给不支持时间游标的 connector 传 `--since` |
 | `watch_unsupported_on_remote` | remote profile 下用 `mfs status --watch` |
+| `sync_already_running` | 同一 connector 已有 running 的 sync_job（被 UNIQUE 约束拒绝）；返回 `see job <id>` |
 
 ## 13. Pipe 行为
 
