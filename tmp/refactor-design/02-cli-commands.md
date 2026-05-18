@@ -18,7 +18,7 @@ MFS 公开 **16 个顶级命令**：11 个 POSIX 风格动词命令 + 5 个名�
 | `mfs head <path-or-uri>` | 前 N 行/记录 |
 | `mfs tail <path-or-uri>` | 后 N 行/记录；`-f` 跟随 append-only |
 | `mfs export <path-or-uri> <file>` | 把对象写到本地文件 |
-| `mfs remove <path-or-uri>` | 从索引移除 |
+| `mfs remove <path-or-uri>` | 注销 connector + 删 chunks / cache / state（destructive，默认 confirm） |
 
 ### 名词管理命令
 
@@ -301,6 +301,36 @@ mfs connector remove postgres://prod
 
 注册和同步走 `mfs add <uri> --config X`，不在这里。`probe` 用来在正式 `mfs add` 之前验证凭据和连通性。
 
+### `mfs remove`（destructive，默认 confirm）
+
+`mfs remove <uri>` 和 `mfs connector remove <uri>` 等价——注销 connector 并清理一切。
+
+```bash
+mfs remove postgres://prod
+mfs remove ./repo
+mfs remove postgres://prod --yes        # 跳过 confirm（脚本场景）
+```
+
+默认 confirm 列出将删的内容：
+
+```text
+$ mfs remove postgres://prod
+This will permanently delete:
+  - 12,453 chunks in Milvus
+  - 3.2 GB cache in object store
+  - 38 indexed objects
+  - 1 running sync job (will be cancelled)
+
+Continue? [y/N]
+```
+
+confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 cache + 删 metadata → 注销 connector。详细并发协调见 [06-architecture.md §5.11](06-architecture.md#511-操作之间的并发协调)。
+
+幂等性：
+
+- 对同一 connector 重复 `mfs remove` 返回 `already removing, see job <id>`（不重新触发清理）
+- 对不存在的 connector 返回 `not registered`（不报错）
+
 ### `mfs profile`
 
 ```bash
@@ -440,7 +470,9 @@ JSON：
 | `field_missing` | connector 数据缺 text_fields 配置的字段 |
 | `since_unsupported` | 给不支持时间游标的 connector 传 `--since` |
 | `watch_unsupported_on_remote` | remote profile 下用 `mfs status --watch` |
-| `sync_already_running` | 同一 connector 已有 running 的 sync_job（被 UNIQUE 约束拒绝）；返回 `see job <id>` |
+| `sync_already_running` | 同一 connector 已有 in-flight sync；返回 `see job <id>`，提示 `mfs job cancel` |
+| `connector_removing` | connector 正在被 remove，拒绝新 add/sync；让用户等清理完成 |
+| `op_conflict` | 通用并发拒绝（如 sync 中又来 update_config）；error 字段说明拒绝原因和当前 op |
 
 ## 13. Pipe 行为
 

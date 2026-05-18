@@ -290,7 +290,7 @@ Install it with:
 
 ### 5.5 Job 队列：用关系型 DB 做队列
 
-MFS 的 job 队列**直接用 metadata DB 表**（`sync_jobs` + `object_tasks`），不引入 Redis / RabbitMQ / Celery。
+MFS 的 job 队列**直接用 metadata DB 表**（`connector_jobs` + `object_tasks`），不引入 Redis / RabbitMQ / Celery。
 
 理由：
 
@@ -309,7 +309,7 @@ MFS 的 job 队列**直接用 metadata DB 表**（`sync_jobs` + `object_tasks`�
 
 MFS 的瓶颈不是队列吞吐——**embedding API rate limit、LLM 速率、Milvus 写入吞吐**才是上限。任务规模典型每天几十到几万 task，远低于 Postgres 上限。
 
-**未来 escape hatch**：`sync_jobs` + `object_tasks` 表当稳定 API；如果真撑不住，broker 换 Redis / NATS 作为中间派发器，**表 schema 不变**，迁移路径可控。
+**未来 escape hatch**：`connector_jobs` + `object_tasks` 表当稳定 API；如果真撑不住，broker 换 Redis / NATS 作为中间派发器，**表 schema 不变**，迁移路径可控。
 
 ### 5.6 Worker 模型与 batching
 
@@ -380,7 +380,7 @@ object_task.status = 'succeeded'
 **3. State 末尾提交**
 
 ```
-connector.sync() 过程中的 self.state.set(...) 写入暂存（sync_jobs.state_snapshot）
+connector.sync() 过程中的 self.state.set(...) 写入暂存（connector_jobs.state_snapshot）
 只有当 sync_job 所有 object_task 成功时才 commit 到 connector_state 表
 ```
 
@@ -394,16 +394,16 @@ daemon / worker 重启时扫一次：
 
 ```sql
 -- 心跳超时的 sync_job 标 failed
-UPDATE sync_jobs   SET status='failed', error='interrupted'
+UPDATE connector_jobs   SET status='failed', error='interrupted'
   WHERE status='running' AND heartbeat < now() - interval '5 minutes';
 
 -- 对应 object_tasks 重置为 pending（依赖幂等性，再次被 worker 拉走重跑）
 UPDATE object_tasks SET status='pending'
   WHERE status='running'
-    AND sync_job_id IN (SELECT id FROM sync_jobs WHERE status='failed');
+    AND connector_job_id IN (SELECT id FROM connector_jobs WHERE status='failed');
 ```
 
-connector_state 因为没被 commit（state_snapshot 在 sync_jobs 里随 job 失败一起作废），下次 `mfs add` 自然从上一个成功的 state 接续。
+connector_state 因为没被 commit（state_snapshot 在 connector_jobs 里随 job 失败一起作废），下次 `mfs add` 自然从上一个成功的 state 接续。
 
 **没有 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
 
@@ -445,6 +445,118 @@ insert_batch_size = 1000         # 单次 INSERT 上限
 
 worker 自适应：根据上一轮平均 chunk 数动态调 `batch_size`，避免极大对象（单 task 出 10 万 chunks）和极小对象（单 task 1 chunk）的两种极端。
 
+### 5.11 操作之间的并发协调
+
+所有"对一个 connector 的操作"（sync / force_sync / remove / update_config）都统一进 `connector_jobs` 表，用 `op_kind` 区分。**一条 UNIQUE 约束 + 三条规则**覆盖所有并发场景。
+
+#### 三条核心规则
+
+**① 同种重复 → 拒绝（destructive 类除外，幂等）**
+
+- `sync + sync` / `force_sync + force_sync` → 拒绝
+- `remove + remove` → 幂等成功（目标状态就是"消失"）
+- `update_config + update_config` → 拒绝
+
+**② 不同种竞争 → `remove` 是 destructive superset，优先**
+
+`remove` 永远能 preempt sync / force_sync / update_config。其他方向反过来不行：sync / force / update 都不能 preempt 已经 running 的 remove。
+
+**③ 同方向不允许 preempt**
+
+`sync` 中又来 `sync` / `force_sync` → 拒绝。理由：
+
+- sync 已经在做你想做的事，preempt 没有收益
+- force_sync 是 user-explicit destructive 操作，应该让用户显式 `mfs job cancel` 后再来——避免"以为只是 add 结果触发了全量重跑"
+
+跟 git 的设计哲学一致：rebase / merge 中间不能再触发同类操作，必须先 `--abort`。
+
+#### 完整语义表
+
+| 当前 in-flight | 新来 | 行为 |
+|---|---|---|
+| 无 | 任意 | OK |
+| `sync` | `sync` / `add <uri>` | 拒绝 `sync_already_running, see job <id>` |
+| `sync` | `force_sync` / `add --force` | 拒绝 `sync_already_running`；提示先 `mfs job cancel` |
+| `sync` | `remove` | preempt：sync 标 `cancelling`，当前 object_task 完成后退出 → remove 入队 → 跑 |
+| `sync` | `update_config` | 拒绝：先等 sync 完成或先 cancel |
+| `force_sync` | `sync` / `force_sync` | 拒绝 |
+| `force_sync` | `remove` | preempt（同 sync） |
+| `remove` | `add` / `sync` / `force_sync` | 拒绝 `connector_removing, retry after cleanup` |
+| `remove` | `remove` | 幂等成功 `already removing, see job <id>` |
+| `remove` | `update_config` | 拒绝 |
+| `update_config` | `sync` | 拒绝；等 update 完成或 cancel |
+| `update_config` | `remove` | preempt |
+
+#### Sync 中 Remove 的具体流程
+
+```
+sync running on connector C
+    │
+    ▼ mfs remove C 来了
+    │
+    ▼ ① 检查 connectors.status='active'（否则按重复 remove 处理）
+    ▼ ② connectors.status = 'removing'        ← 立刻设置；后续 add/sync 看到就拒绝
+    ▼ ③ INSERT connector_jobs (op_kind='remove', status='queued')
+    │   （UNIQUE 约束此时允许：sync 是 running，remove 是 queued）
+    ▼ ④ 把 running 的 sync 标 cancelling
+    ▼ ⑤ worker 在每个 object_task 边界检查 cancel signal
+    │   当前 task 完成后退出（per-object 原子）
+    ▼ ⑥ sync_job status → 'cancelled'
+    ▼ ⑦ remove job 从 'queued' → 'running'
+    ▼ ⑧ 跑 remove 流程：
+    │     - Milvus: drop_partition(connector_uri)   ← 比 delete by filter 快很多
+    │     - object store: 删 cache 文件
+    │     - metadata DB: 删 caches / connector_state / objects / connector_jobs / object_tasks
+    ▼ ⑨ connectors row DELETE
+    ▼ ⑩ remove job status → 'succeeded'
+```
+
+清理顺序确保**幂等可重入**：如果 step ⑧ 中途崩溃，下次重启 worker 重跑 remove job，可以从任何一步开始（DROP 一次空 partition / 删空目录都是 no-op）。
+
+用户那边 `mfs status C` 在 ④-⑥ 期间看到：
+
+```
+Connector: postgres://prod
+Status:    removing
+Current job: job_remove_xx (queued)
+  waiting for: job_sync_yy (cancelling)
+```
+
+#### Worker 端的 cancel 检查
+
+worker 在两个地方检查 cancel signal：
+
+```python
+async def process_object_task(task):
+    if await is_cancelled(task.connector_job_id):
+        task.status = 'cancelled'
+        return
+
+    # 整 task 是原子单元，中途不打断（per-object 原子规则）
+    await do_work(task)
+    task.status = 'succeeded'
+```
+
+对单 task 耗时极长的场景（一个 object 出 10 万 chunk），可在 chunk 批次边界加细检查点：
+
+```python
+for chunk_batch in chunks.chunked(BATCH):
+    if await is_cancelled(task.connector_job_id):
+        task.status = 'cancelled'
+        return    # 整 task 算 cancelled，已写入的 chunks 留着（下次 sync 幂等覆盖）
+    await embed_and_write(chunk_batch)
+```
+
+`is_cancelled()` 查询是 in-memory cached（每 N 秒刷新一次），不每次都打 DB。
+
+#### Scheduler / Watcher 的协调
+
+定时同步和 watch 触发的 sync 也通过同一个表入口。`connectors.status='removing'` 时：
+
+- scheduler 看到就**跳过**这个 connector
+- daemon 内 file watcher 检测到 `status='removing'` 立刻**停止该 root 的 watcher**
+- 即使刚刚 race 触发了一个 sync，会被 UNIQUE 约束拒绝或被随后的 cancel 流程清掉
+
 ## 6. 存储层
 
 三套存储，职责清晰；每套的具体后端独立可换。
@@ -463,6 +575,7 @@ connectors (
   root_uri        VARCHAR,
   type            VARCHAR,
   label           VARCHAR,
+  status          VARCHAR DEFAULT 'active',   -- 'active' | 'removing'
   config_json     TEXT,
   config_hash     VARCHAR,
   credential_ref  VARCHAR,
@@ -499,29 +612,30 @@ caches (
   PRIMARY KEY (object_uri, cache_kind)
 );
 
--- ===== Job 队列：两层模型 =====
-sync_jobs (
+-- ===== Job 队列：统一所有 connector op =====
+connector_jobs (
   id                    VARCHAR PRIMARY KEY,
   tenant_id             VARCHAR DEFAULT 'default',
   connector_id          VARCHAR REFERENCES connectors(id),
+  op_kind               VARCHAR,        -- 'sync' | 'force_sync' | 'remove' | 'update_config'
   trigger               VARCHAR,        -- 'manual' | 'scheduled' | 'watch'
-  status                VARCHAR,        -- 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  status                VARCHAR,        -- 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'failed'
   started_at            TIMESTAMP,
   finished_at           TIMESTAMP,
   heartbeat             TIMESTAMP,      -- worker 心跳，用于检测 crash
-  total_objects         INTEGER,
+  total_objects         INTEGER,        -- 仅 op_kind IN ('sync','force_sync')
   succeeded_objects     INTEGER,
   failed_objects        INTEGER,
   cancelled_objects     INTEGER,
   error                 TEXT,           -- 顶层失败原因
   state_snapshot        TEXT,           -- pending：暂存的 connector state，sync 末尾才 commit
-  -- 关键约束：同 connector 同时只能有一个 running/queued
+  -- 关键约束：同 connector 同时只能有一个 in-flight op
   UNIQUE (connector_id) WHERE status IN ('queued', 'running')
 );
 
 object_tasks (
   id                    VARCHAR PRIMARY KEY,
-  sync_job_id           VARCHAR REFERENCES sync_jobs(id),
+  connector_job_id      VARCHAR REFERENCES connector_jobs(id),   -- 仅 sync/force_sync 类 job 有 task
   object_uri            VARCHAR,
   change_kind           VARCHAR,        -- 'added' | 'modified' | 'deleted'
   status                VARCHAR,        -- 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
@@ -529,7 +643,7 @@ object_tasks (
   last_error            TEXT,
   started_at            TIMESTAMP,
   finished_at           TIMESTAMP,
-  INDEX (sync_job_id, status),
+  INDEX (connector_job_id, status),
   INDEX (status, started_at) WHERE status = 'running'   -- 心跳超时检测
 );
 

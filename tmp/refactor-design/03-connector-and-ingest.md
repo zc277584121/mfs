@@ -638,7 +638,7 @@ object_task.status = 'succeeded'
 
 **③ Connector state 末尾提交**
 
-connector 在 `sync()` 过程中通过 `self.state.set()` 写入的 state，**framework 暂存在 `sync_jobs.state_snapshot`**；只有 sync_job 所有 task 成功才 commit 到 `connector_state` 表。
+connector 在 `sync()` 过程中通过 `self.state.set()` 写入的 state，**framework 暂存在 `connector_jobs.state_snapshot`**；只有 sync_job 所有 task 成功才 commit 到 `connector_state` 表。
 
 中途崩溃 → state 不 commit → 下次 sync 从上一个成功的 state 接续。`connector.sync()` 必须 idempotent。
 
@@ -649,12 +649,12 @@ framework 不暴露 `commit()` 给 connector——commit 时机由 framework 控
 daemon / worker 重启时扫一次：
 
 ```sql
-UPDATE sync_jobs   SET status='failed', error='interrupted'
+UPDATE connector_jobs   SET status='failed', error='interrupted'
   WHERE status='running' AND heartbeat < now() - interval '5 minutes';
 
 UPDATE object_tasks SET status='pending'
   WHERE status='running'
-    AND sync_job_id IN (SELECT id FROM sync_jobs WHERE status='failed');
+    AND connector_job_id IN (SELECT id FROM connector_jobs WHERE status='failed');
 ```
 
 object_tasks 重置为 pending → worker 重新取走重跑。chunk-level 幂等 + per-object 原子保证重跑结果一致。
@@ -668,9 +668,13 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 | `mfs add <uri>` 已注册 | 新 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
 | `mfs add <uri> --force` | 同上但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
 | `mfs add <uri>` 在前次失败后 | 前次 state 未 commit；从上一个成功的 state 重跑——失败的 object 自然再次出现 |
-| 第二次 `mfs add <uri>` 在前次还 running | 返回 `sync_already_running, see job <id>`（被 sync_jobs UNIQUE 约束拒绝） |
+| 第二次 `mfs add <uri>` 在前次还 running | 返回 `sync_already_running, see job <id>`（被 connector_jobs UNIQUE 约束拒绝） |
+| `mfs remove <uri>` 在前次 sync running | preempt：sync 标 `cancelling`，当前 object_task 完成后退出，remove 接管 |
+| `mfs add <uri>` 在 connector `status='removing'` 时 | 拒绝 `connector_removing`，等清理完才能重新注册 |
 
 **不提供 `mfs job retry` 命令**——重跑 = 下次 `mfs add`，state 没 commit 时自然接续。
+
+并发协调的完整语义表见 [06-architecture.md §5.11](06-architecture.md#511-操作之间的并发协调)。
 
 ### 11.4 单 object / 单 chunk 失败
 
