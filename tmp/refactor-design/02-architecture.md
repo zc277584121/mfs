@@ -375,8 +375,6 @@ mfs serve logs                     # ~/.mfs/server.log
 mfs serve requires mfs-server package.
 Install it with:
   uv tool install mfs-server
-# 或
-  mfs serve install
 ```
 
 ### 5.3 本地鉴权
@@ -1117,74 +1115,174 @@ v0.4 **不实现多租户**，但 schema 全部预留。多租户指**一个 MFS
 | 几千万 chunks | 调 Milvus shard / 升级 HNSW 参数；考虑分 partition |
 | 亿级 chunks | 切 `per_connector` 或 `per_tenant` collection；冷热分层 |
 
-## 10. 镜像与包
+## 10. 发布与分发
 
-| 交付物 | 实现语言 | 内容 | 入口 / 包名 |
+### 10.1 交付物清单
+
+| 交付物 | 实现 | 注册中心 | 用户安装 |
 |---|---|---|---|
-| **mfs CLI binary** | Rust | CLI、HTTP transport、profile、输出 | `mfs` (单 binary，多平台) |
-| `mfs-sdk` PyPI | Python | Python SDK（程序化集成，独立于 CLI） | `import mfs` |
-| `@mfs/sdk` npm | TypeScript | JS/TS SDK | OpenAPI 生成 |
-| Go SDK | Go module | OpenAPI 生成 | `github.com/zilliztech/mfs-sdk-go` |
-| Java SDK | Maven | OpenAPI 生成 | `io.zilliz.mfs:mfs-sdk` |
-| PyPI `mfs-server` | Python (+ Rust PyO3) | API、worker、engine、connectors、objects、pipeline、storage | `mfs-server` |
-| Docker `mfs-server-aio` | — | 单容器：API + worker | demo / 小规模 |
-| Docker `mfs-api` | — | 只跑 API | 正式部署 |
-| Docker `mfs-worker` | — | 只跑 worker | 正式部署 |
+| **`mfs` CLI binary** | Rust | GitHub Releases + crates.io + Homebrew tap + Scoop bucket + PyPI wheel | `brew` / `scoop` / `cargo install` / `uv tool install` / `curl install.sh` |
+| **`mfs-server`** | Python + Rust PyO3 | PyPI（wheel 多平台，含 Rust 编译产物） | `uv tool install mfs-server` |
+| **Docker `mfs-api` / `mfs-worker` / `mfs-server-aio`** | — | ghcr.io / Docker Hub | `docker pull` / Compose / Helm |
+| **`mfs-sdk` (Python)** | Python | PyPI | `pip install mfs-sdk`（程序化集成；独立于 CLI） |
+| **`@mfs/sdk` (TS)** | TypeScript | npm | `npm install @mfs/sdk` |
+| **Go SDK** | Go | Go module proxy | `go get github.com/zilliztech/mfs-sdk-go` |
+| **Java SDK** | Java | Maven Central | `io.zilliz.mfs:mfs-sdk` |
 
-CLI 多平台分发：
+多语言 SDK 都从 `protocol/openapi.yaml` 生成。
 
-```bash
-# 用户面安装（CLI 是 Rust binary，跟 server 解耦）
-brew install mfs                              # macOS / Linux Homebrew
-scoop install mfs                              # Windows
-cargo install mfs                              # 通过 cargo（任何平台）
-curl -fsSL https://mfs.dev/install.sh | sh    # 直接下载 binary
+### 10.2 CLI 跨平台 build 与分发（cargo-dist）
+
+CLI 是 Rust 单 binary，跟平台相关。用 **`cargo-dist`** 自动化整个发布——业界标准做法（uv / ruff / starship / zellij / atuin 都用）。
+
+**Target matrix**（6 个 binary 覆盖 99% 用户）：
+
+```
+x86_64-unknown-linux-gnu        # Linux x86_64（大多 server / dev box）
+aarch64-unknown-linux-gnu       # Linux ARM64（AWS Graviton / Ampere）
+x86_64-unknown-linux-musl       # Alpine / 静态链接（可选）
+x86_64-apple-darwin             # macOS Intel
+aarch64-apple-darwin            # macOS Apple Silicon (M1+)
+x86_64-pc-windows-msvc          # Windows x86_64
 ```
 
-Server 端（Python）：
+**发布触发**：一个 git tag 触发 GitHub Actions matrix：
+
+```
+git tag v0.4.0 && git push --tags
+    ↓
+GitHub Actions（cargo-dist 生成的 workflow）自动：
+  ① matrix build 6 个平台 binary
+  ② 打包 tar.gz / zip
+  ③ 上传到 GitHub Releases
+  ④ 更新 install.sh / install.ps1
+  ⑤ 自动 PR 到 Homebrew tap repo
+  ⑥ 可选：scoop manifest / AUR PKGBUILD
+```
+
+整个 build matrix 跑完通常 10-15 分钟。
+
+### 10.3 Server 端 Rust 模块走 maturin → PyPI wheel
+
+`server-rs/` 里的 Rust crate（`mfs-scan` / `mfs-jsonl` / `mfs-grep`）**不单独发布到 crates.io**——它们是 `mfs-server` Python 包的 native 扩展，跟 mfs-server 一起 build。
+
+**工作流**：
 
 ```bash
-uv tool install mfs-server                     # 跑本机 server
+# 开发时（贡献者）
+cd server-rs/
+maturin develop --release            # 编译 Rust → 安装到当前 Python venv
+# Python 代码 from mfs_server_rs import scan_dir, parse_jsonl_stream
+
+# 发布时（CI）
+maturin build --release --target <platform>   # matrix build wheel
+twine upload dist/*.whl                       # 上传 PyPI
+```
+
+每个 `mfs-server` 版本在 PyPI 上对应**多个 wheel**（每平台一个），里面已经包含编译好的 Rust 产物（`.so` / `.pyd`）。
+
+**用户感知不到 Rust**：
+
+```bash
+uv tool install mfs-server
+# pip / uv 自动选当前平台的 wheel
+# wheel 里是 .py + .so，用户不需要装 Rust 工具链
+```
+
+业界先例：**pydantic-core**（pydantic 的 Rust 内核）/ **ruff_python_parser** / **polars** / **tokenizers** — 全是这个模式。
+
+### 10.4 Rust 的"PyPI" = crates.io
+
+| 生态 | 包注册中心 | 默认安装命令 |
+|---|---|---|
+| Python | **PyPI** | `pip install` / `uv tool install` |
+| JS / TS | **npm** | `npm install` |
+| **Rust** | **crates.io** | `cargo install` |
+| Go | proxy.golang.org | `go install` |
+
+**Rust 关键不同**：`cargo install <pkg>` 是**下载源码 + 本地编译**（不是下二进制），所以纯走 crates.io 用户要等几分钟编译。
+
+业界主流 Rust CLI 因此**多渠道并行发布**：
+
+| 渠道 | 体验 | 主要受众 |
+|---|---|---|
+| **GitHub Releases binary**（cargo-dist 自动） | 一行 install.sh / 解压即用 | 大多数用户 |
+| **Homebrew tap**（cargo-dist 自动 PR） | `brew install` | macOS / Linux |
+| **Scoop bucket** | `scoop install` | Windows |
+| **PyPI wheel**（via maturin） | `pip install` / `uv tool install` | Python / agent 用户（最大群） |
+| **crates.io**（`cargo publish`） | `cargo install`（编译慢） | Rust 开发者 |
+| AUR / Snap / Chocolatey | 包管理器命令 | 社区维护，可选 |
+
+crates.io 是"Rust 用户的便利入口"，**不是主分发路径**。
+
+### 10.5 用户安装速查（按系统）
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://mfs.dev/install.sh | sh        # 一行
+brew install zilliztech/tap/mfs                   # Homebrew
+```
+
+**Windows**
+
+```powershell
+irm https://mfs.dev/install.ps1 | iex             # 一行
+scoop bucket add zilliz https://github.com/zilliztech/scoop-bucket
+scoop install mfs                                 # Scoop
+```
+
+**通过包管理器**
+
+```bash
+cargo install mfs                                 # Rust 用户
+pip install mfs                                   # Python 用户（实际装 wheel，里面是 Rust binary）
+uv tool install mfs                               # uv 用户
+```
+
+**Server 端**（Python；自带 Rust PyO3 wheel）
+
+```bash
+uv tool install mfs-server                        # 个人本机
 # 或运维端走 Docker / K8s（见 §8）
 ```
 
-便利组合（个人本机一次装两个）：
-
-```bash
-mfs serve install                              # CLI 内置子命令，自动 uv tool install mfs-server
-```
-
-server optional extras（按 connector 安装）：
+### 10.6 Server optional extras（按 connector 安装）
 
 ```text
-mfs-server[postgres]
-mfs-server[mysql]
-mfs-server[mongo]
-mfs-server[bigquery]
-mfs-server[snowflake]
-mfs-server[slack]
-mfs-server[discord]
-mfs-server[gmail]
-mfs-server[gdrive]
-mfs-server[feishu]
-mfs-server[s3]
-mfs-server[github]
-mfs-server[linear]
-mfs-server[jira]
+mfs-server[postgres]    mfs-server[mysql]       mfs-server[mongo]
+mfs-server[bigquery]    mfs-server[snowflake]
+mfs-server[slack]       mfs-server[discord]     mfs-server[gmail]
+mfs-server[gdrive]      mfs-server[feishu]      mfs-server[s3]
+mfs-server[github]      mfs-server[linear]      mfs-server[jira]
 mfs-server[notion]
-mfs-server[salesforce]
-mfs-server[hubspot]
-mfs-server[zendesk]
+mfs-server[salesforce]  mfs-server[hubspot]     mfs-server[zendesk]
 mfs-server[web]
-mfs-server[embedding-onnx]
-mfs-server[embedding-google]
-mfs-server[llm-anthropic]
-mfs-server[llm-google]
+mfs-server[embedding-onnx]   mfs-server[embedding-google]
+mfs-server[llm-anthropic]    mfs-server[llm-google]
 mfs-server[zilliz]
 mfs-server[all]
 ```
 
-多语言 SDK：npm / Go module / Maven，基于 `protocol/openapi.yaml` 生成。
+### 10.7 发布动作总结
+
+每次发版的实际工作流：
+
+```
+本地：
+  bump 版本号（Cargo.toml + pyproject.toml + package.json 等）
+  git commit -m "release v0.4.0"
+  git tag v0.4.0 && git push --tags
+
+GitHub Actions 自动跑：
+  ① cargo-dist workflow: build CLI 多平台 binary → GH Releases + Homebrew PR
+  ② maturin workflow:    build mfs-server wheel 多平台 → PyPI
+  ③ docker workflow:     build / push mfs-api / mfs-worker / mfs-server-aio → ghcr.io
+  ④ npm publish workflow: TS SDK → npm
+  ⑤ Go SDK 通过 git tag 自动可用（无需 publish）
+  ⑥ Maven publish workflow: Java SDK → Maven Central
+
+一次 git tag 触发全套。
 
 ## 11. 工程目录结构
 
@@ -1234,11 +1332,14 @@ mfs-server[all]
 │           └── runtime/
 │
 ├── server-rs/                                 # ⭐ Rust 加速模块（PyO3 绑定）
-│   ├── Cargo.toml
+│   ├── Cargo.toml                             # workspace 声明子 crate
+│   ├── pyproject.toml                         # maturin 构建配置（指向 PyPI mfs-server 包）
 │   ├── mfs-scan/                              # 大目录扫描 + manifest hash
 │   ├── mfs-jsonl/                             # JSONL / CSV / Parquet 流处理（polars 或自实现）
 │   └── mfs-grep/                              # 高并发线性 grep
-│   # build: maturin develop / pip install . → 生成 mfs_server_rs.<ext> 给 Python import
+│   # 开发: maturin develop --release  → 安装到当前 venv，Python from mfs_server_rs import ...
+│   # 发布: maturin build --release --target <platform> → wheel 含 .so/.pyd，上传 PyPI（跟 mfs-server 一起）
+│   # 不单独发布到 crates.io；作为 mfs-server 包的 native 扩展（业界先例：pydantic-core/polars/ruff）
 │
 ├── sdks/                                      # 多语言 SDK（OpenAPI 生成）
 │   ├── python/                                # PyPI: mfs-sdk（程序化集成用，独立于 CLI）
