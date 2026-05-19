@@ -506,6 +506,8 @@ daemon / worker 重启时扫一次：
 
 ```sql
 -- 心跳超时的 sync_job 标 failed
+-- heartbeat 是 connector_jobs 表里的一个 TIMESTAMP 字段，worker 跑 task 时
+-- 周期 UPDATE 它；housekeeping coroutine 看到超过 5 分钟没刷就判定 worker 崩了。
 UPDATE connector_jobs SET status='failed', error='interrupted'
   WHERE status='running' AND heartbeat < now() - interval '5 minutes';
 
@@ -516,6 +518,57 @@ UPDATE object_tasks SET status='pending'
 ```
 
 state 没 commit，下次 `mfs add` 自然从上一个成功的 state 接续。没有 `mfs job retry` 命令——重跑 = 下次 `mfs add`。
+
+#### 错误分类：retry-able vs fatal
+
+单 task 失败有两类原因，区别对待：
+
+| 类型 | 例子 | 处理 |
+|---|---|---|
+| **retry-able**（瞬时） | HTTP 429 / 5xx、TCP timeout、Milvus 偶发不可用 | 单 task 指数退避重试 N 次（默认 3），超限标 `failed`。**整 sync_job 继续跑其他 task** |
+| **fatal**（结构性） | HTTP 401（auth 失效） / 402（quota / 没钱） / Embedding API key invalid / 5xx 连续不退 | task 标 `failed`，**触发 circuit breaker** |
+
+**Circuit breaker**：worker 维护一个滑动窗口计数器，**同一 sync_job 内连续 N 个 task 因同类 fatal 错误失败**（默认 5），判定为外部依赖结构性故障：
+
+- 立刻 abort 整个 sync_job，标 `failed`，`error` 字段写明 fatal 类型（如 `embedding_quota_exceeded`）
+- 后续 pending task 标 `cancelled`
+- 不再无意义白跑剩下几千个 task 烧时间
+
+用户视角：
+
+```
+$ mfs status postgres://prod
+Connector: postgres://prod
+Status:    failed
+Last job:  job_01HX... (failed)
+  Reason:  embedding API quota exceeded (HTTP 402)
+  Tasks:   142 succeeded, 5 failed (consecutive 402), 1234 cancelled
+
+Recommendation: top up your embedding provider, then `mfs add postgres://prod`
+```
+
+错误码相应增加：
+
+| code | 含义 |
+|---|---|
+| `embedding_quota_exceeded` | embedding API 返回 402 / quota_exceeded |
+| `embedding_auth_failed` | embedding API 返回 401 / invalid key |
+| `vlm_quota_exceeded` / `vlm_auth_failed` | VLM 同上 |
+| `summary_quota_exceeded` / `summary_auth_failed` | summary 同上 |
+| `connector_auth_failed` | connector 凭据失效（postgres 密码错 / GitHub token 过期等） |
+| `circuit_breaker_tripped` | 连续 N 个 task fatal，整 job abort |
+
+配置：
+
+```toml
+[worker.retry]
+max_retries = 3                     # 单 task 重试上限（retry-able 错误）
+backoff_initial_ms = 1000
+backoff_max_ms = 30000
+
+[worker.circuit_breaker]
+consecutive_fatal_threshold = 5     # 连续这么多 fatal 触发整 job abort
+```
 
 ### 7.2 重跑语义
 
@@ -600,30 +653,55 @@ CREATE UNIQUE INDEX ux_connector_jobs_one_queued
 
 ### 8.3 Sync 中的 Remove 流程
 
+场景：用户正在跑 `mfs add postgres://prod`（一个 sync_job 可能要跑几小时），改主意跑 `mfs remove postgres://prod`。总不能等几小时——remove 要能**插队中断当前 sync**。
+
+#### 整体流程
+
 ```
-sync running on connector C
-  │
-  ▼ mfs remove C 来了
-  │
-  ① 检查 connectors.status='active'（否则按重复 remove）
-  ② connectors.status = 'removing'           ← 立刻设置；之后的 add/sync 看到就拒绝
-  ③ INSERT connector_jobs (op_kind='remove', status='queued')
-  ④ 把 running 的 sync 标 cancelling
-  ⑤ worker 在每个 object_task 边界检查 cancel signal，当前 task 完成后退出
-  ⑥ sync_job status → 'cancelled'
-  ⑦ remove job 'queued' → 'running'
-  ⑧ 清理：
-     - Milvus: DELETE WHERE namespace_id = X AND connector_uri = <root>
-       （按 partition_key 路由，只扫该 connector 的桶，不是全表）
-     - object store: 删 cache + staging files/ 树
-     - metadata DB: 删 caches / connector_state / objects / upload_manifests / object_tasks / connector_jobs
-  ⑨ connectors row DELETE
-  ⑩ remove job 'succeeded'
+你跑 mfs remove postgres://prod
+   │
+   ① connectors.status = 'removing'        ← 一个 flag，之后的 add/sync 看到就拒绝
+   ② INSERT 一个 remove 的 job 行，status='queued'
+   │  （UNIQUE 约束此时允许：sync 占 running，remove 占 queued）
+   ③ 给当前 running 的 sync_job 发"cancel"信号（不强杀进程）
+   │
+   ▼  worker 收到 cancel 信号
+   ④ 当前 object_task 跑完 → worker 退出 → sync_job 标 'cancelled'
+   ▼
+   ⑤ remove_job 从 'queued' → 'running'，开始清理：
+        Milvus:    DELETE WHERE namespace_id = X AND connector_uri = <root>
+                   （按 partition_key 路由，只扫该 connector 的桶，不是全表）
+        Object store: 删 cache + staging files/
+        Metadata DB:  删 caches / objects / connector_state /
+                          upload_manifests / object_tasks / connector_jobs
+   ⑥ connectors 表行 DELETE
+   ⑦ remove_job 标 'succeeded'
 ```
 
-清理顺序保证幂等可重入：⑧ 中途崩，下次重启 worker 从任何一步开始都是 no-op。
+#### 两个关键概念
 
-期间 `mfs status C` 看到：
+**Per-object 原子**：单个 object_task 要么所有 chunks 都写完成功（status='succeeded'），要么完全没写（status='pending'）。**不存在"半截写了 5 个 chunks 没写完"的中间状态**。
+
+这是为了让 cancel / crash 后可以安全地从 task 级别重跑——不会出现"前半 chunks 写过了后半没写，谁也不知道哪些写过了"的脏状态。所以 worker 看到 cancel 信号时不是踩急刹车，是"跑完手头这个 object 再停"：
+
+```python
+async def process_object_task(task):
+    if await is_cancelled(task.connector_job_id):    # 进 task 前看一眼
+        task.status = 'cancelled'
+        return
+    await do_work(task)                              # 整 task 不打断
+    task.status = 'succeeded'
+```
+
+`is_cancelled()` 是 in-memory cached（每几秒刷一次），不每次都打 DB。
+
+单 task 耗时极长（一个 object 出 10 万 chunk）的场景可以在 chunk 批次边界加细检查点，cancel 后已写入的 chunks 留着（下次 sync 因为 chunk_id 幂等会覆盖，不会脏）。
+
+**中途崩可重入**：⑤ 的清理动作有 6 个步骤。如果跑到一半 worker 崩了，下次重启 worker 看到 remove_job 还是 'running' → 从头重新跑这 6 步。**这些步骤都是幂等的**（DELETE 已没匹配行 = no-op，删空目录 = no-op），重跑没副作用。所以不需要在 remove 中间记任何"我跑到哪一步了"的细粒度状态。
+
+#### 用户视角
+
+cancel 过渡期间 `mfs status postgres://prod` 看到：
 
 ```
 Connector: postgres://prod
@@ -632,21 +710,7 @@ Current job: job_remove_xx (queued)
   waiting for: job_sync_yy (cancelling)
 ```
 
-worker 端检查 cancel signal：
-
-```python
-async def process_object_task(task):
-    if await is_cancelled(task.connector_job_id):
-        task.status = 'cancelled'
-        return
-    # 整 task 是原子单元，中途不打断
-    await do_work(task)
-    task.status = 'succeeded'
-```
-
-单 task 耗时极长（一个 object 出 10 万 chunk）的场景可以在 chunk 批次边界加细检查点，cancel 后已写入的 chunks 留着（下次 sync 幂等覆盖）。`is_cancelled()` 是 in-memory cached，不每次都打 DB。
-
-Scheduler / Watcher 也通过同一个表入口：`connectors.status='removing'` 时 scheduler 跳过、watcher 停止该 root，避免 race。
+Scheduler / Watcher 也通过同一个 flag 协调：`connectors.status='removing'` 时 scheduler 跳过这个 connector、watcher 停止该 root，避免 race。
 
 ## 9. 多租户与 namespace
 
@@ -726,26 +790,11 @@ token → user_id → 该 user 能访问的 namespace_id 集合
 | 跨 workspace 共享数据 | 同一 namespace_id 出现在多个 `workspace_namespaces` 行 |
 | 个人迁到团队 | 把 namespace 从 `user_namespaces` 移到 `workspace_namespaces`——数据零迁移 |
 
-### 9.4 Milvus 隔离策略
+### 9.4 Milvus 隔离
 
-默认在 Milvus 层用 scalar filter（`namespace_id IN (...)`）。某些 namespace 数据量大或需要更强隔离时，可以按 `collection_strategy` 升级：
+v0.4 整个 MFS 一张 collection，所有 namespace 共享，靠 `namespace_id IN (...)` scalar filter + chunk_id 含 namespace_id 防撞做隔离。partition_key 物理分桶按 connector_uri，所以同 connector 的查询天然只扫一个桶（详见 [§10.3](#103-milvus)）。
 
-| 策略 | Milvus 实现 | 隔离强度 | 资源开销 | 适用 |
-|---|---|---|---|---|
-| `single`（默认） | 一张 collection，按 `namespace_id` scalar filter | 弱 | 最小 | v0.4 / 小规模 |
-| `per_connector` | 一 connector 一张 collection | 中 | 中 | 数据量大时按 connector 切 |
-| `per_namespace` | 一 namespace 一张 collection | 强 | 大 | 多租户强隔离 / 合规 |
-| `database_per_namespace` | 一 namespace 一 Milvus database | 最强 | 最大 | enterprise 合规 |
-
-切策略通过迁移工具（roadmap）。
-
-### 9.5 数据量分层
-
-| 量级 | 策略 |
-|---|---|
-| < 几百万 chunks | 默认 `single` 够 |
-| 几千万 chunks | 调 Milvus shard / HNSW 参数；考虑分 partition |
-| 亿级 chunks | 切 `per_connector` 或 `per_namespace`；冷热分层 |
+数据量大或需要强隔离（合规 / SaaS multi-tenant）时切多 collection（per_connector / per_namespace）是 v0.5+ 范畴——届时会带迁移工具一起设计。v0.4 不预留 toml 配置项以免误用。
 
 ## 10. 存储层
 
@@ -988,25 +1037,25 @@ v0.4 主推 Lite（个人）+ Zilliz Cloud（CS）。自部署 Milvus 是多容�
 uri = "~/.mfs/milvus.db"               # 默认 Lite
 # uri = "https://xxx.zillizcloud.com"  # CS
 # token = "..."
-collection_strategy = "single"          # single | per_connector | per_namespace
 ```
+
+v0.4 整个 MFS 一张 `mfs_chunks` collection，所有 namespace / connector 共享，用 partition_key 物理分桶 + namespace_id scalar filter 隔离。多 collection 切分策略（per_connector / per_namespace）是 v0.5+ 看数据量规模再做的事，会带配套迁移工具一起设计，v0.4 不预留配置项以免误用。
 
 ## 11. 凭据
 
 ### 11.1 Connector 凭据
 
-connector TOML 用 `credential_ref` 引用，不写明文：
+connector TOML 用 `credential_ref` 引用，不写明文。**v0.4 只支持 `env:VAR_NAME` 一种 scheme**——简单、跨平台、CI / Docker / systemd 都通行：
 
 ```toml
 credential_ref = "env:PG_PROD_DSN"
-credential_ref = "secret:pg-prod-readonly"
-credential_ref = "file:~/.mfs/secrets/pg-prod.toml"
-credential_ref = "vault:secret/data/mfs/pg-prod"
 ```
 
-解析顺序：
+`credential_ref` 字符串格式预留 scheme 前缀（`env:` / 未来可加 `secret:` / `file:` / `vault:`），v0.5+ 加新 scheme 时**用户配置不需要变**。其他 scheme 的解析 v0.4 直接返回 `not_implemented_yet` 错误。
 
-1. `env:VAR`——环境变量
+未来 scheme 路线图（不是 v0.4 范围）：
+
+1. `env:VAR`——环境变量（v0.4 唯一支持）
 2. `secret:NAME`——OS keychain（macOS Keychain / Linux secret-service / Windows Credential Manager）
 3. `file:PATH`——本地文件，默认权限 0600
 4. `vault:PATH`——HashiCorp Vault（远端部署主流）

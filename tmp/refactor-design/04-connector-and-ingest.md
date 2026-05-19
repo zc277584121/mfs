@@ -94,9 +94,9 @@ HTTP 主要走 control plane，唯一例外是 remote profile 下本地文件 up
 $ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
-Estimated sync (based on 1% probe sample, ±50% accuracy):
-  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
-  duration:  ~8h on 4 workers
+Estimated work (based on 1% probe sample, ±50% accuracy):
+  chunks:    ~14M
+  tokens:    ~2.4M (use your provider's rate to compute cost)
   storage:   ~3.2GB index + cache
 
 Continue? [y/N]
@@ -106,9 +106,9 @@ Continue? [y/N]
 
 1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
 2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
-3. 按抽样外推总成本，明示 ±50% 精度
+3. 按抽样外推总 chunks / tokens / storage，明示 ±50% 精度
 
-不承诺精确估算——embedding token 数依赖 tokenizer 和实际内容，事先精确算只能跑完才知道。
+**只给物理量，不给钱和时间**——钱因 embedding provider 而异（OpenAI / Voyage / Cohere / 自部署 / 企业协议价都不同），时间受并发 / rate limit / 网络浮动 10x，硬给反而误导。token 数靠抽样 tokenizer 算出来，是个可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。
 
 `--yes` 或本地路径直接开始：
 
@@ -310,6 +310,10 @@ embedding_fp               = sha1( chunk_fp + embedding_model + embedding_model_
 
 Connector 不参与这套逻辑，只提供 upstream fingerprint。下游全由 framework 算。
 
+公式里的 `chunker_config` / `vlm_prompt` 等是**序列化字符串**（JSON / TOML），把所有相关参数揉进去——chunk_size 改 1500→1000，序列化字符串就变，hash 就变。换 provider / model 同理：`embedding_model` 含 provider/model/version 三段。
+
+注意：**配置字符串只进 fp 不进 chunk_id**。chunk_id 是主键，目标是"同一条 record 重 sync 时 UPSERT 覆盖同一行"，所以只用 namespace/connector/object/locator/chunk_kind（这些跟 config 无关）。chunk_fp 才是判断"内容是不是 stale"的指纹，含所有 config。否则换 config 后旧行就成"幽灵行"无法 UPSERT 覆盖。
+
 #### Reconcile 4 步
 
 每次 sync_job 对每个 object 跑这套比对（per-object，early-exit）：
@@ -491,16 +495,13 @@ async def sync(self):
 
 ## 6. 凭据管理
 
-connector TOML 不写明文，只写 `credential_ref`：
+connector TOML 不写明文，只写 `credential_ref`。v0.4 只支持环境变量：
 
 ```toml
-credential_ref = "secret:pg-prod-readonly"          # OS keychain
-credential_ref = "env:PG_PROD_DSN"                  # 环境变量
-credential_ref = "file:~/.mfs/secrets/pg-prod.toml" # 文件
-credential_ref = "vault:secret/data/mfs/pg-prod"    # Vault（远端部署）
+credential_ref = "env:PG_PROD_DSN"
 ```
 
-解析优先级和具体 schema 见 [02 §11](02-architecture.md#11-凭据)。
+其他 scheme（OS keychain / 文件 / Vault）是 v0.5+ 的路线图，详见 [02 §11](02-architecture.md#11-凭据)。
 
 ## 7. Watch（本地路径专用）
 

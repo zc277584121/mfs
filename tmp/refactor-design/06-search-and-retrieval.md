@@ -53,21 +53,9 @@ partition_key 带来的加速：
 
 为什么 namespace_id 不是 partition_key：Milvus 单 collection 只能有一个 partition_key 字段，已经被 connector_uri 占了。两个 namespace 注册同名 connector（如双方 alias 都叫 `prod`）会落到同一物理桶，但每行带 `namespace_id` 标签 + chunk_id 已经 hash 了 namespace_id 保证主键不撞，查询按 `namespace_id IN (...)` scalar filter 隔离。
 
-强隔离需求（合规 / SaaS multi-tenant）走 `collection_strategy = per_namespace`（[02 §9.4](02-architecture.md#94-milvus-隔离策略)）。
+强隔离需求（合规 / SaaS multi-tenant）走多 collection 切分（per_namespace），属于 v0.5+ 范畴，带迁移工具一起设计，详见 [02 §9.4](02-architecture.md#94-milvus-隔离)。v0.4 全 MFS 一张 collection。
 
 Workspace / User 等组织概念不进 Milvus schema——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02 §9](02-architecture.md#9-多租户与-namespace)。
-
-### 可选 collection 策略（server 端配置）
-
-```toml
-# server 端配置
-[milvus]
-collection_strategy = "single"          # 默认；所有 connector 一张 collection
-# collection_strategy = "per_connector" # 一 connector 一张 collection（隔离强；跨 search 多 RPC）
-# collection_strategy = "per_namespace" # 强隔离场景：每 namespace 一张 collection
-```
-
-v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 
 ### 字段说明
 
@@ -530,11 +518,9 @@ Probing connector and sampling 1% of objects...
 
 Estimated work (based on sample, ±50% accuracy):
   scan:      12.4M rows across 38 tables
-  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
-  duration:  ~8h on 4 workers
+  chunks:    ~14M
+  tokens:    ~2.4M  (use your provider's rate to compute cost)
   storage:   ~3.2GB index + cache
-
-Note: actual cost may differ by up to 50%. Watch `mfs status` for real numbers.
 
 Continue? [y/N]
   Or limit scope:
@@ -546,10 +532,10 @@ Continue? [y/N]
 
 1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
 2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
-3. 按抽样的 token / cost / duration 外推总成本
-4. 报告明示 ±50% 精度，用户决定继续 / 限定范围 / 取消
+3. 按抽样外推总 chunks / tokens / storage，明示 ±50% 精度
+4. 用户决定继续 / 限定范围 / 取消
 
-不承诺精确估算——embedding token 数依赖 tokenizer 和实际内容，事先精确算只能跑完才知道。文档默认表达"先打个底，实际成本上线后看 `mfs status`"。
+**只给物理量，不给钱和时间**：embedding provider 价格不同（OpenAI / Voyage / Cohere / 自部署 / 企业协议），时间受 worker 并发 / rate limit / 网络浮动 10x。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。实际进度上线后看 `mfs status`。
 
 ## 12. 删除与一致性
 

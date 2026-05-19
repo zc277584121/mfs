@@ -325,13 +325,15 @@ caches (
 
 ### 10.3 何时 cache、何时不 cache
 
-每个 connector plugin 决定，一般规则：
+**核心原则：大集合（`rows.jsonl` / `messages.jsonl` 等虚拟集合对象）不全量物化。** 它们在外部数据源里不真的以文件形态存在——是 MFS 为了让用户能 `cat / head / grep` 而呈现的虚拟接口。MFS 不会把 12M 行的 postgres 表全量 dump 成本地 jsonl（也没人真的会去 cat 12M 行），保持 lazy + 选择性 head_cache 就够。
+
+每个 connector plugin 自己决定细节，一般规则：
 
 - 真实文件（本地文件、GitHub blob、S3 object）→ 不 cache，每次 connector.read() 直接拉（要么 fast，要么需要凭据隔离）
-- MFS 生成的虚拟对象（schema.json / rows.jsonl 的 head / messages.jsonl）→ cache
-- 大对象 lazy 模式（rows.jsonl）→ 不全量 cache；用户 `cat --range` 时局部拉，可选写局部 cache
+- 小元数据（schema.json、users.jsonl 这种几 KB）→ cache，访问频繁
+- 大集合（rows.jsonl / messages.jsonl）→ **不全量物化**。`cat --range A:B` 直接走 connector pushdown（如 SQL `OFFSET LIMIT`）；可选 head_cache 缓存前 N 条加速 `mfs head`
 - 图片 VLM → cache description 文本，不 cache 图片本身
-- PDF / DOCX / HTML 转 markdown → cache markdown，原文件还在 source
+- PDF / DOCX / HTML 转 markdown → cache markdown（converter 贵），原文件还在 source
 
 ### 10.4 cache 淘汰
 

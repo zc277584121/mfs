@@ -107,13 +107,15 @@ mfs connector probe postgres://prod --config x.toml
 $ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
-Estimated sync (based on 1% probe sample, ±50% accuracy):
-  embedding: ~2.4M tokens (~$48 at text-embedding-3-small)
-  duration:  ~8h on 4 workers
+Estimated work (based on 1% probe sample, ±50% accuracy):
+  chunks:    ~14M
+  tokens:    ~2.4M (use your provider's rate to compute cost)
   storage:   ~3.2GB index + cache
 
 Continue? [y/N]
 ```
+
+只给确切估得到的物理量。**钱不估**（每个 embedding provider 价格不同，自部署、企业协议价、Azure / Voyage / Cohere 都不一样）。**时间不估**（受 worker 并发 / API rate limit / 网络浮动 10x）。实际成本上线后看 `mfs status` 实时进度。
 
 `--yes` 或本地路径直接开始：
 
@@ -123,6 +125,21 @@ Processing 184 files under /repo
 Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
 Worker running in background. Run `mfs status` to check progress.
 ```
+
+### 检测到 framework 配置变化时
+
+换了 embedding model / chunker config / converter 版本，下次 `mfs add` 时 reconcile pass 会发现下游 fp 失效（详见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)）。如果失效范围大就先提示一下，让用户明确决定：
+
+```text
+$ mfs add postgres://prod
+Detected framework config change:
+  embedding model: text-embedding-3-small → text-embedding-3-large
+
+This will re-embed 12,453 chunks (~2.4M tokens).
+Continue? [y/N]
+```
+
+`--yes` 跳过 confirm。chunk 文本本身不会重新切，只是重 embed——比从零跑便宜得多。
 
 ### URI 写法
 
