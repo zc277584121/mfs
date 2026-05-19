@@ -446,6 +446,8 @@ worker 自适应：根据上一轮平均 chunk 数动态调 `batch_size`，避�
 
 ## 7. 一致性
 
+**Source of truth 是外部数据源（upstream）**：Metadata DB 只是"我对 upstream 的认知"，Object store 和 Milvus 是从 DB 的 fingerprint 派生出来的产物。这个分层意味着 MFS 的一致性保证只覆盖"upstream 变了我能感知"，不覆盖"派生层被外部直接改了/损坏了"——后者的托底是 `mfs remove + mfs add` 重建。
+
 整套 sync 的正确性靠四条规则：
 
 **① Chunk-level 幂等**
