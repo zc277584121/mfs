@@ -32,22 +32,28 @@ index_params = {
 }
 ```
 
-### Partition by connector
+### Partition by connector_uri（用 `partition_key`，不是 named partition）
 
-`partition_key=connector_uri` 是 schema 阶段必须定死的字段。它让几个操作显著加速：
+`partition_key=connector_uri` 是 schema 阶段必须定死的字段。Milvus 按这个字段自动哈希分桶——**注意：不是 named partition**（`create_partition / drop_partition` 那一套）。两者差异和取舍详见 [02 §6.3](02-architecture.md#63-milvus)。
 
-| 操作 | partition 带来的好处 |
+partition_key 带来的加速：
+
+| 操作 | partition_key 带来的好处 |
 |---|---|
-| `mfs search "..." postgres://prod` | 只扫 `postgres://prod` 这一个 partition，跳过其他 connector |
-| `mfs search "..." --all` | 多 partition 并行扫，scatter-gather |
-| `mfs connector remove postgres://prod` | 直接 `drop_partition`，比 `delete by filter` 快几个数量级 |
-| 大数据量切 collection 时迁移 | 按 partition 物理切到 `per_connector` collection 容易 |
+| `mfs search "..." postgres://prod` | filter 带 `connector_uri == X` → 只扫该 connector 命中的物理桶 |
+| `mfs search "..." --all` | 多桶并行扫，scatter-gather |
+| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 也按 partition_key 路由，只扫该桶。**不是 drop_partition**（那需要 named partition） |
+| 大数据量切 collection 时迁移 | 按桶物理切到 `per_connector` collection 容易 |
 
 后改 partition key 需要数据迁移，所以一开始定下来。
 
-### namespace_id 字段是物理分区主键
+### namespace_id 字段：scalar filter，不是 partition_key
 
 所有 chunk 写入时带上 `namespace_id`，所有查询自动 filter `namespace_id IN (current_request_namespaces)`。v0.4 server 只有一个 `default` namespace，所有 chunk 都写 `"default"`，client 不需要关心。
+
+**为什么 namespace_id 不是 partition_key**：Milvus 单 collection 只能有一个 partition_key 字段。connector_uri 那条已经用了。两个 namespace 注册同名 connector（如双方 alias 都叫 `prod`）→ 物理上同 partition 桶，但行各自带 `namespace_id` 标签 + chunk_id 已经 hash 了 namespace_id 保证主键不撞，查询时按 `namespace_id IN (...)` scalar filter 隔离。
+
+强隔离需求（合规 / SaaS multi-tenant）走 `collection_strategy = per_namespace`（[02 §9.5](02-architecture.md#95-milvus-隔离策略)）。
 
 Workspace / User 等组织概念**不进 Milvus schema**——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02-architecture.md §9](02-architecture.md#9-多租户与-namespace-设计)。
 
@@ -67,7 +73,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 
 | 字段 | 含义 |
 |---|---|
-| `chunk_id` | uuid 或 `sha1(object_uri + locator + chunk_kind)`；幂等写入 |
+| `chunk_id` | `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`；幂等写入。**namespace_id 必须进 hash**——否则两个 namespace 注册了同名外部数据源（如双方 alias 都叫 `prod`）会让 chunk_id 撞车互相覆盖 |
 | `namespace_id` | 物理分区主键；v0.4 恒为 `"default"`，多租户启用后由 server 注入 |
 | `connector_uri` | 包含该 chunk 的 connector root，如 `postgres://prod` |
 | `object_uri` | chunk 来自哪个 object，如 `postgres://prod/public/tickets/rows.jsonl` |
@@ -463,21 +469,28 @@ prompt   = "Describe this image..."
 
 千万行的表如果默认 `chunk_strategy=per_row`，一次 `mfs add` 会写出千万 chunk + 调千万次 embedding。控制手段：
 
-### 11.1 `chunk_max` 硬上限
+### 11.1 `chunk_max` 硬上限（**framework 内置保守默认**）
+
+framework 内置默认 `chunk_max = 1_000_000`（一百万 chunk / object），server.toml 可以全局覆盖，单个 `[[objects]]` 段可以再覆盖：
 
 ```toml
+# server.toml（全局默认；如果不写就走 framework 内置 1_000_000）
+[chunk]
+default_chunk_max = 1000000
+
+# connector TOML
 [[objects]]
 match = "public.events"
 text_fields = ["event_type", "payload_summary"]
-chunk_max = 100000
+chunk_max = 100000                # 这个对象单独压低
 ```
 
 超过停止 + 报错：
 
 ```text
 chunk_max_exceeded: public.events
-This object would produce ~12.4M chunks, exceeding chunk_max=100000.
-Add filter_expr or chunk_strategy to limit:
+This object would produce ~12.4M chunks, exceeding chunk_max=1000000 (framework default).
+Add filter_expr or chunk_strategy to limit, or explicitly raise chunk_max:
 
   [[objects]]
   match = "public.events"
@@ -485,7 +498,11 @@ Add filter_expr or chunk_strategy to limit:
   # or
   chunk_strategy = "windowed"
   chunk_window = "30d"
+  # or
+  chunk_max = 20000000            # 显式承诺承担成本
 ```
+
+**为什么默认是 1M 而不是无穷**：embedding API 调用花钱 + Milvus 写入慢，默认要一道防线挡住"用户 `--yes` 跳过 estimate 直接跑 5000 万行表"的事故。1M 是一个保守值——大部分团队的 ticket / issue / message 量都在 100k 量级，安全余量；真有大需求要显式提一行配置，迫使用户做一次决定。
 
 ### 11.2 windowed 策略
 

@@ -32,7 +32,7 @@ mfs connector probe postgres://prod --config .mfs/connectors/prod-postgres.toml
 
 ```bash
 mfs add postgres://prod                      # 再同步（幂等）
-mfs add postgres://prod --force              # 强制重建
+mfs add postgres://prod --force-index        # 强制重 chunk + embed
 mfs ls postgres://prod/public/tickets        # 浏览
 mfs connector list                           # 看已注册的
 ```
@@ -362,28 +362,191 @@ framework 不 introspect `self.state` 里存的是什么——postgres 存 `upda
 
 ### 5.2 Framework 内部：per-artifact fingerprint chain
 
-这是 **framework 内部机制**，跟 connector 接口分开。framework 拿到 upstream fingerprint 后，自己组合 chunker / embedding model 等版本信息，算出每层 cache 的 fingerprint，决定哪层失效。
+这是 **framework 内部机制**，跟 connector 接口分开。framework 拿到 upstream fingerprint 后，自己组合 chunker / embedding model 等版本信息，算出每层产物的 fingerprint，决定哪层失效。
+
+#### 5.2.1 产物模型：per-object_kind DAG
+
+每个 object_kind（document / image / table_rows / message_stream / ...）有自己的**产物依赖图**。framework 用 `ArtifactSpec` 声明：
+
+```python
+@dataclass
+class ArtifactSpec:
+    kind:          str                  # "cache.converted_md" / "chunk.body" / "embedding"
+    depends_on:    list[str]            # 上游产物 kind（"upstream" 是特殊源）
+    config_inputs: list[str]            # 影响 fp 的 framework 配置 key
+    storage:       Literal["cache_table", "milvus_field", "milvus_row"]
+```
+
+每个 object_kind 在 `processors/<kind>/` 里 declare 自己的 ArtifactSpec 列表。framework 把这些列表组装成 DAG，每条边代表"我依赖什么"。
+
+各 object_kind 的具体 DAG：
 
 ```
-cache_fp(converted_md)     = sha1( upstream + converter_name + converter_version )
-cache_fp(vlm_text)         = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
-cache_fp(page_cache)       = sha1( upstream )
-cache_fp(head_cache)       = sha1( upstream + N )
+document (md/code/text/...)
+    ┌──────────┐
+    │ upstream │
+    └────┬─────┘
+         ▼
+    ┌───────────────┐    [chunker_name, chunker_config, tokenizer_version]
+    │ chunk.body    │ ←──
+    └────┬──────────┘
+         ▼
+    ┌───────────────┐    [embedding_model, embedding_version]
+    │ embedding     │ ←──
+    └───────────────┘
+
+document (pdf/docx/gdoc)
+    upstream
+       │  [converter_name, converter_version]
+       ▼
+    cache.converted_md
+       │  [chunker_name, chunker_config, tokenizer_version]
+       ▼
+    chunk.body
+       │  [embedding_model, embedding_version]
+       ▼
+    embedding
+
+image
+    upstream
+       │  [vlm_model, vlm_prompt, vlm_provider]
+       ▼
+    cache.vlm_text
+       │  (1:1 wrap)
+       ▼
+    chunk.vlm_description
+       │  [embedding_model]
+       ▼
+    embedding
+
+table_rows (postgres rows.jsonl)
+    upstream(per row)
+       │  [text_fields, template_version]
+       ▼
+    chunk.row_text (per row)
+       │  [embedding_model]
+       ▼
+    embedding
+
+message_stream (slack messages.jsonl)
+    upstream(per channel-day)
+       │  [group_by, session_idle_min, agg_template_version]
+       ▼
+    chunk.thread_aggregate (per thread)
+       │  [embedding_model]
+       ▼
+    embedding
+
+table_schema (postgres schema.json)
+    upstream
+       │  [schema_summary_model, schema_summary_prompt]
+       ▼
+    chunk.schema_summary
+       │  [embedding_model]
+       ▼
+    embedding
+
+directory
+    child_object_uris (隐式 upstream)
+       │  [dir_summary_model, dir_summary_prompt]
+       ▼
+    chunk.directory_summary
+       │  [embedding_model]
+       ▼
+    embedding
+```
+
+#### 5.2.2 fp 计算公式（framework 集中实现）
+
+```python
+# framework
+def compute_artifact_fp(spec: ArtifactSpec, upstream_fps: dict, config: dict) -> str:
+    parts = [upstream_fps[k] for k in spec.depends_on]   # 上游 fp（按声明顺序）
+    parts += [str(config[k]) for k in spec.config_inputs]  # framework 配置 key
+    return sha1("\x00".join(parts).encode()).hexdigest()
+```
+
+具体到每层公式（按 storage 字段对应到存哪里）：
+
+```
+upstream_fp                = connector.fingerprint(path)     ← objects.fingerprint
+
+cache_fp(converted_md)     = sha1( upstream + converter_name + converter_version )      ← caches.fingerprint
+cache_fp(vlm_text)         = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )   ← caches.fingerprint
+cache_fp(page_cache)       = sha1( upstream )                                            ← caches.fingerprint
+cache_fp(head_cache)       = sha1( upstream + N )                                        ← caches.fingerprint
 
 chunk_fp(body)             = sha1( cache_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
 chunk_fp(row_text)         = sha1( upstream + text_fields + template_version )
 chunk_fp(thread_aggregate) = sha1( upstream + group_by + agg_template_version )
 chunk_fp(vlm_chunk)        = sha1( cache_fp(vlm_text) )
-chunk_fp(summary)          = sha1( cache_fp + summary_model + summary_prompt + summary_provider )
 chunk_fp(schema_summary)   = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
 chunk_fp(directory_summary)= sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
+                                                              ← Milvus 行 chunk_fingerprint
 
 embedding_fp               = sha1( chunk_fp + embedding_model + embedding_model_version )
+                                                              ← Milvus 行 embedding_fingerprint
 ```
 
-每种 artifact 声明自己依赖的 input set，framework 自动算 fp。改 chunker config / 换 embedding model / 升级 converter 时，对应层 fp 变 → 该层 stale → 自动 rebuild。
+Connector **不参与这套逻辑**，只提供 `upstream fingerprint`（per object）。下游 fp 全由 framework 算。
 
-Connector 不参与这套逻辑，只提供 `upstream fingerprint`。
+#### 5.2.3 Reconcile pass: framework 内部
+
+每次 sync_job 处理流：
+
+```
+sync_job 开始
+   ▼
+① connector.sync() 流式 yield ObjectChange(uri, kind)
+   │
+   │  for each ObjectChange:
+   │    - added  → 整套 build（没有 old fp 可比，直接走 4 步链）
+   │    - modified → 走 Reconcile（4 步，下面）
+   │    - deleted → 删 Milvus 行 + caches 行 + objects 行
+   │
+   ▼  yield 完
+② Sweep pass: framework 扫描"未在 yield 集合里的 object"
+   for object in connectors 表 WHERE connector_id = X AND object_uri NOT IN yielded_set:
+      跑 Reconcile（4 步）—— 用于探测 framework 配置变化
+```
+
+**4 步 Reconcile**（per object, early-exit）：
+
+```
+Step 1: upstream 层比对
+  new_fp = connector.fingerprint(path)
+  old_fp = objects 表的 fingerprint 列
+  if new_fp != old_fp:
+      enqueue full rebuild → 整套 4 步重做
+      return
+  # else: upstream 没变，继续
+
+Step 2: cache 层比对（仅对该 object_kind 适用的 cache_kind）
+  for cache_kind in processor.applicable_caches(object_kind):
+      new_fp = compute_artifact_fp(spec, {upstream: new_fp}, framework_config)
+      old_fp = caches 表的 fingerprint 列
+      if new_fp != old_fp:
+          enqueue cache_rebuild → 触发下游 chunk + embed
+          continue   # 这一支下游会被这个 task 触发
+
+Step 3: chunk 层比对
+  for chunk_row in milvus.query(connector_uri=X, object_uri=Y):
+      new_fp = compute_artifact_fp(...)
+      if new_fp != chunk_row.chunk_fingerprint:
+          enqueue chunk_rebuild → 触发下游 embed
+          continue
+
+Step 4: embedding 层比对
+      new_fp = compute_artifact_fp(...)
+      if new_fp != chunk_row.embedding_fingerprint:
+          enqueue embed_only (chunk 文本不动，只重 embed)
+```
+
+**Early-exit 性质**：上游 fp 不等就直接整套重做，跳过下游检查（下游一定也 stale）。
+
+**为什么 sync 末尾要 sweep**：connector 只汇报 upstream 变化，不知道 framework 配置变了。**没有 sweep pass，换 embedding 模型后 `mfs add ./repo` 啥也不会发生**——connector 一看 manifest unchanged，啥都不 yield。sweep 让 framework 主动检查自己产物的状态。
+
+**性能**：sweep 是只读比对（不读 upstream，不打 connector），只查 metadata DB + Milvus 字段。100 万 chunk 几秒钟级。
 
 ### 5.3 Milvus 上的失效行为
 
@@ -450,9 +613,75 @@ Milvus 不支持只更新一列。任何 fingerprint 变化最终都走 **DELETE
 
 cursor / state schema 在 connector 内部自定义，framework 不参与。Sync 失败时 connector 决定怎么回滚或保留状态。
 
-### 5.5 file connector 的实现示例
+### 5.5 file connector 的实现示例（manifest 不含 framework 配置）
 
-完整流程：
+注意：file connector 的 manifest 只包含**文件本身的 fingerprint**（path / size / mtime_ns / sha1），**不包含** chunker / embedding model / converter 版本。这些 framework 层的配置变化由 [§5.2.3 Reconcile pass](#523-reconcile-pass-framework-内部) 的 sweep 步骤捕获，跟 manifest diff 无关。
+
+### 5.6 Mid-job checkpoint API
+
+[02 §5.7 规则 ③](02-architecture.md#57-一致性四条规则) 的默认行为是"state 末尾提交"：connector 中途崩 → state 不 commit → 下次重头跑。对 file / github code 这种**重跑 cheap** 的 connector 没问题；对 Slack / Gmail / Salesforce 等**外部 API rate limited** 的 connector，重头跑会被 rate limit 打爆。
+
+framework 提供一个 **可选的** `self.state.checkpoint()` API，让 connector 在 sync 中途显式 commit state：
+
+```python
+class StateStore(Protocol):
+    async def get(self, key: str) -> Any | None: ...
+    async def set(self, key: str, value: Any) -> None: ...
+    async def delete(self, key: str) -> None: ...
+
+    async def checkpoint(self) -> None:
+        """显式把当前 state_snapshot commit 到 connector_state 表。
+
+        ⚠️ 仅适合 "cursor 推进型" state。半截 commit 必须是合法的"可接续状态"——
+        即下次 sync 从这个 state 启动时，能正确从中断点接续，不丢数据也不重做太多。
+        """
+```
+
+framework 拿到 checkpoint 调用 → 一个事务把 `connector_jobs.state_snapshot` 行 copy 到 `connector_state` 表 + 重置 snapshot → 之后即使本 job 失败，下次也从这里接续。
+
+#### 5.6.1 哪些 state 形态能调 checkpoint
+
+| state 形态 | 例 | 能调 checkpoint? | 理由 |
+|---|---|---|---|
+| **单调推进 cursor** | postgres `max(updated_at)` / slack `{ch: max(ts)}` / gmail `historyId` / linear `updatedAt` / s3 `last_key` / mongodb `resume_token` / bigquery `max(_PARTITIONTIME)` | ✅ 推荐 | cursor 是单调的，半截 commit 后下次从该 cursor 继续，跳过已处理的，不会丢数据 |
+| **paged token** | gdrive `next_page_token` | ⚠️ 看 provider | gdrive `changes.list` token 长期有效 → OK；某些 provider token 短期失效 → 不推荐 |
+| **commit hash 类（A→B）** | github code `commit_sha`、git tag、bigquery `snapshot_time` | ❌ 不要 | 一个 sync 是"从 commit A 跳到 commit B"的原子转换，中间没有合法的"半 commit" |
+| **全量 map 快照** | file `{path: hash}`、web crawl `{url: etag}` | ❌ 不要 | state 是"对完整目录树/全站点的快照"。半截的 map 不能宣称是某一时刻的真相 |
+
+**判断准则**：你的 state 在 `checkpoint()` 调用的那一瞬间，是不是一个**合法的"从此处接续"的起点**？
+
+- 是 → 可以调
+- 不是（半截 map / 中间转换状态） → 不要调
+
+#### 5.6.2 推荐 checkpoint 频率
+
+```python
+# 推荐模式：每处理 N 个分组（page / channel / day）调一次
+async def sync(self):
+    last = await self.state.get("last_ts")
+    page_index = 0
+    async for page in self.api.fetch_paginated(since=last):
+        for record in page:
+            yield ObjectChange(record.uri, "modified")
+        await self.state.set("last_ts", page.max_ts)
+        page_index += 1
+        if page_index % 50 == 0:                # 每 50 页 checkpoint
+            await self.state.checkpoint()
+```
+
+频率取决于"重跑 50 页贵不贵 + checkpoint 自己的事务成本"。100k 量级数据 50~200 是合理区间。
+
+#### 5.6.3 不调 checkpoint 的 connector 走默认行为
+
+file / github code / web crawl 这些**不应该调** checkpoint 的 connector 走 [02 §5.7 规则 ③](02-architecture.md#57-一致性四条规则) 默认的"末尾提交"语义。它们都满足：
+
+- 重头跑 cheap（本地 walk / git diff / 用户限定的 crawl 范围）
+- chunk_id 幂等保证不重写 Milvus
+- 即使全部 ObjectChange 重 yield 一遍，绝大多数 task 在 Reconcile 早退（upstream 没变）
+
+不调 checkpoint 是合理选择，不要勉强加。
+
+### 5.7 file connector 的 sync 完整流程示例
 
 ```
 1. scan：os.walk(root) 应用 ignore rules（.gitignore + .mfsignore + 默认 binary 规则）
@@ -468,6 +697,7 @@ cursor / state schema 在 connector 内部自定义，framework 不参与。Sync
 3. manifest 里有但 current_paths 没有 → yield ObjectChange(path, "deleted")
 
 4. 更新 self.state 里的 manifest（写新 sha1 / size / mtime）
+   ⚠️ file connector **不调 checkpoint**：全量 map 形态不能半截 commit（详见 §5.6.1）
 ```
 
 manifest 是 file connector 自己定义的数据结构，存在 `self.state` 里。framework 不关心它的形状。其他 connector（postgres / slack / s3 / ...）按各自需要在 `self.state` 里存自己的 state。
@@ -630,11 +860,12 @@ daemon 内置简单 scheduler（基于 SQLite + APScheduler 风格），用户�
 **① Chunk-level 幂等**
 
 ```
-chunk_id = sha1(object_uri + locator + chunk_kind)    ← 确定性 hash
+chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)
+                                                                       ← 确定性 hash
 写 chunk = DELETE WHERE chunk_id = X + INSERT new row
 ```
 
-任何 worker / 重试 / 并发，对同 chunk_id 的写都等效。
+任何 worker / 重试 / 并发，对同 chunk_id 的写都等效。`namespace_id` 必须进 hash——否则两个 namespace 注册同名外部数据源（如双方 alias 都叫 `prod`）会让 chunk_id 撞车互相覆盖。
 
 **② Per-object 原子**
 
@@ -675,7 +906,8 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 | 命令 | 行为 |
 |---|---|
 | `mfs add <uri>` 已注册 | 新 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
-| `mfs add <uri> --force` | 同上但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
+| `mfs add <uri> --force-index` | 同上但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重 chunk + embed |
+| `mfs add ./path --force-upload` | 仅 upload flow：client 忽略 manifest cache 全量重传 + server 强制重 index |
 | `mfs add <uri>` 在前次失败后 | 前次 state 未 commit；从上一个成功的 state 重跑——失败的 object 自然再次出现 |
 | 第二次 `mfs add <uri>` 在前次还 running | 返回 `sync_already_running, see job <id>`（被 connector_jobs UNIQUE 约束拒绝） |
 | `mfs remove <uri>` 在前次 sync running | preempt：sync 标 `cancelling`，当前 object_task 完成后退出，remove 接管 |
@@ -699,9 +931,12 @@ connector_state 因为没 commit，下次 `mfs add` 自然从上一个成功状�
 | 当前 | v0.4 |
 |---|---|
 | `mfs add .` 本地索引（同进程） | `mfs add .` 通过 HTTP 调 daemon |
-| `~/.mfs/milvus.db` + `~/.mfs/state.db` | 同位置，schema 升级（要 `mfs add . --force` 重建一次） |
+| `~/.mfs/milvus.db` + `~/.mfs/state.db` | 同位置，schema 升级（要 `mfs add . --force-index` 重建一次） |
 | `mfs status` | 同名，语义扩展（增加 connector / job 维度） |
 | `mfs add --watch` | 同 |
+| `mfs add --force` | 改名 `--force-index`（语义不变）；remote profile 下另有 `--force-upload` |
+| Milvus chunk schema 字段 `account_id` | 改名 `namespace_id`（多租户底层主键，详见 [02 §9](02-architecture.md#9-多租户与-namespace-设计)）。**Milvus 不支持字段重命名 in-place**——升级时必须 drop collection 重建，所有数据走一次重 index。这一步在 release note 里要明确标记。 |
+| Milvus chunk_id 公式 `sha1(source + start + end + content_hash + model)` | 改 `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`。新 schema 需要重 build，跟上一行的 collection rebuild 一并完成 |
 | 没有外部数据源概念 | 加 `mfs add <uri> --config X` 注册外部 connector |
 | 没有本机 server | 用 `mfs serve start` 启动；`MFS_AUTOSTART=1` 时首次 `mfs add` 也会触发 |
 
@@ -713,5 +948,7 @@ uv tool install mfs-server # server（Python）
 mfs serve start
 mfs profile add local --url http://127.0.0.1:8765
 mfs profile use local
-mfs add . --force         # 重建本地索引（schema 升级）
+mfs add . --force-index    # 重建本地索引（schema 升级；底下会 drop 旧 collection）
 ```
+
+> ⚠️ **Release note 必须标注**：v0.3 → v0.4 升级会 drop Milvus collection（字段重命名 + chunk_id 公式变更）。所有索引需要从 upstream 重 build。本机部署用户 `mfs add . --force-index` 重跑一次即可；CS 部署用户参考运维迁移文档。

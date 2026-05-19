@@ -74,28 +74,34 @@ mfs add <uri>                                  # alias = mfs connector add <uri>
 mfs add .
 mfs add ./repo
 mfs add ./repo --watch                  # 启动 watcher
-mfs add ./repo --force                  # 强制重建
+mfs add ./repo --force-index            # server 端强制重 chunk + embed（不重传字节）
+mfs add ./repo --force-upload           # 上传所有文件（imply --force-index）— upload flow 专用
 
 # 外部 connector
 mfs add postgres://prod --config x.toml             # 首次：注册 + 同步（默认 confirm）
 mfs add postgres://prod --config x.toml --yes       # 跳过 confirm
 mfs add postgres://prod                             # 已注册：再同步一次
-mfs add postgres://prod --force                     # 强制重建
+mfs add postgres://prod --force-index               # 强制重 chunk + embed
 mfs add slack://eng --since 2026-05-01              # 时间游标增量
 
 # 想先试连接、不写状态
 mfs connector probe postgres://prod --config x.toml
 ```
 
-5 个核心 flag：
+6 个核心 flag：
 
 | flag | 作用 |
 |---|---|
 | `--config <toml>` | 外部 connector 首次注册必填；已注册时忽略（要改配置用 `mfs connector update`） |
 | `--yes` | 跳过 confirm。默认行为：首次注册外部 connector 估算成本后等确认；本地小目录直接跑 |
 | `--watch` | 仅本地路径有效，启动 daemon 内 watcher |
-| `--force` | 跳过 fingerprint 比对，重建可重建部分 |
+| `--force-index` | 跳过 fingerprint 比对，server 端强制重 chunk + embed。**不重传字节**（upload flow 下 manifest diff 仍然有效）。覆盖 95% "我要 force"的场景 |
+| `--force-upload` | 仅 upload flow（remote profile + 本地路径）有效；忽略 client 端 manifest cache，**全量重传**整个目录。imply `--force-index`。常规场景不需要，仅当怀疑 staging 字节本身坏了时用 |
 | `--since <date>` | 仅时间游标 connector（postgres updated_at / slack ts / github / gmail）有效；其他报 `since_unsupported` |
+
+> **不提供 `--force` 短写法**：避免歧义（到底重传不重传？）。两个 flag 各自明确语义，要"大锤"用 `--force-upload`，否则用 `--force-index`。
+>
+> shared fs 场景（不走 upload flow）下 `--force-upload` 报错 `upload_not_applicable`——共享 fs 模式根本没有"上传"这个步骤。
 
 试连接、注册管理等不在 `mfs add` 上挂 flag，拆到 `mfs connector` 子树（probe / list / inspect / update / remove）。
 
@@ -366,7 +372,7 @@ This will permanently delete:
 Continue? [y/N]
 ```
 
-confirm 后流程：取消正在跑的 sync（如有）→ drop_partition + 清 cache + 删 metadata → 注销 connector。详细并发协调见 [02-architecture.md §5.11](02-architecture.md#511-操作之间的并发协调)。
+confirm 后流程：取消正在跑的 sync（如有）→ Milvus `DELETE WHERE connector_uri = X`（按 partition_key 路由，只扫该桶）+ 清 cache + 删 metadata → 注销 connector。详细并发协调见 [02-architecture.md §5.11](02-architecture.md#511-操作之间的并发协调)。
 
 幂等性：
 

@@ -198,6 +198,8 @@ uri = "~/.mfs/milvus.db"                  # 或 http://localhost:19530 / https:/
 ```toml
 [client]
 default_profile = "local"
+client_id       = "01HX...XYZ"      # 首次启动自动生成的 UUIDv7；用于 connector_uri
+                                    # 不要手动改——改了会导致已注册的 file connector 变孤儿
 
 [[profiles]]
 name = "local"
@@ -210,6 +212,28 @@ credential_ref = "env:MFS_API_TOKEN"
 ```
 
 不需要写 `kind` 字段，CLI 跟 server 握手时自动判断 `is_local`，结果缓存到 client.toml。
+
+#### `client_id` 跟 machine-id 的分工
+
+```
+machine-id  ─┐
+             ├─ 只用来判定 is_local（client/server 是否共享 fs）
+client_id   ─┘  client.toml 持久化的随机 UUID（uuid7）
+                进 connector_uri，作为"哪个 client 注册了这个 file connector"的稳定标识
+```
+
+`client_id` 在 CLI 首次启动 `ensure_mfs_home()` 时生成（`uuid.uuid7()`）写入 `client.toml`。**它跟 machine-id 解耦**，因为 machine-id 不稳定：
+
+| 场景 | machine-id | client_id | connector 状态 |
+|---|---|---|---|
+| 同台机器持续使用 | 不变 | 不变 | 一直认识 |
+| Docker 容器重启（无 volume 挂载 `~/.mfs`） | 每次新生成 | 每次新生成 → file connector 重复注册 | ⚠️ Docker 用户要把 `~/.mfs` 挂成 volume |
+| Docker 容器重启（有 volume 挂载 `~/.mfs`） | 每次新生成 | client.toml 持久化，不变 | ✅ 仍认识之前的 connector |
+| 笔记本重装系统但备份过 `~/.mfs` | 变了 | 不变 | ✅ 仍认识之前的 connector |
+| 多机访问同一 NFS `~/repo` | 各自不同 | 各自不同（各自的 client.toml） | 各自独立 file connector（避免多 client 抢写同一 connector） |
+| `systemd-machine-id-setup --commit` | 变了 | 不变 | ✅ 不受影响 |
+
+`§3.5` 的 connector_uri 构造从 `file://<machine-id>/<path>` 改为 `file://<client_id>/<path>`。
 
 profile 管理：
 
@@ -332,9 +356,11 @@ MFS-API-Version: v1
 
 #### connector_uri 的构造
 
-client 端发的 `connector_uri` 形如 `file://<client-machine-id>/<abs-path>`。`<client-machine-id>` 是 client 端 machine-id，让多个 client 不会撞同一 alias。一个 `connector_uri` 一辈子绑定一个 client（v0.4 禁止"多 client 共写同一 connector"——避免 manifest race）。
+client 端发的 `connector_uri` 形如 `file://<client_id>/<abs-path>`。`<client_id>` 是 client 端 `client.toml` 里持久化的 UUIDv7（首次启动 CLI 自动生成），让多个 client 不会撞同一 alias。一个 `connector_uri` 一辈子绑定一个 client（v0.4 禁止"多 client 共写同一 connector"——避免 manifest race）。
 
-用户面仍然是 `mfs add ./repo`，CLI 自动规范化成 `file://...`。
+**为什么不用 machine-id**：machine-id 在 Docker 容器、`systemd-machine-id-setup --commit`、系统重装等场景会变，会导致已注册的 file connector 变孤儿。`client_id` 持久化在 `client.toml`，跟着用户数据走（用户备份 `~/.mfs` 就 OK），稳定。`client.toml` 跟 docker volume 一起挂载就解决了 Docker 场景。详见 [§2 client_id 跟 machine-id 的分工](#client_id-跟-machine-id-的分工)。
+
+用户面仍然是 `mfs add ./repo`，CLI 自动规范化成 `file://<client_id>/<abs-path>`。
 
 #### 错误恢复（简化版，先不考虑灾难）
 
@@ -453,7 +479,9 @@ DB 队列不阻止 batch，关键是 **batching layer** 显式分两层放：
 
 **第一层：worker 一次拉 N 个 task**（减少 DB round-trip + Milvus batch INSERT）
 
-worker 从 DB 拉 task 时**按 `priority` 升序**，相同 priority 按入队时间：
+worker 从 DB 拉 task 时**按 `priority` 升序**，相同 priority 按入队时间。**SQL 形态因后端而异**：
+
+**Postgres 路径（远端部署 / 多 worker 并发）**：
 
 ```sql
 SELECT * FROM object_tasks
@@ -463,12 +491,43 @@ FOR UPDATE SKIP LOCKED
 LIMIT $batch_size
 ```
 
+`FOR UPDATE SKIP LOCKED` 是 PG 特有语法——多 worker 各拉各的批不冲突。
+
+**SQLite 路径（本机 daemon）**：SQLite **不支持** `FOR UPDATE / SKIP LOCKED`。改成两步事务：
+
+```sql
+BEGIN IMMEDIATE;                                    -- 抢全库写锁
+
+SELECT id FROM object_tasks
+WHERE status = 'pending' AND connector_job_id = ?
+ORDER BY priority ASC, started_at ASC
+LIMIT $batch_size;
+
+UPDATE object_tasks SET status = 'running', started_at = current_timestamp
+WHERE id IN (<拿到的 id 列表>);
+
+COMMIT;
+```
+
+`BEGIN IMMEDIATE` 立刻获取写锁，其他 worker 会等到本事务 commit。**SQLite 路径建议 worker `concurrency = 1`**——多 worker 在 SQLite 上互相 serialize 没有吞吐收益，反而增加锁竞争。本机部署单 worker 即可。
+
+server 端 storage adapter 按 backend 选实现：
+
+```python
+class TaskQueue:
+    async def claim_batch(self, job_id, batch_size, priority_order):
+        if self.backend == "postgres":
+            return await self._claim_postgres(...)   # SELECT ... FOR UPDATE SKIP LOCKED
+        else:  # sqlite
+            return await self._claim_sqlite(...)     # BEGIN IMMEDIATE + SELECT + UPDATE
+```
+
 `priority` 由 `connector.task_priority(change)` 在入队时一次性算出来写进 task 行——大多数 connector 默认 0（FIFO）。
 
 ```python
 async def worker_loop():
     while True:
-        tasks = await db.fetch_pending(limit=BATCH_SIZE)   # SELECT ... FOR UPDATE SKIP LOCKED
+        tasks = await db.claim_batch(limit=BATCH_SIZE)     # 自动按 backend 选 PG/SQLite 实现
                                                             # ORDER BY priority ASC, started_at ASC
         if not tasks:
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
@@ -527,20 +586,21 @@ DataLoader pattern。embedding / summary / VLM 三类外部 API 都用这个模�
 2. **graceful degradation**：跑到一半挂了，至少关键文件已经索引；剩下没跑完的多半是 tests / generated，影响最小。
 3. **重跑顺序一致**：重试失败的 task 时，重要的还是先被重试——最快恢复"能搜到核心内容"的状态。
 
-**幂等性不依赖顺序**：chunk_id = `sha1(object_uri + locator + chunk_kind)`，跟处理顺序无关。priority 只影响**用户体感和调度便利性**，不影响正确性。
+**幂等性不依赖顺序**：chunk_id = `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`（详见 [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema)），跟处理顺序无关。priority 只影响**用户体感和调度便利性**，不影响正确性。
 
-### 5.7 一致性三条规则
+### 5.7 一致性四条规则
 
-整套 sync 的正确性靠这三条保证：
+整套 sync 的正确性靠这四条保证：
 
 **1. Chunk-level 幂等**
 
 ```
-chunk_id = sha1(object_uri + locator + chunk_kind)    ← 确定性 hash
+chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)
+                                                                     ← 确定性 hash
 写 chunk = DELETE WHERE chunk_id = X + INSERT new row
 ```
 
-任何 worker / 任何重试 / 任何并发，对同 chunk_id 的写都等效。
+任何 worker / 任何重试 / 任何并发，对同 chunk_id 的写都等效。`namespace_id` 必须进 hash——否则两个 namespace 注册同一外部数据源（如双方都叫 `postgres://prod`）会让 chunk_id 撞车互相覆盖。
 
 **2. Per-object 原子**
 
@@ -551,16 +611,33 @@ object_task.status = 'succeeded'
 
 中途任一步失败 → object_task 保持 'running' 或退 'failed'，下次 sync 重试整个 object。
 
-**3. State 末尾提交**
+**3. State 末尾提交 + 可选 checkpoint**
 
 ```
 connector.sync() 过程中的 self.state.set(...) 写入暂存（connector_jobs.state_snapshot）
-只有当 sync_job 所有 object_task 成功时才 commit 到 connector_state 表
+默认行为：只有当 sync_job 所有 object_task 成功时才 commit 到 connector_state 表
+可选：connector 调 self.state.checkpoint() → framework 立刻把当前 snapshot commit
 ```
 
-中途崩溃 → state 不 commit → 下次 sync 从上次成功的 state 重启。`connector.sync()` 必须 idempotent（同 state 输入 → 同 ObjectChange 输出，加上新数据）。
+中途崩溃 → 未 checkpoint 的 state 不 commit → 下次 sync 从上次成功的 state 重启。`connector.sync()` 必须 idempotent（同 state 输入 → 同 ObjectChange 输出，加上新数据）。
 
-framework 不暴露 `commit()` 给 connector——commit 时机由 framework 控制。
+checkpoint API 详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint-api)；不是所有 state 形态都能调，规范见那一节。
+
+**4. Sync 末尾 reconcile pass**
+
+connector.sync() 只负责报告 upstream 变化。但下游产物（cache / chunk / embedding）可能因 framework 配置变化（换 embedding 模型 / chunker 升级 / converter 升级）而 stale，**connector 不感知**。每次 sync_job 在 connector.sync() yield 完后，framework 跑一遍 **reconcile pass**：
+
+```
+sweep 当前 connector 下所有未在本次 sync 中被 yield 的 object：
+  跑 fingerprint chain 比对（详见 04 §5.2）：
+    - cache 层 fp 变了？→ 入队 cache rebuild
+    - chunk 层 fp 变了？→ 入队 chunk rebuild
+    - embedding 层 fp 变了？→ 入队 embed rebuild only
+```
+
+这条让 "换 embedding 模型 → 跑 `mfs add ./repo` → 自动重 embed" 能 work——用户**不需要 `--force-index`** 来触发模型变化的失效。完整逻辑详见 [04 §5.2 Reconcile pass](04-connector-and-ingest.md#52-reconcile-pass-framework-内部).
+
+framework 不暴露 `commit()` 给 connector（只暴露 `checkpoint()`），commit 时机由 framework 控制。
 
 ### 5.8 故障恢复
 
@@ -637,7 +714,8 @@ WHERE connector_job_id NOT IN (SELECT id FROM connector_jobs);
 | 命令 | 行为 |
 |---|---|
 | `mfs add <uri>` 已注册 | 新建 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
-| `mfs add <uri> --force` | 同上，但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
+| `mfs add <uri> --force-index` | 同上，但所有 object 视为 'modified'，跳过 fingerprint 比对，强制重建 chunks |
+| `mfs add ./path --force-upload` | 仅 upload flow：忽略 client manifest cache 全量重传 + 强制重 index |
 | `mfs add <uri>` 在前一个 sync 失败后 | 前次 state 没 commit；从上上次的 state 重跑——失败的 object 自然重新出现在流里 |
 | 第二次 `mfs add <uri>` 在前一个 sync 还 running | 返回 `sync_already_running, see job <id>`（被 UNIQUE 约束拒绝） |
 
@@ -648,6 +726,9 @@ WHERE connector_job_id NOT IN (SELECT id FROM connector_jobs);
 ```toml
 [worker]
 concurrency = 4                  # 同时跑几个 worker（asyncio task）
+                                 # ⚠️ metadata backend = "sqlite" 时建议设为 1：
+                                 # SQLite 不支持 SKIP LOCKED，多 worker 互相 serialize
+                                 # 没吞吐收益。详见 §5.6
 batch_size = 50                  # 一个 worker 一次拉多少 object_task
 poll_interval_ms = 200           # 队列空时轮询间隔
 heartbeat_interval_s = 30        # worker 心跳频率
@@ -672,13 +753,22 @@ worker 自适应：根据上一轮平均 chunk 数动态调 `batch_size`，避�
 
 ### 5.11 操作之间的并发协调
 
-所有"对一个 connector 的操作"（sync / force_sync / remove / update_config）都统一进 `connector_jobs` 表，用 `op_kind` 区分。**一条 UNIQUE 约束 + 三条规则**覆盖所有并发场景。
+所有"对一个 connector 的操作"（sync / force_sync / remove / update_config）都统一进 `connector_jobs` 表，用 `op_kind` 区分。**两条 partial UNIQUE 约束 + 三条规则**覆盖所有并发场景。
 
-#### 三条核心规则
+#### 两条 partial UNIQUE 约束（§6.1 schema）
+
+```sql
+CREATE UNIQUE INDEX ux_connector_jobs_one_running ON connector_jobs (connector_id) WHERE status = 'running';
+CREATE UNIQUE INDEX ux_connector_jobs_one_queued  ON connector_jobs (connector_id) WHERE status = 'queued';
+```
+
+含义：同 connector 任意时刻**至多一个 running** + **至多一个 queued**。`(running, queued)` 同时存在是合法的——这正是 sync→remove preempt 流程需要的。"任意 op_kind 都受这两条约束限制" 是关键：拒绝逻辑（"sync 中又来 sync 怎么办"）由**应用层**根据 `op_kind` 判断，而不是由 SQL 约束本身判断。
+
+#### 三条核心规则（应用层）
 
 **① 同种重复 → 拒绝（destructive 类除外，幂等）**
 
-- `sync + sync` / `force_sync + force_sync` → 拒绝
+- `sync + sync` / `force_sync + force_sync` → 应用层拒绝（即使约束允许，业务层判断）
 - `remove + remove` → 幂等成功（目标状态就是"消失"）
 - `update_config + update_config` → 拒绝
 
@@ -722,21 +812,24 @@ sync running on connector C
     ▼ ① 检查 connectors.status='active'（否则按重复 remove 处理）
     ▼ ② connectors.status = 'removing'        ← 立刻设置；后续 add/sync 看到就拒绝
     ▼ ③ INSERT connector_jobs (op_kind='remove', status='queued')
-    │   （UNIQUE 约束此时允许：sync 是 running，remove 是 queued）
+    │   （ux_connector_jobs_one_queued 此时允许：sync 在 running，remove 占 queued）
     ▼ ④ 把 running 的 sync 标 cancelling
     ▼ ⑤ worker 在每个 object_task 边界检查 cancel signal
     │   当前 task 完成后退出（per-object 原子）
     ▼ ⑥ sync_job status → 'cancelled'
     ▼ ⑦ remove job 从 'queued' → 'running'
     ▼ ⑧ 跑 remove 流程：
-    │     - Milvus: drop_partition(connector_uri)   ← 比 delete by filter 快很多
-    │     - object store: 删 cache 文件
-    │     - metadata DB: 删 caches / connector_state / objects / connector_jobs / object_tasks
+    │     - Milvus: DELETE WHERE namespace_id = X AND connector_uri = <root>
+    │       （受 partition_key=connector_uri 物理路由加速；详见 §6.3）
+    │     - object store: 删 cache 文件 + staging files/ 树
+    │     - metadata DB: 删 caches / connector_state / objects / upload_manifests / object_tasks / connector_jobs
     ▼ ⑨ connectors row DELETE
     ▼ ⑩ remove job status → 'succeeded'
 ```
 
-清理顺序确保**幂等可重入**：如果 step ⑧ 中途崩溃，下次重启 worker 重跑 remove job，可以从任何一步开始（DROP 一次空 partition / 删空目录都是 no-op）。
+清理顺序确保**幂等可重入**：如果 step ⑧ 中途崩溃，下次重启 worker 重跑 remove job，可以从任何一步开始（DELETE 已无匹配行 / 删空目录都是 no-op）。
+
+> 关于"是不是 drop_partition 更快"：Milvus 的 `partition_key` 是按字段哈希自动分桶，**不是 named partition**，没有对应的 `drop_partition(<value>)` API。remove 走 `DELETE WHERE connector_uri = ...`；partition_key 的好处是过滤只扫一个物理桶，但删除时仍要执行 expression-based delete（详见 §6.3 + [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema)）。
 
 用户那边 `mfs status C` 在 ④-⑥ 期间看到：
 
@@ -827,14 +920,15 @@ objects (
 );
 
 caches (
+  namespace_id    VARCHAR DEFAULT 'default',  -- 进主键，避免跨 namespace 同名 object_uri 撞车
   object_uri      VARCHAR,
   cache_kind      VARCHAR,
-  storage_path    VARCHAR,                  -- ~/.mfs/cache/<sha1>/<kind> 或 s3 key
+  storage_path    VARCHAR,                    -- ~/.mfs/cache/caches/<namespace_id>/<sha1>/<kind> 或 s3 key
   fingerprint     VARCHAR,
   size_bytes      INTEGER,
   built_at        TIMESTAMP,
   last_accessed   TIMESTAMP,
-  PRIMARY KEY (object_uri, cache_kind)
+  PRIMARY KEY (namespace_id, object_uri, cache_kind)
 );
 
 -- ===== Job 队列：统一所有 connector op =====
@@ -853,10 +947,18 @@ connector_jobs (
   failed_objects        INTEGER,
   cancelled_objects     INTEGER,
   error                 TEXT,           -- 顶层失败原因
-  state_snapshot        TEXT,           -- pending：暂存的 connector state，sync 末尾才 commit
-  -- 关键约束：同 connector 同时只能有一个 in-flight op
-  UNIQUE (connector_id) WHERE status IN ('queued', 'running')
+  state_snapshot        TEXT            -- pending：暂存的 connector state，sync 末尾才 commit
 );
+
+-- 关键约束：同 connector 同时至多一个 running、至多一个 queued。
+-- 内联 partial UNIQUE 语法在 SQLite / Postgres 都不允许，必须拆成两条 partial UNIQUE INDEX。
+-- 拆成两条而非合一条 (status IN ('queued','running')) 的理由：
+-- §5.11 的 sync→remove preempt 流程要求 "sync running 时 remove queued" 共存——
+-- 合一条约束会阻止 remove 入队。
+CREATE UNIQUE INDEX ux_connector_jobs_one_running ON connector_jobs (connector_id)
+  WHERE status = 'running';
+CREATE UNIQUE INDEX ux_connector_jobs_one_queued  ON connector_jobs (connector_id)
+  WHERE status = 'queued';
 
 object_tasks (
   id                    VARCHAR PRIMARY KEY,
@@ -868,10 +970,10 @@ object_tasks (
   attempts              INTEGER DEFAULT 0,
   last_error            TEXT,
   started_at            TIMESTAMP,
-  finished_at           TIMESTAMP,
-  INDEX (connector_job_id, status, priority),                -- worker 调度索引
-  INDEX (status, started_at) WHERE status = 'running'        -- 心跳超时检测
+  finished_at           TIMESTAMP
 );
+CREATE INDEX ix_object_tasks_sched ON object_tasks (connector_job_id, status, priority);
+CREATE INDEX ix_object_tasks_running ON object_tasks (status, started_at) WHERE status = 'running';
 
 -- ===== Connector 内部 state =====
 connector_state (
@@ -930,30 +1032,35 @@ object store 同时存两类东西：
 | DB schema / 元数据 dump | `schema_dump.json` | postgres `schema.json` 的物化 |
 | markdown / code / 纯文本真实文件 | **无 cache** | 直接 read，没必要 cache |
 
-实际目录布局（每个 sha1 子目录通常只 1 个文件）：
+实际目录布局（每个 sha1 子目录通常只 1 个文件，**最外层按 namespace_id 切**）：
 
 ```
 ~/.mfs/cache/
   caches/
-    <sha1(./repo/manual.pdf)>/
-      converted_md                     ← PDF 转 markdown
-    <sha1(postgres://prod/.../rows.jsonl)>/
-      page_cache.jsonl                 ← DB 物化页
-    <sha1(./repo/diagram.png)>/
-      vlm_text                         ← 图片 VLM 描述
-    <sha1(postgres://prod/.../schema.json)>/
-      schema_dump.json                 ← DB schema 物化
-  uploads/                             ← §3.5 upload flow 用
-    <connector_id>/
-      <temp_file_id>.zip               ← bundle，commit 后删
+    <namespace_id>/                              ← v0.4 恒为 "default"；多租户启用后是真值
+      <sha1(./repo/manual.pdf)>/
+        converted_md                             ← PDF 转 markdown
+      <sha1(postgres://prod/.../rows.jsonl)>/
+        page_cache.jsonl                         ← DB 物化页
+      <sha1(./repo/diagram.png)>/
+        vlm_text                                 ← 图片 VLM 描述
+      <sha1(postgres://prod/.../schema.json)>/
+        schema_dump.json                         ← DB schema 物化
+  uploads/
+    <namespace_id>/
+      <connector_id>/
+        <temp_file_id>.zip                       ← bundle，commit 后删
   files/
-    <connector_id>/                    ← 解压后的真实文件树，作为 cache 保留
-      src/cli.py
-      README.md
-      ...
+    <namespace_id>/
+      <connector_id>/                            ← 解压后的真实文件树，作为 cache 保留
+        src/cli.py
+        README.md
+        ...
 ```
 
-`caches` 表存 `(object_uri, cache_kind) → storage_path` 映射；`upload_staging` 表存 temp_file_id → 路径。
+**为什么按 namespace_id 切**：cache 内容来自 object_uri 的 sha1，但两个 namespace 注册同名 connector 时 object_uri 相同 → cache key 相同 → 一个 namespace 的 cache 内容可能被另一个 namespace 直接命中（ACL 跳过）。v0.4 单 namespace 只有 `default/` 一层，没成本；等 v0.5+ 多租户上线时**已经物理隔离**，不需要重组目录。
+
+`caches` 表存 `(namespace_id, object_uri, cache_kind) → storage_path` 映射；`upload_staging` 表存 temp_file_id → 路径。
 
 #### 默认后端：本地文件系统
 
@@ -996,7 +1103,35 @@ per_namespace_quota_gb = 0           # 0 = 不限；多租户部署可按 namesp
 
 ### 6.3 Milvus
 
-一张 collection `mfs_chunks`，partition by connector。详见 [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
+一张 collection `mfs_chunks`，`partition_key = connector_uri`。详见 [06-search-and-retrieval.md §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
+
+#### Partition by connector_uri：用 `partition_key`，不是 named partition
+
+Milvus 里有**两套不同的 partition 机制**，文档里经常被混用：
+
+| 机制 | API | 数量上限 | 适合 |
+|---|---|---|---|
+| **Named partition** | `create_partition("p1") / drop_partition("p1")` | 单 collection ~4096 个（可配置） | 你**显式管理**的少量分区（如按 month 分区） |
+| **`partition_key` 字段** | schema 里 `partition_key=True`；写入/查询按字段哈希自动路由 | 由配置 `num_partitions` 决定，默认 64 | 多租户类**大量自动分桶**场景 |
+
+MFS 用的是 **`partition_key`**：
+
+- ✅ 不用代码显式 create / drop 物理分区
+- ✅ 查询带 `connector_uri == X` filter 时只扫该 connector 命中的桶
+- ❌ **没有对应的 "drop one connector 的桶" API**——remove 一个 connector 必须走 `DELETE WHERE connector_uri = X`
+
+所以 §5.11 流程里 remove 用 `DELETE WHERE namespace_id = X AND connector_uri = <root>`。partition_key 仍然有用：DELETE 也会按 partition_key 路由，只扫该 connector 命中的桶（不是全表 scan），但仍是 expression-based delete，比 named partition 的 `drop_partition`（直接删一个物理文件夹）慢一个数量级。
+
+**v0.4 选择 partition_key 而不是 named partition 的理由**：
+
+| 维度 | partition_key | named partition |
+|---|---|---|
+| connector 数量上限 | 几万级（受 `num_partitions` 影响弱，主要受 collection 整体规模限制） | 单 collection ~4096，**真的有硬上限** |
+| 注册/注销 connector 代码 | 不动 schema，写入即生效 | 每个 connector 显式 `create_partition`，状态需手动 GC |
+| remove 一个 connector 性能 | DELETE WHERE（中等） | `drop_partition`（最快） |
+| 多 namespace × 多 connector | scale OK | partition 数量爆炸 |
+
+MFS 预期 connector 数量可能成百上千（个人 + 团队 + 多 namespace），partition_key 是唯一可 scale 的方案。**性能换扩展性的取舍**。
 
 backends（推荐优先级 ↓）：
 
@@ -1013,7 +1148,7 @@ v0.4 主推 **Lite（个人）+ Zilliz Cloud（CS 部署）** 两条路。自部
 | 能力 | Lite 3.0 | Zilliz Cloud | 自部署 Milvus 3.0+ |
 |---|---|---|---|
 | `partition_key` 字段 | ⚠️ 待 verify（Lite 3.0 是 Python 全重写，能力跟历史版本不一定一致） | ✅ | ✅ |
-| `drop_partition` 快速删除 | ⚠️ 待 verify | ✅ | ✅ |
+| DELETE by expression | ✅ | ✅ | ✅ |
 | `sparse_vec` + 内建 BM25 | ⚠️ 待 verify | ✅ | ✅ |
 | `scalar index` 字段 | ✅ | ✅ | ✅ |
 | JSON metadata filter | ✅ | ✅ | ✅ |

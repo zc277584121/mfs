@@ -309,13 +309,14 @@ watch -n 30 'mfs add slack://eng && mfs head -n 50 slack://eng/...'
 
 ```sql
 caches (
+  namespace_id     TEXT DEFAULT 'default',   -- 进主键，避免跨 namespace 同名 object_uri 撞车
   object_uri       TEXT,
   cache_kind       TEXT,            -- "converted_md" | "page_cache" | "head_cache" | "vlm_text" | "schema_dump"
-  storage_path     TEXT,            -- ~/.mfs/cache/<sha1(object_uri)>/<cache_kind>
+  storage_path     TEXT,            -- ~/.mfs/cache/caches/<namespace_id>/<sha1(object_uri)>/<cache_kind>
   fingerprint      TEXT,            -- 同上游 fingerprint，用于 stale check
   size_bytes       INTEGER,
   built_at         TIMESTAMP,
-  PRIMARY KEY (object_uri, cache_kind)
+  PRIMARY KEY (namespace_id, object_uri, cache_kind)
 )
 ```
 

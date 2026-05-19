@@ -492,6 +492,54 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 | 附件目录 | `files/` |
 | 真实文件 | 原名 |
 
+### 10.7 URL → path 规范化（web / crawler 类 connector 必须遵守）
+
+把 URL 直接当文件名用会撞——不同的 URL 可能映射到同一虚拟 path → object_uri 撞 → chunk_id 撞 → 后写的覆盖先写的。**所有把 URL 映射成 path 的 connector**（web、Notion 公开页、Confluence、知识库爬虫等）必须遵守以下规范化规则：
+
+```
+URL: https://docs.acme.com/Guide/Start?lang=zh#install
+                            ↓
+                    URL canonicalization
+                            ↓
+1. scheme + host 小写、丢端口（仅当是默认端口 :80/:443）
+2. path：去 trailing slash（除非 path 就是 "/"）
+3. fragment（#anchor）：丢掉（同页不同锚不算不同对象）
+4. query：保留有意义参数；丢掉常见 tracking（utm_*、fbclid、gclid）
+   保留下来的参数按 key 字典序排序：lang=zh&page=2
+5. percent-encoding：normalize 大小写（%2F → %2F；不要 %2f）
+6. path 段中的非安全字符（"?", "/", ":" 等 percent-encode）
+                            ↓
+canonical URL: https://docs.acme.com/Guide/Start?lang=zh
+                            ↓
+                    映射到 virtual path
+                            ↓
+pages/docs.acme.com/Guide/Start__q=lang=zh.md
+```
+
+**映射规则**：
+
+| URL 部分 | 进 virtual path 的形式 |
+|---|---|
+| host | 作为第一级目录段（`pages/<host>/`） |
+| path | 按 `/` 切，**保留大小写**（FS 大小写敏感性差异要用 lowercase host 但 path 保留原样） |
+| query（非空） | 用 `__q=<sorted_kv>` 后缀挂在最后一段，参数值用 `=` 分隔，多个参数用 `&` 分隔 |
+| 文件名末尾后缀 | 默认 `.md`（页面转 markdown 后） |
+
+**例子**：
+
+| URL | virtual path |
+|---|---|
+| `https://docs.acme.com/` | `pages/docs.acme.com/index.md` |
+| `https://docs.acme.com/Guide/Start` | `pages/docs.acme.com/Guide/Start.md` |
+| `https://docs.acme.com/Guide/Start/` | `pages/docs.acme.com/Guide/Start.md`（trailing slash 不区分） |
+| `https://docs.acme.com/Guide/Start?lang=zh` | `pages/docs.acme.com/Guide/Start__q=lang=zh.md` |
+| `https://docs.acme.com/Guide/Start#install` | `pages/docs.acme.com/Guide/Start.md`（fragment 丢掉） |
+| `https://docs.acme.com/Guide/Start?utm_source=x` | `pages/docs.acme.com/Guide/Start.md`（utm_ 丢掉） |
+
+**路径长度 / 特殊字符**：path 段超过 200 字节或含 FS 禁用字符（Windows 上的 `< > : " | ? *`）→ 截断 + 加 `__h=<sha1[:8]>` 后缀防碰撞。
+
+**保留原 URL** 在 `objects.extra_json.url` 里供 cat 渲染 / 给 agent 看，不要从 virtual path 反推。
+
 ## 11. 边界规则
 
 | 想做的事 | 该不该做 |
