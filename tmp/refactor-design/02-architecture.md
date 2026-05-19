@@ -237,24 +237,41 @@ HTTP API 主要走 control plane（路径、option、状态、搜索结果），
 
 ```
 ① client scan + 本地 manifest cache (~/.mfs/clients/<server>/<connector>/manifest.db)
-  得到当前的 (path, size, mtime_ns, sha1) 集合
+  得到当前的 (path, size, mtime_ns, inode, sha1) 集合
+  client 本地做 inode + sha1 配对，得到 renames_hint（详见 04 §5.7）
 
 ② POST /v1/files/manifest
-  body: { connector_uri, paths: [...] }
+  body: {
+    connector_uri,
+    paths: [...],
+    renames_hint: [{old_path, new_path, sha1}, ...]   // client 自己 inode 配对的结果
+  }
   server 比对自己的 manifest，返回:
-    missing  → client 端新增的
-    stale    → client hash 变了的
-    extra    → server 多余的（client 本地删了的）
+    missing            → client 端新增的（需上传）
+    stale              → client hash 变了的（需上传）
+    extra              → server 多余的（client 本地删了的）
+    renames_accepted   → server 验证 sha1 一致后接受的 rename（零字节上传）
+    renames_rejected   → sha1 验证失败 / server manifest 里没 old_path，退化为 missing + extra
 
 ③ client 把 missing + stale 文件打成 zip，
   PUT /v1/files/upload?connector_uri=...
   server 把字节放到 staging area: object_store://uploads/<connector_uri>/<temp_file_id>.zip
   返回 temp_file_id
+  （renames_accepted 不上传字节）
 
 ④ POST /v1/files/commit
-  body: { connector_uri, temp_file_id, deletions: [extra...] }
+  body: {
+    connector_uri,
+    temp_file_id,
+    renames:   [...],     // accepted rename 列表
+    deletions: [...]      // 真删了的
+  }
   server:
     - 解压 zip 到 staging files/<connector_uri>/
+    - 处理 renames:
+        · staging files OS-level rename: old_path → new_path
+        · 触发 §10.3 Milvus 改 chunk_id 流程（向量复用，零 embedding API）
+        · UPDATE caches / objects 表
     - 处理 deletions（删 staging files + Milvus chunks + objects 行）
     - 触发 file connector sync（扫 staging area → chunk → embed → 写 Milvus）
     - 更新 server 端 manifest
@@ -262,20 +279,38 @@ HTTP API 主要走 control plane（路径、option、状态、搜索结果），
   返回 job_id
 ```
 
-一致性保证：每次 `mfs add` 上传完成后，server 端 file connector 看到的目录树跟 client 当前目录树一致——本地新增/修改 → 上传；本地删除 → 通过 commit deletions 同步删除。
+一致性保证：每次 `mfs add` 上传完成后，server 端 file connector 看到的目录树跟 client 当前目录树一致——本地新增/修改 → 上传；本地删除 → 通过 commit deletions 同步删除；本地 rename → 通过 commit renames 路径迁移，不传字节。
 
 设计取舍：
 
 - **海量小文件**打 zip 一次上传，HTTP roundtrip 数量不随文件数线性增长
 - **巨大单文件**（超过 `max_bundle_size_mb`）不打包，独立 multipart streaming PUT
+- **rename**：client inode 配对识别后只传一个 rename 列表（几 KB），不传文件字节。即使 mv 1GB 文件也是零带宽
 - 不做 chunk-level rsync / 断点续传（v0.4 范围内 ROI 不划算）
+
+#### Rename 验证
+
+server 端不存 inode（client-local 概念，跨 client 不可信），用 **sha1 验证**：
+
+```
+对 client 报告的每条 rename (old_path → new_path, sha1=X):
+   server_sha1 = upload_manifests[connector_id][old_path].sha1
+   if server_sha1 is None:
+       reject → server 端没见过 old_path，当 missing 处理
+   elif server_sha1 != X:
+       reject → client / server manifest 不同步，退化为 missing + extra（真上传）
+   else:
+       accept → 加进 renames_accepted
+```
+
+退化路径保证 manifest 不一致也能恢复一致——坏情况下退化为常规上传，不会数据损坏。
 
 错误恢复：
 
 - 上传到一半失败：server 不写任何状态，下次重新 manifest diff
 - commit 没成功：staging zip 留着没解压，下次 `mfs add` 重新走
 
-Client 端 manifest cache（SQLite）记录每个 path 的 `(size, mtime_ns, sha1, last_seen)`，每次启动只 stat 比对 size+mtime，不变就复用旧 sha1——增量扫描接近 zero overhead。
+Client 端 manifest cache（SQLite）记录每个 path 的 `(size, mtime_ns, inode, sha1, last_seen)`，每次启动只 stat 比对 size+mtime，不变就复用旧 sha1。**rename 检测主要靠 inode 配对**，几乎零 sha1 重算（详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)）。
 
 `connector_uri` 构造为 `file://<client_id>/<abs-path>`；一个 connector_uri 一辈子绑定一个 client，v0.4 禁止多 client 共写同一 connector。
 

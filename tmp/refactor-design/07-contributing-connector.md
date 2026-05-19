@@ -197,8 +197,13 @@ class Range:
 
 @dataclass
 class ObjectChange:
-    uri:  str
-    kind: Literal["added", "modified", "deleted"]
+    uri:     str
+    kind:    Literal["added", "modified", "deleted", "renamed"]
+    old_uri: Optional[str] = None    # 仅 renamed：原 path / URI
+    # `renamed` 是可选 kind——connector 能可靠识别"同内容换 path"时主动 yield，
+    # 让 framework 跳过重 chunk / 重 embed，只改 Milvus 的 chunk_id 主键。
+    # 不能识别的 connector 照旧 yield added + deleted，正确但更贵。
+    # 详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)。
 
 # self.state：framework 注入的命名空间 KV store
 class StateStore(Protocol):

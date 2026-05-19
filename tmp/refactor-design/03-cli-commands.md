@@ -126,6 +126,17 @@ Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
 Worker running in background. Run `mfs status` to check progress.
 ```
 
+如果检测到 rename（`mv ./repo/projects/old ./repo/projects/new` 后），输出多一行 `N renames`：
+
+```text
+$ mfs add ./repo
+Processing 184 files under /repo
+Detected: 100 renames, 0 modified, 0 added, 0 deleted
+Renames skip re-embedding (content unchanged); only chunk_id is rewritten.
+```
+
+rename 检测算法（inode + sha1 fallback）和触发条件详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)。
+
 ### 检测到 framework 配置变化时
 
 换了 embedding model / chunker config / converter 版本，下次 `mfs add` 时 reconcile pass 会发现下游 fp 失效（详见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)）。如果失效范围大就先提示一下，让用户明确决定：

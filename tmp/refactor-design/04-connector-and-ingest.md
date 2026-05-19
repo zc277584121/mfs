@@ -205,9 +205,12 @@ class ConnectorPlugin:
 
 @dataclass
 class ObjectChange:
-    uri:  str
-    kind: Literal["added", "modified", "deleted"]
+    uri:     str
+    kind:    Literal["added", "modified", "deleted", "renamed"]
+    old_uri: Optional[str] = None    # 仅 renamed：原 path / URI
 ```
+
+`renamed` 是个可选 kind——connector 能可靠识别"同内容换 path"时主动 yield，让 framework 跳过重 chunk / 重 embed，只改 Milvus 的 chunk_id 主键。其他 connector 不强制实现，照旧 yield `added` + `deleted` 也正确（只是更贵）。详见 [§5.7](#57-rename-detection)。
 
 Connector 内部 state（cursor / manifest / etag 表）用 framework 提供的 KV store 持久化：
 
@@ -430,19 +433,38 @@ file connector 的 sync 完整流程：
    - manifest 里有 + (size, mtime_ns) 完全一致 → 跳过
    - manifest 里有 + (size, mtime_ns) 变化 → 算 sha1(content)
      - sha1 跟 manifest 一致 → 只是 touch 了 mtime，更新 manifest.mtime_ns，跳过
-     - sha1 不一致 → yield ObjectChange(path, "modified")
-   - manifest 里没有 → yield ObjectChange(path, "added")
+     - sha1 不一致 → 加进 modified 候选
+   - manifest 里没有 → 加进 added 候选
 
-3. manifest 里有但 current_paths 没有 → yield ObjectChange(path, "deleted")
+3. manifest 里有但 current_paths 没有 → 加进 deleted 候选
 
-4. 更新 self.state 里的 manifest（写新 sha1 / size / mtime）
+4. Rename detection（详见 §5.7.2）：对 added × deleted 做 inode + sha1 配对
+   - inode 一致（同 fs mv）→ yield ObjectChange("renamed", new, old_uri=old)，零 sha1
+   - inode 不可信 / 失败 → size 预过滤后算 sha1，匹配 → yield "renamed"
+   - 都没匹配 → yield "added" / "deleted"
+
+5. 更新 self.state 里的 manifest（写新 sha1 / size / mtime / inode）
+```
+
+manifest 结构：
+
+```python
+manifest = {
+  path: {
+    "size":     int,
+    "mtime_ns": int,
+    "inode":    Optional[int],   # 不可信平台为 None，退化 sha1 配对
+    "sha1":     str,
+  },
+  ...
+}
 ```
 
 manifest 是 file connector 自己定义的结构，存在 `self.state` 里。其他 connector 按各自需要存自己的 state，framework 不 introspect。
 
 **file connector 不调 checkpoint**——它的 state 是全量 map 形态，半截 commit 不合法（详见 §5.6.1）。
 
-注意：file connector 的 manifest 只包含**文件本身的 fingerprint**（path / size / mtime_ns / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化由 §5.2 的 sweep 步骤捕获，跟 manifest diff 无关。
+注意：file connector 的 manifest 只包含**文件本身的 fingerprint**（path / size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化由 §5.2 的 sweep 步骤捕获，跟 manifest diff 无关。
 
 ### 5.6 Mid-job checkpoint
 
@@ -492,6 +514,119 @@ async def sync(self):
 频率取决于"重跑 50 页贵不贵 + checkpoint 自己的事务成本"。10 万量级数据 50~200 页一次是合理区间。
 
 不调 checkpoint 的 connector 走默认末尾提交语义，靠 chunk_id 幂等保证重跑不会写脏 Milvus。
+
+### 5.7 Rename detection
+
+笔记类场景里改文件夹名 / 改文件名很常见。如果当成 `deleted + added` 处理，所有 chunks 都要重新切分 + 重新 embed——既花钱又花时间，但文件内容根本没变。Framework 提供一套机制让 connector 报告 rename，跳过重 embed。
+
+#### 5.7.1 协议层
+
+connector 可选 yield `renamed` ObjectChange：
+
+```python
+yield ObjectChange(kind="renamed", uri=new_uri, old_uri=old_uri)
+```
+
+不能识别的 connector 照旧 yield `added` + `deleted`，正确但更贵。
+
+#### 5.7.2 配对算法（推荐 inode + sha1 fallback）
+
+file connector 用两层配对，**绝大多数场景零 sha1 计算**：
+
+```python
+# manifest schema 扩展：加 inode 字段
+manifest = {
+  path: {"size": ..., "mtime_ns": ..., "inode": 12345, "sha1": "..."},
+  ...
+}
+
+# 配对算法
+deleted_by_inode = {manifest[p].inode: p for p in deleted_paths
+                    if manifest[p].inode is not None}
+deleted_by_sha1  = {manifest[p].sha1:  p for p in deleted_paths}
+
+for new_path in sorted(added_paths):                  # 字典序保证 deterministic
+    new_inode = get_stable_inode(new_path)            # os.stat().st_ino，平台不可信时返 None
+
+    # 优先 inode（同 fs mv 场景，零 sha1）
+    if new_inode and new_inode in deleted_by_inode:
+        old_path = deleted_by_inode[new_inode]
+        # 双重校验防 inode 复用
+        if manifest[old_path].size == os.stat(new_path).st_size:
+            yield ObjectChange("renamed", new_path, old_uri=old_path)
+            deleted_by_inode.pop(new_inode)
+            deleted_by_sha1.pop(manifest[old_path].sha1, None)
+            continue
+
+    # inode 配对失败（跨 fs / 网络 fs / inode 复用），按 size 预过滤再算 sha1
+    new_size = os.stat(new_path).st_size
+    has_size_match = any(manifest[p].size == new_size for p in deleted_by_sha1.values())
+    if has_size_match:
+        new_sha1 = compute_sha1(new_path)             # 真读盘
+        old_path = deleted_by_sha1.pop(new_sha1, None)
+        if old_path:
+            yield ObjectChange("renamed", new_path, old_uri=old_path)
+            continue
+
+    # 真新增
+    yield ObjectChange("added", new_path)
+
+# 配对剩下的：真删
+for old_path in set(deleted_by_sha1.values()):
+    yield ObjectChange("deleted", old_path)
+```
+
+`get_stable_inode` 在不可信平台（Windows FAT32 / 部分网络 fs）返回 None，直接退到 sha1 路径——**没 inode 也能跑**，只是慢点。
+
+#### 5.7.3 Framework 处理 `renamed`
+
+renamed event 进 framework 后，**chunk 内容、所有 fingerprint 都不变**——只有 chunk_id 主键变（因为 `chunk_id = sha1(... + object_uri + ...)`）。处理流程：
+
+```
+对 old_uri 在 Milvus 里的所有 chunks:
+  ① 读出 dense_vec / sparse_vec / content / locator / chunk_kind /
+       chunk_fingerprint / embedding_fingerprint / metadata
+  ② 算新 chunk_id = sha1(namespace + connector + new_uri + locator + chunk_kind)
+  ③ INSERT 新行（向量 + content + 所有 fp 字段直接复用，不调 embedder）
+  ④ DELETE 旧行（按旧 chunk_id 或按 object_uri 批量删）
+
+caches 表:   UPDATE object_uri = new_uri WHERE object_uri = old_uri
+objects 表:  UPDATE object_uri = new_uri, parent_path = ... WHERE object_uri = old_uri
+object_store: 物理 mv cache 目录
+  ~/.mfs/cache/caches/<ns>/<sha1(old_uri)>/  →  ~/.mfs/cache/caches/<ns>/<sha1(new_uri)>/
+```
+
+`chunk_fp` / `embedding_fp` 公式里都不含 `object_uri`（详见 [§5.2](#52-fingerprint-chain)），所以 rename 后 fp 真的不变，零外部 API 调用。
+
+#### 5.7.4 边界情况
+
+| 场景 | inode 行为 | 处理 |
+|---|---|---|
+| 同 fs mv | inode 不变 | inode 配对，零 sha1 |
+| 跨 fs mv（fs1 → fs2）| 实际是 cp + rm，inode 变 | 退化 sha1 配对 |
+| 编辑器保存（vim `:w` 走 rename-after-write） | 新 inode + 新 sha1 | 不进 rename 路径，走 modified 重 embed（语义正确）|
+| 硬链接 `ln a.md b.md` | 两 path 同 inode，都还在 | 不在 deleted+added 集合，不进 rename 路径 |
+| Windows FAT32 / 网络 fs | inode 不可信 | get_stable_inode 返 None，退化 sha1 |
+| inode 复用（删原 → fs 把 inode 给新文件） | 理论可能 | size 双重校验拒掉；极端 case 仍走 sha1 兜底 |
+| FS case-insensitive 改大小写（`Foo → foo`）| scan 看不到变化 | 不支持，用户自己绕（先改临时名）|
+| 1 → N copy + 删原 | 1 个 inode/sha1 配对成功，剩下走 added | 部分优化 |
+| 改名 + 编辑内容 | sha1 不匹配 | 退化为 deleted + added，重 embed（语义正确）|
+| 同 sha1 多个文件（重复内容） | 按字典序配对，outcome 等价 | 任意配对都对，少一次 embed 就赢 |
+| connector root 自己改名（`mv ~/notes ~/notes-v2`） | 新 connector_uri = 新 connector | 不在本机制范围；用户需 `mfs remove + add` |
+
+#### 5.7.5 性能与正确性的兜底
+
+inode 配对失败时退化到 sha1 配对，sha1 配对失败时退化到 `deleted + added`——**坏情况下退化为原行为，不会数据损坏**。
+
+#### 5.7.6 不加 `mfs rename` 命令
+
+考虑过但不采纳：
+
+1. 用户已经 `mv` 了，daemon 自己 scan 就能发现，再多一条命令是冗余
+2. 其他 connector（postgres / slack / github）上游没有 rename 概念
+3. bulk rename 让用户自己 glob 出参数列表太丑
+
+让 connector 自己负责 rename detection 比让用户手动报告靠谱。
 
 ## 6. 凭据管理
 
