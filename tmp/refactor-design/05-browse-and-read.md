@@ -1,26 +1,26 @@
 # 浏览与读取
 
-本文回答：`ls / tree / cat / head / tail / grep` 这六个命令的后台行为，cache 怎么用，大对象怎么处理。
+这一篇讲 `ls / tree / cat / head / tail / grep` 这六个命令的后台行为：cache 怎么用、大对象怎么处理、密度视图什么时候生效。
 
 ## 1. ls 与 tree 的后台行为
 
 ```
 mfs ls postgres://prod/public/tickets
   │
-  ├─ 1. 查 metadata DB:
-  │     SELECT virtual_path, media_type, size_hint, last_seen, fingerprint, extra
-  │     FROM objects
-  │     WHERE connector_id = $cid AND parent_path = '/public/tickets'
-  │     ORDER BY virtual_path
+  ① 查 metadata DB:
+       SELECT virtual_path, media_type, size_hint, last_seen, fingerprint, extra
+       FROM objects
+       WHERE connector_id = $cid AND parent_path = '/public/tickets'
+       ORDER BY virtual_path
   │
-  ├─ 2. 如果 records 的 last_seen 超过 TTL（默认 1h）：
-  │       触发后台 connector.list($path) 刷新（不阻塞当前请求）
-  │       当前请求返回 cached 结果，附 "(may be stale)" 提示
+  ② 如果 records 的 last_seen 超过 TTL（默认 1h）：
+       触发后台 connector.list($path) 刷新（不阻塞当前请求）
+       当前请求返回 cached 结果，附 "(may be stale)" 提示
   │
-  └─ 3. 渲染输出
+  ③ 渲染输出
 ```
 
-**所有 ls/tree 都走 metadata DB cache**，不直接打回 connector。metadata DB 就是虚拟文件系统的 path index——这是它必须存在的根本理由。
+所有 ls / tree 都走 metadata DB cache，不直接打回 connector——metadata DB 就是虚拟文件系统的 path index。
 
 `--refresh` 强制同步刷新后再列：
 
@@ -92,12 +92,12 @@ file  LICENSE         text/plain           11 KB
 
 ## 3. tree 的无界处理
 
-slack/discord/gmail 这种按日期递归很容易爆炸（365 天 × 100 频道）。规则：
+slack / discord / gmail 这种按日期递归很容易爆炸（365 天 × 100 频道）。规则：
 
-- **默认 `-L 2`**，不是 unlimited。
-- **每层最多 100 项**，超过显示 `... (N more, narrow with <path>)`。
-- **时间分区目录**默认时间倒序，只展开最近 30 天。
-- 用户加 `--limit N` 调整单层上限，`-L N` 调整深度。
+- 默认 `-L 2`，不是 unlimited
+- 每层最多 100 项，超过显示 `... (N more, narrow with <path>)`
+- 时间分区目录默认时间倒序，只展开最近 30 天
+- 用户加 `--limit N` 调整单层上限，`-L N` 调整深度
 
 ```text
 $ mfs tree slack://eng -L 3
@@ -118,13 +118,12 @@ slack://eng
 
 ### 4.1 不用 cursor token
 
-理由：
+cursor 是 stateful 复杂度，agent 难管、token 过期、兼容性问题多。MFS 用更简单的几条命令组合应对：
 
-- cursor 是 stateful 复杂度，agent 难管，token 过期 / 兼容性问题多。
-- 真要遍历大对象用 `mfs export` 物化到本地再处理。
-- 大对象过滤用 `mfs grep`（server-side pushdown），不需要全量拉回。
-- 增量数据走"周期 `mfs add <uri>` + `mfs head -n N` 看快照"，v0.4 不做流式跟随。
-- DB query 结果不稳定靠 `export` 物化解决。
+- 真要遍历大对象用 `mfs export` 物化到本地再处理
+- 大对象过滤用 `mfs grep`（server-side pushdown），不需要全量拉回
+- 增量数据走"周期 `mfs add <uri>` + `mfs head -n N` 看快照"，v0.4 不做流式跟随
+- DB query 结果不稳定靠 `export` 物化解决
 
 ### 4.2 统一接口
 
@@ -136,10 +135,10 @@ mfs cat <uri> --range A:B    # 按行/记录区间读取
 mfs export <uri> <file>      # 完整导出到本地
 ```
 
-职责完全不重叠：
+职责不重叠：
 
-- `head/tail` 只看端点，不带范围。
-- `cat` 默认完整；`--range A:B` 取闭开区间。
+- `head / tail` 只看端点，不带范围
+- `cat` 默认完整；`--range A:B` 取闭开区间
 
 ### 4.3 `--range A:B` 单位
 
@@ -234,7 +233,7 @@ s3://logs/app/2026-05-10/app.jsonl
 
 下推与否对用户透明：用户只用 `mfs grep`，框架根据 connector 能力派发。`mfs status --verbose <uri>` 可看到该对象的 grep 实现路径。
 
-`mfs grep` 默认是字面精确匹配（符合 unix 习惯）；只有 `--mode index` 才走 Milvus BM25 召回。
+`mfs grep` 默认是字面精确匹配（符合 unix 习惯），`--mode index` 才走 Milvus BM25 召回。
 
 ## 7. cat 对非文本对象的渲染
 
@@ -255,7 +254,7 @@ cat 按 media_type 决定渲染方式：
 
 ## 8. 密度视图的适用范围
 
-`--peek / --skim / --deep` 和 W/H/D 参数**只对 document / code / directory 形态生效**：
+`--peek / --skim / --deep` 和 W/H/D 参数只对 document / code / directory 形态生效：
 
 | 命令 | 适用对象 | 行为 |
 |---|---|---|
@@ -265,11 +264,11 @@ cat 按 media_type 决定渲染方式：
 
 数据来源：
 
-- `--peek`: metadata DB（无需 Milvus）。
-- `--skim`: Milvus 查该 path 下的 `directory_summary` / `summary` / `vlm_description` chunk；没有则降级到 `--peek`。
-- `--deep`: Milvus + 取 cache head。
+- `--peek`: metadata DB（无需 Milvus）
+- `--skim`: Milvus 查该 path 下的 `directory_summary` / `summary` / `vlm_description` chunk，没有则降级到 `--peek`
+- `--deep`: Milvus + 取 cache head
 
-**对结构化对象**（rows.jsonl / messages.jsonl / records.jsonl / schema.json / sample / page_cache）传 `--peek/--skim/--deep` 直接报错：
+对结构化对象（rows.jsonl / messages.jsonl / records.jsonl / schema.json / sample / page_cache）传 `--peek / --skim / --deep` 直接报错：
 
 ```text
 density view not supported for application/x-ndjson
@@ -278,17 +277,11 @@ use head/tail/cat --range instead:
   mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:50
 ```
 
-错误码 `density_unsupported`。理由：head/tail/range 已经完整覆盖结构化对象的预览需求；密度视图重复造轮子且语义模糊。
+错误码 `density_unsupported`。head/tail/range 已经完整覆盖结构化对象的预览需求，密度视图重复造轮子且语义模糊。W/H/D 参数同样规则。
 
-W/H/D 参数同样规则。
+## 9. v0.4 不支持流式跟随（`tail -f`）
 
-## 9. v0.4 不支持流式跟随 (`tail -f`)
-
-`tail -f` 不在 v0.4 范围。理由：
-
-- 实现一个真正有用的 `tail -f` 需要每个 connector 单独搭 push/poll 通道（slack events / discord WS / fs watcher / s3 list polling / DB CDC ...），工程成本高
-- 受益场景窄——日志监控、聊天跟随只是少数场景
-- 退化为"周期轮询"的伪流式没多大价值
+不在 v0.4 范围。每个 connector 要单独搭 push/poll 通道（slack events / discord WS / fs watcher / s3 list polling / DB CDC ...）工程成本太高，受益场景又窄。
 
 替代做法：
 
@@ -301,7 +294,7 @@ mfs head -n 50 slack://eng/.../messages.jsonl    # 看最新一批
 watch -n 30 'mfs add slack://eng && mfs head -n 50 slack://eng/...'
 ```
 
-之后视用户呼声决定是否在 v0.5+ 引入。届时优先支持 file connector 和 slack/discord 这种自带 push 的源。
+视用户呼声决定是否 v0.5+ 引入，届时优先支持 file connector 和 slack / discord 这种自带 push 的源。
 
 ## 10. Cache 层细节
 
@@ -332,13 +325,13 @@ caches (
 
 ### 10.3 何时 cache、何时不 cache
 
-每个 connector plugin 决定。一般规则：
+每个 connector plugin 决定，一般规则：
 
-- **真实文件**（本地文件、GitHub blob、S3 object）→ 不 cache，每次 connector.read() 直接拉（要么 fast，要么需要凭据隔离）。
-- **MFS 生成的虚拟对象**（schema.json / rows.jsonl 的 head / messages.jsonl）→ cache。
-- **大对象 lazy 模式**（rows.jsonl）→ 不全量 cache；用户 cat --range 时局部拉，可选写局部 cache。
-- **图片 VLM**→ cache description 文本（不 cache 图片本身）。
-- **PDF/DOCX/HTML 转 markdown**→ cache markdown（原文件还在 source）。
+- 真实文件（本地文件、GitHub blob、S3 object）→ 不 cache，每次 connector.read() 直接拉（要么 fast，要么需要凭据隔离）
+- MFS 生成的虚拟对象（schema.json / rows.jsonl 的 head / messages.jsonl）→ cache
+- 大对象 lazy 模式（rows.jsonl）→ 不全量 cache；用户 `cat --range` 时局部拉，可选写局部 cache
+- 图片 VLM → cache description 文本，不 cache 图片本身
+- PDF / DOCX / HTML 转 markdown → cache markdown，原文件还在 source
 
 ### 10.4 cache 淘汰
 
@@ -354,14 +347,14 @@ eviction = "lru"
 
 ## 11. Pipe 与 stdin
 
-**Pipe 是普通 unix 字节流**——MFS 不在 stdin/stdout 上发明私有协议，不识别"上游来自哪个 connector"。这样每个新 connector 不需要做 pipe 元数据适配，命令简单。
+Pipe 是普通 unix 字节流——MFS 不在 stdin/stdout 上发明私有协议，不识别"上游来自哪个 connector"。每个新 connector 不需要做 pipe 元数据适配。
 
 规则：
 
-- 上游 `mfs cat / head / tail / grep / search` 输出**纯字节流**（默认）或 JSON（`--json`），没有 MFS header。
-- `mfs search` / `mfs grep` 读 stdin 时**总是把 stdin 当临时文本处理**。
-- 想限定到具体 connector 或对象，**传 path 参数**：`mfs search "..." <path>`。
-- 无 path 且无 `--all` 且无 stdin：报错。
+- 上游 `mfs cat / head / tail / grep / search` 输出纯字节流（默认）或 JSON（`--json`），没有 MFS header
+- `mfs search` / `mfs grep` 读 stdin 时总是把 stdin 当临时文本处理
+- 想限定到具体 connector 或对象就传 path 参数：`mfs search "..." <path>`
+- 无 path、无 `--all`、无 stdin → 报错
 
 示例：
 

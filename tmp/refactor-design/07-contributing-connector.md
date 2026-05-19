@@ -1,47 +1,47 @@
-# 贡献新 Connector 的规范
+# 贡献新 Connector
 
-本文写给想给 MFS 加新 connector 的开发者。社区贡献的工作量目标：**约 500-1500 行 Python，集中在 `connectors/<name>/`**，按你实现到哪一层而定。
+这一篇写给想给 MFS 加新 connector 的开发者。预期工作量：500~1500 行 Python，集中在 `connectors/<name>/`，按实现到哪一层而定。
 
 ## 0. 必须实现 vs 可选重写
 
-Connector 暴露两类方法：**必须实现**的 abstract method（不写就跑不起来），和**可选重写**的 method（基类有默认实现，重写就用你的）。
+Connector 暴露两类方法：
 
 ```
 必须实现（6 个 abstract method）
-  stat / list / read              ← 核心 IO
-  fingerprint / sync               ← 变化检测
-  object_kind_of                   ← 路径→object 类型映射
+  stat / list / read              核心 IO
+  fingerprint / sync              变化检测
+  object_kind_of                  路径 → object 类型映射
 
 可选重写（基类有默认；重写就走你的逻辑）
-  grep          — 默认线性扫；postgres/slack 可重写做下推
-  search        — 默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
-  chunk_plan    — 默认按 object_kind 推断；自定义 chunk strategy 时重写
-  render        — 默认按 media_type 渲染；Parquet/ORC 等特殊格式可重写
-  task_priority — 默认 0 (FIFO)；有"首屏可见"诉求的 connector（如 file）可重写
-  acl           — 默认 None；多租户 ACL 场景重写
+  grep          默认线性扫；postgres / slack 可重写做下推
+  search        默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
+  chunk_plan    默认按 object_kind 推断；自定义 chunk strategy 时重写
+  render        默认按 media_type 渲染；Parquet / ORC 等特殊格式可重写
+  task_priority 默认 0（FIFO）；有"首屏可见"诉求的 connector（如 file）重写
+  acl           默认 None；多租户 ACL 场景重写
 ```
 
-写一个简单 connector**只实现 6 个 abstract method 就能跑**（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
+只实现 6 个 abstract method 就能跑起来（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
 
-不暴露更深的扩展点（自定义 chunker 内部、自定义 cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
+framework 不暴露更深的扩展点（自定义 chunker 内部、自定义 cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
 
 ## 1. 你需要写什么（vs 不需要写什么）
 
-| 关注点 | 你写 | 你不写 / 复用 framework |
+| 关注点 | 你写 | 复用 framework |
 |---|---|---|
-| 连接外部系统 / 认证 | ✅ 用对应 SDK | 凭据通过 `credential_ref` 解析 |
-| 决定 URI 树长什么样 | ✅ 写 `PROMPT.md` + `layout.py` | 命名规范见 §10 |
-| `stat / list / read` 实现 | ✅ 三个 method | API 路由、HTTP、SSE 都是 framework |
-| 变化检测 (`fingerprint / sync`) | ✅ 算法 + state schema 完全自由 | framework 接管"哪些变化要重建" |
-| 对象 → object_kind 映射 | ✅ 一个 dict | 每个 object_kind 的 chunker / structure 全 framework |
-| chunk 切分 / embedding / summary / VLM | ❌ | framework pipeline |
-| `cat / head / tail / grep / ls / tree` 命令 | ❌ | framework shell helpers |
-| Retrieval Index (Milvus) | ❌ | framework |
-| metadata DB / cache 存储 | ❌ | framework storage |
-| HTTP API / SDK | ❌ | framework |
-| `mfs add` / `mfs connector` / `mfs status` 行为 | ❌ | framework engine |
-| 配置 schema 验证 | ✅ 用 pydantic | framework 调验证 |
-| 内置 preset（如有） | ✅ 可选；提供默认 text_fields/locator_fields/... | 否则用户必须显式配 |
+| 连接外部系统 / 认证 | 用对应 SDK | 凭据通过 `credential_ref` 解析 |
+| 决定 URI 树长什么样 | 写 `PROMPT.md` + `layout.py` | 命名规范见 §10 |
+| `stat / list / read` 实现 | 三个 method | API 路由、HTTP、SSE 都是 framework |
+| 变化检测（`fingerprint / sync`） | 算法 + state schema 自由 | framework 接管"哪些变化要重建" |
+| 对象 → object_kind 映射 | 一个 dict | 每个 object_kind 的 chunker / structure 全 framework |
+| 配置 schema 验证 | 用 pydantic | framework 调验证 |
+| 内置 preset（可选） | 提供默认 text_fields / locator_fields | 没 preset 用户得显式配 |
+| chunk 切分 / embedding / summary / VLM | | framework pipeline |
+| `cat / head / tail / grep / ls / tree` | | framework shell helpers |
+| Retrieval Index（Milvus） | | framework |
+| metadata DB / cache 存储 | | framework storage |
+| HTTP API / SDK | | framework |
+| `mfs add / connector / status` | | framework engine |
 
 ## 2. 文件骨架
 
@@ -438,7 +438,7 @@ CI 自动跑 contract + fake。真连测试可选。
 
 ### 10.2 集合用 JSONL，不要造目录里全是单 JSON
 
-❌ **不要**：
+不要：
 
 ```text
 tickets/
@@ -448,9 +448,9 @@ tickets/
   ...
 ```
 
-理由：scale 不好；`ls` 巨慢；agent 没法 head/grep 整个集合。
+scale 不好，`ls` 巨慢，agent 没法 head/grep 整个集合。
 
-✅ **要**：
+要：
 
 ```text
 tickets/
@@ -459,25 +459,25 @@ tickets/
   comments.jsonl               # 全部 comment（带 ticket_id 反向引用）
 ```
 
-用 `mfs grep '"id":12' tickets/records.jsonl` 或 `export + jq` 取单条。
+取单条用 `mfs grep '"id":12' tickets/records.jsonl` 或 `export + jq`。
 
-### 10.3 单 record 的精确定位走 locator，不暴露成 path
+### 10.3 单 record 走 locator，不暴露成 path
 
-不要给单条 record / row / issue 分配独立 path。它们由搜索结果的 `locator` JSON 定位，详见 [06-search-and-retrieval.md §3](06-search-and-retrieval.md#3-locator-schema-per-connector).
+不要给单条 record / row / issue 分配独立 path。它们由搜索结果的 `locator` JSON 定位，详见 [06 §3](06-search-and-retrieval.md#3-locator-schema-per-connector)。
 
 例外：单条对象天然有持久 path 且数量可控时可以暴露（如 GitHub PR `pulls/42/diff.patch`）。
 
 ### 10.4 目录节点不能 cat
 
-`cat` 一个目录路径返回 `is_directory` 错误。所有目录节点统一行为，不要在某些 connector 让 `cat dir/` 返回"目录概览"——那是 `ls` 的事。
+`cat` 目录返回 `is_directory` 错误。所有目录节点统一行为，不要在某些 connector 让 `cat dir/` 返回"目录概览"——那是 `ls` 的事。
 
 ### 10.5 真实文件透传
 
-GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**的对象：
+GitHub blob、S3 object、Drive file、本地文件这些真有文件实体的对象：
 
 - 保留原文件名和后缀
 - 不在路径上"装饰"任何东西
-- `cat` 返回原始 bytes（除非是 PDF/DOCX 等 framework 知道怎么转 markdown 的类型）
+- `cat` 返回原始 bytes（除非是 PDF / DOCX 等 framework 知道怎么转 markdown 的类型）
 
 ### 10.6 命名词汇约定
 
@@ -494,7 +494,7 @@ GitHub blob、S3 object、Drive file、本地文件这些**真有文件实体**�
 
 ### 10.7 URL → path 规范化（web / crawler 类 connector 必须遵守）
 
-把 URL 直接当文件名用会撞——不同的 URL 可能映射到同一虚拟 path → object_uri 撞 → chunk_id 撞 → 后写的覆盖先写的。**所有把 URL 映射成 path 的 connector**（web、Notion 公开页、Confluence、知识库爬虫等）必须遵守以下规范化规则：
+把 URL 直接当文件名用会撞：不同的 URL 可能映射到同一虚拟 path，导致 object_uri 撞 → chunk_id 撞 → 后写的覆盖先写的。把 URL 映射成 path 的 connector（web、Notion 公开页、Confluence、知识库爬虫等）必须遵守下面的规范化规则：
 
 ```
 URL: https://docs.acme.com/Guide/Start?lang=zh#install
@@ -516,16 +516,16 @@ canonical URL: https://docs.acme.com/Guide/Start?lang=zh
 pages/docs.acme.com/Guide/Start__q=lang=zh.md
 ```
 
-**映射规则**：
+映射规则：
 
 | URL 部分 | 进 virtual path 的形式 |
 |---|---|
 | host | 作为第一级目录段（`pages/<host>/`） |
-| path | 按 `/` 切，**保留大小写**（FS 大小写敏感性差异要用 lowercase host 但 path 保留原样） |
-| query（非空） | 用 `__q=<sorted_kv>` 后缀挂在最后一段，参数值用 `=` 分隔，多个参数用 `&` 分隔 |
+| path | 按 `/` 切，保留大小写（host 用 lowercase，path 保留原样） |
+| query（非空） | 用 `__q=<sorted_kv>` 后缀挂在最后一段，多个参数用 `&` 分隔 |
 | 文件名末尾后缀 | 默认 `.md`（页面转 markdown 后） |
 
-**例子**：
+例子：
 
 | URL | virtual path |
 |---|---|
@@ -536,32 +536,32 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 | `https://docs.acme.com/Guide/Start#install` | `pages/docs.acme.com/Guide/Start.md`（fragment 丢掉） |
 | `https://docs.acme.com/Guide/Start?utm_source=x` | `pages/docs.acme.com/Guide/Start.md`（utm_ 丢掉） |
 
-**路径长度 / 特殊字符**：path 段超过 200 字节或含 FS 禁用字符（Windows 上的 `< > : " | ? *`）→ 截断 + 加 `__h=<sha1[:8]>` 后缀防碰撞。
+特殊情况：path 段超过 200 字节或含 FS 禁用字符（Windows 上的 `< > : " | ? *`）→ 截断 + 加 `__h=<sha1[:8]>` 后缀防碰撞。
 
-**保留原 URL** 在 `objects.extra_json.url` 里供 cat 渲染 / 给 agent 看，不要从 virtual path 反推。
+原 URL 保存在 `objects.extra_json.url` 里供 cat 渲染 / 给 agent 看，不要从 virtual path 反推。
 
 ## 11. 边界规则
 
-| 想做的事 | 该不该做 |
+| 想做的事 | 能做吗 |
 |---|---|
-| 给 `chunk_kind` 加一种新值 | ❌ 8 种已固定，要加走 framework RFC |
-| 给 `object_kind` 加新值 | ❌ 同上 |
-| 在 connector 里直接写 Milvus | ❌ 走 framework pipeline |
-| 在 connector 里直接调 OpenAI embedding | ❌ 同上 |
-| 在 connector 里读 `~/.mfs/cache/` | ❌ 走 framework storage adapter |
-| 用新的 URI scheme（如 `myco://`） | ✅ 注册即可 |
-| 让 cat 渲染特殊格式 | ✅ 在 `object_kind_of` 标个合适的 kind 用 framework 已有 handler |
-| 在 connector 里写 schedule cron | ❌ 用户写 connector TOML 的 `schedule` 字段，framework scheduler 调 |
-| 暴露不在 PROMPT.md 描述里的 path | ❌ 暴露 = 文档化 |
-| 自定义 `namespace_id` 行为 | ❌ namespace_id 由 framework 注入 |
-| 在 `self.state` 里存任意 schema | ✅ schema 由 connector 自己定义（cursor / manifest / etag map 等），framework 不 introspect |
-| 通过 `task_priority` 控制 object 索引顺序 | ✅ 可选；返回 int，越小越先；不写默认 FIFO |
+| 给 `chunk_kind` 加新值 | 不行，8 种固定，要加走 framework RFC |
+| 给 `object_kind` 加新值 | 不行，同上 |
+| 在 connector 里直接写 Milvus | 不行，走 framework pipeline |
+| 在 connector 里直接调 OpenAI embedding | 不行，同上 |
+| 在 connector 里读 `~/.mfs/cache/` | 不行，走 framework storage adapter |
+| 在 connector 里写 schedule cron | 不行，用户在 connector TOML 写 `schedule`，framework scheduler 调 |
+| 暴露不在 PROMPT.md 描述里的 path | 不行，暴露 = 文档化 |
+| 自定义 `namespace_id` 行为 | 不行，由 framework 注入 |
+| 用新的 URI scheme（如 `myco://`） | 可以，注册即可 |
+| 让 cat 渲染特殊格式 | 可以，在 `object_kind_of` 标合适的 kind 用 framework handler |
+| 在 `self.state` 里存任意 schema | 可以，由 connector 自己定义（cursor / manifest / etag map），framework 不 introspect |
+| 用 `task_priority` 控制 object 索引顺序 | 可以（可选），返回 int 越小越先，不写默认 FIFO |
 
 ## 12. 写 connector 前的设计检查
 
-写第一行代码前回答：
+写第一行代码前先回答：
 
-1. 你的 connector root 下要暴露哪些 object？写出来。
+1. connector root 下要暴露哪些 object？
 2. 每个 object 是什么 media_type、什么 object_kind？
 3. 列目录 / 读对象的成本如何？需要 cache 吗？
 4. 怎么判断对象变化？fingerprint 算什么？

@@ -1,12 +1,12 @@
 # Agent Skill 指南
 
-本文写给**给 LLM agent 集成 MFS 的人**（Skill 作者、agent framework 维护者、prompt 工程师）。教 agent 何时用哪个命令、怎么解读返回结果、如何避开常见坑。
+这一篇写给给 LLM agent 集成 MFS 的人（Skill 作者、agent framework 维护者、prompt 工程师）。讲 agent 何时用哪个命令、怎么解读返回结果、怎么避开常见坑。
 
-不是给 connector 贡献者看的（那个看 [07-contributing-connector.md](07-contributing-connector.md)），也不是给最终用户看的（看 README）。
+不是给 connector 贡献者看的（看 [07-contributing-connector.md](07-contributing-connector.md)），也不是给最终用户看的（看 README）。
 
 ## 1. Agent 的 MFS 心智模型
 
-让 agent 先建立这套心智，再讨论命令：
+让 agent 先建立这套心智再讨论命令：
 
 ```
 Agent 想找信息
@@ -20,12 +20,12 @@ Agent 想找信息
    └─ 不知道有什么   →  tree --peek 先扫一圈
 ```
 
-**核心规则**：
+四条核心规则：
 
-1. **看到 URI 不要瞎猜**——先 `mfs ls <uri>` 或 `mfs connector inspect <root>` 了解 connector 暴露什么对象。
-2. **结果是可继续操作的**——search/grep 返回的 `source` URI 直接喂给 cat / head / export。
-3. **大对象不要 cat**——`mfs cat <uri>` 对大对象会拒绝，要用 head/tail/range/export。
-4. **结构化对象不要用 `--peek/--skim/--deep`**——这些只对 document/code 形态有效，对 JSONL 报错。
+1. 看到 URI 不要瞎猜——先 `mfs ls <uri>` 或 `mfs connector inspect <root>` 了解 connector 暴露什么对象
+2. 结果是可继续操作的——search / grep 返回的 `source` URI 直接喂给 cat / head / export
+3. 大对象不要 cat——`mfs cat <uri>` 对大对象会拒绝，要用 head / tail / range / export
+4. 结构化对象不要用 `--peek / --skim / --deep`——这些只对 document / code 形态有效，对 JSONL 报错
 
 ## 2. 推荐工作流
 
@@ -86,7 +86,7 @@ watch -n 60 'mfs add s3://logs && mfs head -n 50 s3://logs/app/today.jsonl'
 
 ### `--json` envelope
 
-每个命令都有 `--json` 输出。agent 优先用 `--json` 而不是解析人类输出。统一结构：
+每个命令都支持 `--json`。agent 优先用 `--json` 而不是解析人类输出。统一结构：
 
 ```json
 {
@@ -143,18 +143,18 @@ mfs export <source> /tmp/data.jsonl
 jq 'select(.id == 12)' /tmp/data.jsonl
 ```
 
-## 4. 反模式：不要这样做
+## 4. 反模式
 
-| ❌ 反模式 | ✅ 推荐 |
+| 别这样 | 推荐 |
 |---|---|
 | `mfs cat <huge-rows.jsonl>`（不带 `--range`） | `mfs head -n 20` 或 `mfs cat --range 0:100` |
 | `mfs cat --peek <rows.jsonl>` | `mfs head -n 5 <rows.jsonl>` |
-| 拼构造 path 取单 record（如 `tickets/12.json`） | 用 search/grep 的结果 + `locator` |
+| 拼构造 path 取单 record（如 `tickets/12.json`） | 用 search / grep 的结果 + `locator` |
 | 用 pipe 传递 source 元信息 | 直接传 path 参数：`mfs search "..." <path>` |
 | `mfs add <uri>` 然后假设立刻 search 可用 | `mfs status <uri>` 看 sync 进度，等 search=available |
-| 在 remote profile 下用大目录 `mfs add ./repo`（会触发上传，可能很慢） | 先 `mfs add --register-only`（仅探测，不上传）看 dry-run，再决定 |
-| 用 `mfs cat` 看图片 | `mfs cat <img> --meta` 看 VLM description |
-| 在 `--all` 上跑没有 filter 的 query | 加 `--top-k` 限制 / 加 path 缩小范围 |
+| remote profile 下大目录 `mfs add ./repo`（会触发大量上传） | 先 `mfs connector probe ./repo` 看一眼，再决定 |
+| `mfs cat` 看图片 | `mfs cat <img> --meta` 看 VLM description |
+| `--all` 上跑没有 filter 的 query | 加 `--top-k` 限制 / 加 path 缩小范围 |
 
 ## 5. 错误码处理
 
@@ -175,7 +175,13 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 | `upload_bundle_too_large` | 单次 bundle 太大 | 加 ignore 规则缩小范围，或拆分目录 |
 | `field_missing` | text_fields 配的字段不存在 | 用户层配置问题；提示用户改 connector TOML |
 
-所有错误都有 `suggestions` 字段——优先按 suggestion 行动，不要试错。
+所有错误都有 `suggestions` 字段，优先按 suggestion 行动，不要试错。
+
+补充错误码：
+
+| code | 意思 | 怎么办 |
+|---|---|---|
+| `upload_not_applicable` | shared fs 场景下用了 `--force-upload` | 去掉 flag，shared fs 不存在上传 |
 
 ## 6. Skill 目录结构
 
@@ -185,10 +191,10 @@ MFS 发布一个 agent skill 包，结构如下：
 skills/mfs/
 ├── SKILL.md                      # 主体：心智模型 + 命令清单 + 工作流 + 反模式
 └── references/
-    ├── connectors/               # ⭐ 每个 connector 一份 PROMPT
-    │   ├── file.md               # ← 来自 connectors/file/PROMPT.md
-    │   ├── postgres.md           # ← 来自 connectors/postgres/PROMPT.md
-    │   ├── slack.md              # ← 来自 connectors/slack/PROMPT.md
+    ├── connectors/               # 每个 connector 一份 PROMPT
+    │   ├── file.md               # 来自 connectors/file/PROMPT.md
+    │   ├── postgres.md           # 来自 connectors/postgres/PROMPT.md
+    │   ├── slack.md              # 来自 connectors/slack/PROMPT.md
     │   ├── github.md
     │   ├── web.md
     │   └── ...                   # 所有已发布的 connector
@@ -197,19 +203,19 @@ skills/mfs/
     └── workflows.md              # 工作流示例库
 ```
 
-**`SKILL.md` 主体内容**：
+`SKILL.md` 主体内容：
 
-1. **MFS 是什么**（1 段）：file-like shell-native CLI，agent 直接用 shell 命令搜/读各种数据源
-2. **命令清单 + 用途**（一张表）：参考 [03-cli-commands.md](03-cli-commands.md)
-3. **推荐工作流**（本文 §2 那几个）
-4. **结果 envelope** + 怎么从结果回到对象（本文 §3）
-5. **反模式列表**（本文 §4）
-6. **错误码处理**（本文 §5）
-7. **指向 `references/connectors/<name>.md`**：agent 看到某 connector URI 就读对应的 reference 了解暴露的对象布局
+1. MFS 是什么（1 段）：file-like shell-native CLI，agent 直接用 shell 命令搜 / 读各种数据源
+2. 命令清单 + 用途（一张表）：参考 [03-cli-commands.md](03-cli-commands.md)
+3. 推荐工作流（本文 §2）
+4. 结果 envelope + 怎么从结果回到对象（本文 §3）
+5. 反模式列表（本文 §4）
+6. 错误码处理（本文 §5）
+7. 指向 `references/connectors/<name>.md`：agent 看到某 connector URI 就读对应的 reference 了解暴露的对象布局
 
 ### `mfs skill build` 自动收纳 connector PROMPT
 
-每个 connector 在自己目录里写 `PROMPT.md`（详见 [07-contributing-connector.md §5](07-contributing-connector.md#5-promptmd-范本)）。MFS 提供一个构建命令把这些 PROMPT 自动收纳到 skill 的 references 目录：
+每个 connector 在自己目录里写 `PROMPT.md`（详见 [07 §5](07-contributing-connector.md#5-promptmd-范本)）。MFS 提供一个构建命令把这些 PROMPT 自动收纳到 skill 的 references 目录：
 
 ```bash
 # CLI 内置子命令
@@ -234,7 +240,7 @@ mfs connector inspect <root> --json             # 看具体一个 connector 的 
 mfs stat <uri> --json                           # 看单个对象的 capabilities
 ```
 
-`connector inspect` 返回的 PROMPT 字段就是 connector 的 `PROMPT.md` 内容——跟 skill references 里的同一份内容，运行时拉取作为兜底。
+`connector inspect` 返回的 PROMPT 字段就是 connector 的 `PROMPT.md` 内容——跟 skill references 里同一份，运行时拉取作为兜底。
 
 ## 7. 让 agent 自己发现能力
 
@@ -243,7 +249,7 @@ agent 不要硬编码"什么 connector 支持什么操作"。运行时 query：
 ```bash
 mfs connector list --json
 mfs connector inspect <root> --json     # 拿到该 connector 的 PROMPT / capabilities / 暴露的对象
-mfs stat <uri> --json                   # 单个对象的 capabilities (cat / grep / tail / range)
+mfs stat <uri> --json                   # 单个对象的 capabilities（cat / grep / tail / range）
 ```
 
 `capabilities` 字段告诉 agent 这个对象能用什么命令：
@@ -256,9 +262,9 @@ mfs stat <uri> --json                   # 单个对象的 capabilities (cat / gr
 }
 ```
 
-agent 看到 `cat="denied_unless_range"` 就不要直接 cat，直接走 head 或 range。看到 `grep="pushdown"` 就用 `mfs grep` 让 server 下推 SQL/API。
+agent 看到 `cat="denied_unless_range"` 就不要直接 cat，走 head 或 range；看到 `grep="pushdown"` 就用 `mfs grep` 让 server 下推 SQL / API。
 
-这种动态发现让 agent **跟着新 connector 自动适应**——不用每加一个 source 就改 skill 文件。
+这种动态发现让 agent 跟着新 connector 自动适应，不用每加一个 source 就改 skill 文件。
 
 ## 8. 多步骤任务的中断与恢复
 
@@ -287,7 +293,7 @@ mfs search "..." postgres://prod
 
 ## 9. 给 connector 贡献者的提示
 
-如果你贡献了一个新 connector，别忘了在 connector 目录里写一份 `PROMPT.md`，agent skill 会读它生成上下文。详见 [07-contributing-connector.md §5](07-contributing-connector.md#5-promptmd-范本)。
+贡献新 connector 时别忘了在 connector 目录里写一份 `PROMPT.md`，agent skill 会读它生成上下文。详见 [07 §5](07-contributing-connector.md#5-promptmd-范本)。
 
 好的 `PROMPT.md` 让 agent 不需要试错就知道：
 

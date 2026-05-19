@@ -1,10 +1,10 @@
 # Search 与 Retrieval
 
-本文回答：Milvus collection schema 怎么设计，每个 connector 把什么内容写进 Milvus，用户怎么配字段，search 流程怎么走。
+这一篇讲 Milvus collection schema 长什么样、每个 connector 写什么进去、用户怎么配字段、search 流程怎么走。
 
 ## 1. Milvus collection schema
 
-**默认全 MFS 只有一张 Milvus collection**：`mfs_chunks`。所有 connector / 所有 object_kind / 所有 chunk_kind 共用。
+整个 MFS 默认只有一张 Milvus collection：`mfs_chunks`。所有 connector / 所有 object_kind / 所有 chunk_kind 共用。
 
 ```python
 collection_name = "mfs_chunks"
@@ -34,7 +34,7 @@ index_params = {
 
 ### Partition by connector_uri（用 `partition_key`，不是 named partition）
 
-`partition_key=connector_uri` 是 schema 阶段必须定死的字段。Milvus 按这个字段自动哈希分桶——**注意：不是 named partition**（`create_partition / drop_partition` 那一套）。两者差异和取舍详见 [02 §6.3](02-architecture.md#63-milvus)。
+`partition_key=connector_uri` 是 schema 阶段必须定死的字段。Milvus 按这个字段自动哈希分桶——不是 named partition（`create_partition / drop_partition` 那一套）。两者差异和取舍详见 [02 §10.3](02-architecture.md#103-milvus)。
 
 partition_key 带来的加速：
 
@@ -42,7 +42,7 @@ partition_key 带来的加速：
 |---|---|
 | `mfs search "..." postgres://prod` | filter 带 `connector_uri == X` → 只扫该 connector 命中的物理桶 |
 | `mfs search "..." --all` | 多桶并行扫，scatter-gather |
-| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 也按 partition_key 路由，只扫该桶。**不是 drop_partition**（那需要 named partition） |
+| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 也按 partition_key 路由，只扫该桶（不是 drop_partition，那需要 named partition） |
 | 大数据量切 collection 时迁移 | 按桶物理切到 `per_connector` collection 容易 |
 
 后改 partition key 需要数据迁移，所以一开始定下来。
@@ -51,11 +51,11 @@ partition_key 带来的加速：
 
 所有 chunk 写入时带上 `namespace_id`，所有查询自动 filter `namespace_id IN (current_request_namespaces)`。v0.4 server 只有一个 `default` namespace，所有 chunk 都写 `"default"`，client 不需要关心。
 
-**为什么 namespace_id 不是 partition_key**：Milvus 单 collection 只能有一个 partition_key 字段。connector_uri 那条已经用了。两个 namespace 注册同名 connector（如双方 alias 都叫 `prod`）→ 物理上同 partition 桶，但行各自带 `namespace_id` 标签 + chunk_id 已经 hash 了 namespace_id 保证主键不撞，查询时按 `namespace_id IN (...)` scalar filter 隔离。
+为什么 namespace_id 不是 partition_key：Milvus 单 collection 只能有一个 partition_key 字段，已经被 connector_uri 占了。两个 namespace 注册同名 connector（如双方 alias 都叫 `prod`）会落到同一物理桶，但每行带 `namespace_id` 标签 + chunk_id 已经 hash 了 namespace_id 保证主键不撞，查询按 `namespace_id IN (...)` scalar filter 隔离。
 
-强隔离需求（合规 / SaaS multi-tenant）走 `collection_strategy = per_namespace`（[02 §9.5](02-architecture.md#95-milvus-隔离策略)）。
+强隔离需求（合规 / SaaS multi-tenant）走 `collection_strategy = per_namespace`（[02 §9.4](02-architecture.md#94-milvus-隔离策略)）。
 
-Workspace / User 等组织概念**不进 Milvus schema**——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02-architecture.md §9](02-architecture.md#9-多租户与-namespace-设计)。
+Workspace / User 等组织概念不进 Milvus schema——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02 §9](02-architecture.md#9-多租户与-namespace)。
 
 ### 可选 collection 策略（server 端配置）
 
@@ -73,7 +73,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 
 | 字段 | 含义 |
 |---|---|
-| `chunk_id` | `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`；幂等写入。**namespace_id 必须进 hash**——否则两个 namespace 注册了同名外部数据源（如双方 alias 都叫 `prod`）会让 chunk_id 撞车互相覆盖 |
+| `chunk_id` | `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`，幂等写入。namespace_id 必须进 hash——否则两个 namespace 注册同名外部数据源会让 chunk_id 撞车 |
 | `namespace_id` | 物理分区主键；v0.4 恒为 `"default"`，多租户启用后由 server 注入 |
 | `connector_uri` | 包含该 chunk 的 connector root，如 `postgres://prod` |
 | `object_uri` | chunk 来自哪个 object，如 `postgres://prod/public/tickets/rows.jsonl` |
@@ -89,7 +89,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 
 ## 2. chunk_kind 枚举（framework 固定）
 
-固定 8 种，**connector 不能私加**：
+固定 8 种，connector 不能私加：
 
 | chunk_kind | 来源 | 例 |
 |---|---|---|
@@ -104,7 +104,7 @@ v0.4 默认 `single`。换策略时需要数据迁移工具（roadmap）。
 
 新增 chunk_kind 要走框架升级流程，不通过 connector TOML 加。
 
-search 默认全 kind 召回；filter 时用 `mfs search ... --kind body,summary` 限定。
+search 默认全 kind 召回，用 `mfs search ... --kind body,summary` 限定。
 
 ## 3. locator schema per connector
 
@@ -290,7 +290,7 @@ PRESETS = {
 }
 ```
 
-**Postgres / MySQL / MongoDB / 用户自定义 SaaS 对象没有 preset**——字段都是业务定义的，必须显式配。缺失时报错：
+Postgres / MySQL / MongoDB / 用户自定义 SaaS 对象没有 preset——字段都是业务定义的，必须显式配。缺失时报错：
 
 ```text
 Connector postgres://prod registered.
@@ -354,9 +354,9 @@ mfs search "..." <path> --top-k 10
 
 `mfs search --all` 或 `mfs search <path>` 跨多个 connector 时：
 
-- **每 partition 取 `top_k * over_fetch_ratio`**（默认 ratio=3），避免漏掉某个 partition 真正高分的结果
-- **RRF 融合分数跨 partition 可比**：因为 RRF 公式 `1/(k + rank)` 跟绝对相似度无关，只跟 partition 内的排名有关；两个 partition 都按各自的相似度 rank 算 RRF 分。理论上仍然有些 bias（小 partition 排名分布密），但实测对 hybrid 召回影响小。
-- **全局 merge**：拿到所有 partition 的 over-fetch 结果后，按 RRF score 排序，取全局 top_k 返回给用户。
+- 每 partition 取 `top_k * over_fetch_ratio`（默认 ratio=3），避免漏掉某个 partition 真正高分的结果
+- RRF 融合分数跨 partition 可比：RRF 公式 `1/(k + rank)` 跟绝对相似度无关，只看 partition 内的排名。理论上仍有些 bias（小 partition 排名分布密），但实测对 hybrid 召回影响小
+- 全局 merge：拿到所有 partition 的 over-fetch 结果后按 RRF score 排序，取全局 top_k 返回
 
 `over_fetch_ratio` 在 server.toml 配置：
 
@@ -366,7 +366,7 @@ over_fetch_ratio = 3              # 跨 partition 时每 partition 取 top_k * 3
 max_partitions_per_query = 32     # --all 时最多并行扫几个 partition
 ```
 
-如果 connector 多到几十几百，single query 跨全部 partition 会慢；这时建议用户加 `--connector-type` filter 限定（例如 `mfs search "..." --kind body --all --connector-type postgres,slack`）。
+如果 connector 多到几十几百，跨全部 partition 查会慢，建议用 `--connector-type` filter 限定（如 `mfs search "..." --all --connector-type postgres,slack`）。
 
 ### 模式
 
@@ -397,9 +397,9 @@ mfs search "session" ./src --top-k 5 --collapse object
 
 ## 8. Grep 流程
 
-详细派发见 [05-browse-and-read.md §6](05-browse-and-read.md#6-grep-的派发)。本节补充 Milvus 召回路径。
+详细派发见 [05 §6](05-browse-and-read.md#6-grep-的派发)。这一节补充 Milvus 召回路径。
 
-对**已建 chunk 索引**的 object，`grep --mode index` 可走 Milvus sparse_vec（BM25）路径：
+对已建 chunk 索引的 object，`grep --mode index` 可走 Milvus sparse_vec（BM25）路径：
 
 ```
 Milvus sparse search:
@@ -408,10 +408,10 @@ Milvus sparse search:
   返回带 chunk content 的 hits → 按行号在 chunk 内定位
 ```
 
-优势：跨大文件查关键词不用线性扫。
-缺点：召回 chunk 文本，不能保证精确字面匹配（BM25 是统计相关，不是 regex）。
+- 优势：跨大文件查关键词不用线性扫
+- 缺点：召回的是 chunk 文本，BM25 是统计相关不是 regex，不能保证精确字面匹配
 
-`grep` 默认是字面精确匹配（符合 unix 习惯）；只有 `--mode index` 才走 Milvus BM25。
+grep 默认是字面精确匹配（符合 unix 习惯），`--mode index` 才走 Milvus BM25。
 
 ## 9. 跨 connector search 示例
 
@@ -459,17 +459,17 @@ model    = "gpt-4o-mini"        # 必须是 vision 模型
 prompt   = "Describe this image..."
 ```
 
-切换 embedding model 会让所有 chunk 的 `embedding_fingerprint` 失效，触发 **DELETE + re-INSERT**（chunk 文本不变，只 embed 重算；Milvus 不支持列级 update，所以仍是整行替换）。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
+切换 embedding model 让所有 chunk 的 `embedding_fingerprint` 失效，触发 DELETE + re-INSERT（chunk 文本不变，只 embed 重算；Milvus 不支持列级 update 所以是整行替换）。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
 
-切换 summary / vlm 模型只影响对应 `chunk_kind` 的行（`summary` / `directory_summary` / `schema_summary` / `vlm_description`），其他 chunk 不动。通过 `chunk_kind` filter 做精准 DELETE。
+切换 summary / vlm 模型只影响对应 `chunk_kind` 的行（`summary` / `directory_summary` / `schema_summary` / `vlm_description`），其他 chunk 不动。
 
-完整的 per-artifact fingerprint 设计见 [04-connector-and-ingest.md §5.1](04-connector-and-ingest.md#51-per-artifact-fingerprint-chain).
+完整的 per-artifact fingerprint chain 设计见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)。
 
 ## 11. 大对象索引控制
 
 千万行的表如果默认 `chunk_strategy=per_row`，一次 `mfs add` 会写出千万 chunk + 调千万次 embedding。控制手段：
 
-### 11.1 `chunk_max` 硬上限（**framework 内置保守默认**）
+### 11.1 `chunk_max` 硬上限（framework 内置保守默认）
 
 framework 内置默认 `chunk_max = 1_000_000`（一百万 chunk / object），server.toml 可以全局覆盖，单个 `[[objects]]` 段可以再覆盖：
 
@@ -502,7 +502,7 @@ Add filter_expr or chunk_strategy to limit, or explicitly raise chunk_max:
   chunk_max = 20000000            # 显式承诺承担成本
 ```
 
-**为什么默认是 1M 而不是无穷**：embedding API 调用花钱 + Milvus 写入慢，默认要一道防线挡住"用户 `--yes` 跳过 estimate 直接跑 5000 万行表"的事故。1M 是一个保守值——大部分团队的 ticket / issue / message 量都在 100k 量级，安全余量；真有大需求要显式提一行配置，迫使用户做一次决定。
+为什么默认是 1M 而不是无穷：embedding API 调用花钱、Milvus 写入慢，默认需要一道防线挡住"用户 `--yes` 跳过 estimate 直接跑 5000 万行表"的事故。1M 是个保守值——大部分团队的 ticket / issue / message 量都在 100k 量级；真有大需求要显式提一行配置，迫使用户做一次决定。
 
 ### 11.2 windowed 策略
 
@@ -542,14 +542,14 @@ Continue? [y/N]
     mfs add postgres://prod --schema-only
 ```
 
-估算引擎流程：
+估算流程：
 
 1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
 2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
-3. 按抽样的 token/cost/duration 外推总成本
-4. 报告时明示"±50% 精度"，用户决定继续 / 限定范围 / 取消
+3. 按抽样的 token / cost / duration 外推总成本
+4. 报告明示 ±50% 精度，用户决定继续 / 限定范围 / 取消
 
-**不**承诺精确估算——embedding token 数依赖 tokenizer 和实际内容，事先精确算只能跑完才知道。文档默认表达"先打个底，actual cost 上线后看 `mfs status` 实测"。
+不承诺精确估算——embedding token 数依赖 tokenizer 和实际内容，事先精确算只能跑完才知道。文档默认表达"先打个底，实际成本上线后看 `mfs status`"。
 
 ## 12. 删除与一致性
 
