@@ -379,9 +379,22 @@ SQLite 路径建议 `concurrency = 1`，多 worker 在 SQLite 上互相 serializ
 
 ### 6.4 Batching
 
-两层 batching，互不影响：
+两层 batching，互不影响。
 
-**第一层：worker 一次拉 N 个 task**
+**第一层：每个外部 API 调用都有 client-side micro-batcher**（DataLoader 模式）
+
+embedding / summary / VLM / converter 这类外部 API 调用，client 包一层 micro-batcher——多个并发 await 自动合并成一次 API 调用，对调用方透明：
+
+```python
+class BatchingEmbeddingClient:
+    """攒到 max_batch 或超时就 flush，对 worker 透明。
+    embedding / summary / VLM / converter 各有一个独立实例，互不干扰。"""
+    async def embed(self, text: str) -> Vector: ...
+```
+
+这层是吞吐的关键——一次 API 调用做几十到几百个 chunks 远比逐个调省钱省时间。配合 worker 内的 `asyncio.gather`（下面）多个 task 并发调用 API，micro-batcher 自然把它们合并掉。Milvus 不需要 client batcher（worker 显式 batch 写入）。
+
+**第二层：worker 一次拉 N 个 task，并行处理**
 
 ```python
 async def worker_loop():
@@ -391,13 +404,12 @@ async def worker_loop():
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
             continue
 
-        all_chunks = []
-        for t in tasks:
-            chunks = await chunk_object(t)
-            all_chunks.extend(chunks)
+        # 并行跑 chunker（IO 并发 + Rust PyO3 模块释放 GIL，CPU bound 部分也能多核）
+        chunk_lists = await asyncio.gather(*[chunk_object(t) for t in tasks])
+        all_chunks = [c for lst in chunk_lists for c in lst]
 
-        # 一次 API 调用做几百 chunks 的 embedding
-        vecs = await embedding_client.batch_embed([c.content for c in all_chunks])
+        # embedding micro-batcher 会自动 batch；这里 await 一次拿到全部
+        vecs = await asyncio.gather(*[embedding_client.embed(c.content) for c in all_chunks])
         for c, v in zip(all_chunks, vecs):
             c.dense_vec = v
 
@@ -406,15 +418,7 @@ async def worker_loop():
         await db.mark_succeeded([t.id for t in tasks])
 ```
 
-**第二层：API client 内的 micro-batcher**（DataLoader 模式）
-
-```python
-class BatchingEmbeddingClient:
-    """攒到 max_batch 或超时就 flush，对 worker 透明。"""
-    async def embed(self, text: str) -> Vector: ...
-```
-
-embedding / summary / VLM 三类外部 API 都用这个模式。Milvus 不需要 client batcher（worker 显式 batch 写入）。
+`chunk_object(t)` 按 object_kind 分派到对应 processor（document → markdown chunker / pdf → converter → markdown chunker / image → VLM / table_rows → row text 拼接 / ...）。CPU 重的部分（AST 切分、JSONL 流处理、大目录 scan）走 server-rs 的 Rust PyO3 模块，调用时释放 GIL，所以 `asyncio.gather` 在多核上是真并行。
 
 ### 6.5 配置
 
@@ -438,11 +442,15 @@ batch_max_wait_ms = 500
 batch_size = 10
 batch_max_wait_ms = 500
 
+[converter]                       # PDF / DOCX 等可批量 converter，可选
+batch_size = 4
+batch_max_wait_ms = 200
+
 [milvus]
 insert_batch_size = 1000
 ```
 
-worker 自适应：根据上一轮平均 chunk 数动态调 `batch_size`，避免极大对象（单 task 出 10 万 chunks）和极小对象（单 task 1 chunk）的两种极端。
+worker 自适应：每跑完一批记一下"平均 chunks-per-task"，下一轮按"目标 chunks 总数 / 平均 chunks-per-task"调 `batch_size`，并加一道"单批 chunks 硬上限"防止抓到一个产 10 万 chunks 的大 task 卡住整批。这样既不让小 task（如 image 出 1 chunk）每批只攒到几个，也不让大 task（如 `rows.jsonl` 出几万 chunks）独占资源。
 
 ## 7. 一致性
 
