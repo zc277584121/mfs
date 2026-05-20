@@ -78,7 +78,17 @@ class ConnectorPlugin(ABC):
     CONFIG_SCHEMA: type[BaseModel]     # pydantic model 校验 TOML
 
     # ─────── 生命周期 ──────────────────────────────
-    def __init__(self, config: BaseModel, credential: Any) -> None: ...
+    def __init__(self, config: BaseModel, credential: Any, *, ctx: ConnectorContext):
+        """ctx 由 framework 注入，包含:
+        - state:           KV store，connector 自己定义 schema
+        - connector_id / namespace_id
+        - object_config_for(path) → ObjectConfig（从 [[objects]] TOML 段解析）
+        """
+        self.config = config
+        self.credential = credential
+        self.state = ctx.state           # 快捷别名
+        self.ctx = ctx
+
     async def connect(self) -> None: ...
     async def close(self) -> None: ...
     async def healthcheck(self) -> HealthStatus: ...
@@ -88,22 +98,46 @@ class ConnectorPlugin(ABC):
     async def stat(self, path: str) -> FileStat: ...
     @abstractmethod
     async def list(self, path: str) -> list[Entry]: ...
-    @abstractmethod
-    async def read(self, path: str, range: Range | None = None) -> bytes | AsyncIterator[bytes]: ...
 
-    # ─────── 必须实现：变化检测（abstract method）──────────────
+    # read 跟 read_records 二选一：
+    # - 纯字节 connector（file / s3 / web）只实现 read
+    # - 结构化 connector（postgres / saas）只实现 read_records，framework 自动 wrap 出 read
+
+    async def read(
+        self, path: str, range: Range | None = None
+    ) -> AsyncIterator[bytes]:
+        """字节流，给 cat/head/tail/grep/export 用。
+        如果只实现了 read_records，framework 自动按 jsonl 格式（每行一条 dict）
+        把 records 序列化成 bytes 兜底，connector 不用再写一遍。"""
+        # 默认实现：调 read_records 后 json.dumps + b"\n"
+        records = self.read_records(path, range)
+        if records is None:
+            raise NotImplementedError("either read or read_records must be implemented")
+        async for r in records:
+            yield (json.dumps(r, default=str) + "\n").encode()
+
+    async def read_records(
+        self, path: str, range: Range | None = None
+    ) -> AsyncIterator[dict] | None:
+        """结构化数据 yield record dict 流，chunker 直接按 chunk_strategy
+        （per_row / per_group）消费。纯字节 connector 不实现，返回 None。"""
+        return None
+
+    # ─────── 必须实现：变化检测 ───────────────────────
     @abstractmethod
     async def fingerprint(self, path: str) -> str | None:
         """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。
         framework 用这个跟自己存的对比，决定 cache / chunk / embedding 哪层失效。"""
 
     @abstractmethod
-    async def sync(self) -> AsyncIterator[ObjectChange]:
+    async def sync(self, opts: SyncOptions) -> AsyncIterator[ObjectChange]:
         """同步：流式 yield 每个变化的 object。
+        - opts.full=True：用户加了 --force-index，跳过 cursor 走全量
+        - opts.since: 用户传了 --since <date>，覆盖 state 里的 cursor
         cursor / manifest / etag / state schema 都在 connector 内部，
         通过 self.state（KV store）持久化，framework 不 introspect。"""
 
-    # ─────── 必须实现：路径分类（abstract method）──────────────
+    # ─────── 必须实现：路径分类 ──────────────────────
     @abstractmethod
     def object_kind_of(self, path: str) -> ObjectKind:
         """把虚拟 path 映射到 object_kind。
@@ -117,7 +151,8 @@ class ConnectorPlugin(ABC):
         self, pattern: str, path: str, options: GrepOptions
     ) -> AsyncIterator[GrepMatch] | None:
         """默认走 framework 线性扫；postgres/slack 等可重写做下推。
-        返回 None = 用 framework default。"""
+        返回 None = 用 framework default。
+        options.text_fields / metadata_fields 由 framework 从 ObjectConfig 注入。"""
         return None
 
     async def search(
@@ -205,21 +240,62 @@ class ObjectChange:
     # 不能识别的 connector 照旧 yield added + deleted，正确但更贵。
     # 详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)。
 
+@dataclass
+class SyncOptions:
+    full:  bool = False                 # 用户 --force-index → True
+    since: Optional[str] = None         # 用户 --since <date>，覆盖 state 里的 cursor
+
 # self.state：framework 注入的命名空间 KV store
 class StateStore(Protocol):
     async def get(self, key: str) -> Any | None: ...
     async def set(self, key: str, value: Any) -> None: ...
     async def delete(self, key: str) -> None: ...
+    async def checkpoint(self) -> None: ...    # 仅 cursor / monotonic-set state 安全调
     # value 可以是任意 JSON-serializable 结构（dict / list / str / number），
     # connector 自己定义 schema，framework 不 introspect。
 
+# self.ctx：framework 注入的运行时上下文
+@dataclass
+class ConnectorContext:
+    state:        StateStore
+    connector_id: str
+    namespace_id: str
+
+    def object_config_for(self, path: str) -> ObjectConfig:
+        """按 path 在 [[objects]] match glob 中找匹配项；
+        没匹配的用默认配置（按 object_kind 推断）。grep / chunker 用。"""
+
+@dataclass
+class ObjectConfig:
+    """从 connector TOML 的 [[objects]] 段解析而来。framework 注入。"""
+    text_fields:     list[str]
+    metadata_fields: list[str]
+    locator_fields:  list[str]
+    chunk_strategy:  str            # per_row / per_group / per_field_chunked
+    indexable:       bool = True
+    chunk_max:       int = 1_000_000
+    filter_expr:     Optional[str] = None
+    text_template:   Optional[str] = None
+    group_by:        Optional[str] = None
+    session_idle_min: Optional[int] = None
+
 @dataclass
 class GrepMatch:
-    path: str
-    line_no: int
-    line_content: str
-    context_before: list[str]
-    context_after: list[str]
+    path:           str
+    locator:        Optional[dict] = None      # 结构化 connector 用（postgres row 的 pk）
+    line_no:        Optional[int] = None       # 文本 connector 用
+    content:        str = ""                   # 匹配到的内容片段
+    context_before: list[str] = field(default_factory=list)
+    context_after:  list[str] = field(default_factory=list)
+
+@dataclass
+class GrepOptions:
+    pattern:          str
+    case_insensitive: bool = False
+    context_lines:    int = 0
+    # framework 从 ObjectConfig 注入：
+    text_fields:      list[str] = field(default_factory=list)
+    metadata_fields:  list[str] = field(default_factory=list)
 
 @dataclass
 class HealthStatus:
@@ -253,101 +329,346 @@ Hints:
 
 `{prefix}` 是占位符，运行时 framework 替换成具体 connector root URI。
 
-## 6. 最小可工作例子
+## 6. 两个真实例子
 
-`connectors/example/`：实现一个虚拟 connector `example://demo`，root 下有 `hello.txt` 和 `counters.jsonl`。
+两个简化版 connector 展示完整接口怎么用——一个结构化（Postgres），一个动态发现 path 的（Web crawl）。生产 connector 完整代码在 `connectors/<name>/`，这里展示骨架到能跑的程度。
 
-### plugin.py
+### 6.1 Postgres connector（结构化 connector 模板）
+
+**`connectors/postgres/layout.py`** — 把虚拟 path 翻译成结构化节点（每个 connector 必备的工具）：
 
 ```python
-from mfs_server.connectors.base import ConnectorPlugin, Capabilities, HealthStatus
-from .config import ExampleConfig
-from .layout import resolve, object_kind_of, list_root
-from .sync import fingerprint, change_set
+from enum import Enum
+from dataclasses import dataclass
 
-class ExamplePlugin(ConnectorPlugin):
-    NAME = "example"
-    URI_SCHEME = "example"
-    DISPLAY_NAME = "Example"
-    PROMPT = open(__file__.replace("plugin.py", "PROMPT.md")).read()
-    CONFIG_SCHEMA = ExampleConfig
-    CAPABILITIES = Capabilities(
-        grep_pushdown=False,
-        search_pushdown=False,
-        paged_cat=True,
-        acl=False,
-    )
+class PgKind(str, Enum):
+    ROOT          = "root"
+    DATABASE_JSON = "database_json"
+    SCHEMA_DIR    = "schema_dir"
+    TABLES_DIR    = "tables_dir"
+    TABLE_DIR     = "table_dir"
+    TABLE_SCHEMA  = "table_schema"
+    TABLE_ROWS    = "table_rows"
 
-    def __init__(self, config, credential):
-        self.config = config
-        self.credential = credential
+@dataclass
+class PgNode:
+    kind:   PgKind
+    schema: str | None = None
+    table:  str | None = None
 
-    async def connect(self): pass
-    async def close(self): pass
-    async def healthcheck(self):
-        return HealthStatus(ok=True, detail="example always ok", extra={})
-
-    async def stat(self, path):
-        return resolve(self.config, path).to_stat()
-
-    async def list(self, path):
-        return list_root(self.config, path)
-
-    async def read(self, path, range=None):
-        return resolve(self.config, path).read_bytes(range)
-
-    def object_kind_of(self, path):
-        return object_kind_of(path)
-
-    async def fingerprint(self, path):
-        return fingerprint(self.config, path)
-
-    async def sync(self):
-        last = await self.state.get("last_seen") or 0
-        for path, ts in scan(self.config, since=last):
-            yield ObjectChange(uri=path, kind="modified")
-        await self.state.set("last_seen", now())
+def resolve(path: str) -> PgNode:
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts: return PgNode(PgKind.ROOT)
+    if parts == ["database.json"]: return PgNode(PgKind.DATABASE_JSON)
+    if len(parts) == 1: return PgNode(PgKind.SCHEMA_DIR, schema=parts[0])
+    if len(parts) == 2 and parts[1] == "tables":
+        return PgNode(PgKind.TABLES_DIR, schema=parts[0])
+    if len(parts) == 3 and parts[1] == "tables":
+        return PgNode(PgKind.TABLE_DIR, schema=parts[0], table=parts[2])
+    if len(parts) == 4 and parts[1] == "tables":
+        if parts[3] == "schema.json":
+            return PgNode(PgKind.TABLE_SCHEMA, schema=parts[0], table=parts[2])
+        if parts[3] == "rows.jsonl":
+            return PgNode(PgKind.TABLE_ROWS, schema=parts[0], table=parts[2])
+    raise FileNotFoundError(path)
 ```
 
-### config.py
+**`connectors/postgres/config.py`**：
 
 ```python
 from pydantic import BaseModel
+from typing import List
 
-class ExampleConfig(BaseModel):
-    counter_start: int = 0
-    counter_count: int = 100
+class PostgresConfig(BaseModel):
+    schemas: List[str] = ["public"]
+    max_read_rows: int = 10000
 ```
 
-### TOML（用户写）
+**`connectors/postgres/plugin.py`**：
 
-```toml
-[connector]
-type = "example"
-root = "example://demo"
-label = "Example demo"
+```python
+import json, asyncpg
+from mfs_server.connectors.base import (
+    ConnectorPlugin, Capabilities, FileStat, Entry, ObjectChange,
+    HealthStatus, GrepMatch,
+)
+from .config import PostgresConfig
+from .layout import PgKind, resolve
 
-[example]
-counter_start = 0
-counter_count = 1000
+class PostgresPlugin(ConnectorPlugin):
+    NAME = "postgres"
+    URI_SCHEME = "postgres"
+    DISPLAY_NAME = "Postgres"
+    PROMPT = open(__file__.replace("plugin.py", "PROMPT.md")).read()
+    CONFIG_SCHEMA = PostgresConfig
+    CAPABILITIES = Capabilities(
+        cursor_kind="updated_at",
+        grep_pushdown=True,
+        paged_cat=True,
+    )
+
+    # __init__ 用基类默认实现（config, credential, ctx）
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(self.credential)
+
+    async def close(self):
+        await self.pool.close()
+
+    async def healthcheck(self):
+        try:
+            async with self.pool.acquire() as c:
+                await c.fetchval("SELECT 1")
+            return HealthStatus(ok=True, detail="", extra={})
+        except Exception as e:
+            return HealthStatus(ok=False, detail=str(e), extra={})
+
+    # ─── stat / list ───
+    async def stat(self, path):
+        node = resolve(path)
+        if node.kind in (PgKind.ROOT, PgKind.SCHEMA_DIR,
+                         PgKind.TABLES_DIR, PgKind.TABLE_DIR):
+            return FileStat(path=path, type="dir",
+                            media_type=None, size_hint=None,
+                            fingerprint=None, extra={})
+        if node.kind == PgKind.TABLE_SCHEMA:
+            fp = await self._schema_fp(node.schema, node.table)
+            return FileStat(path=path, type="file",
+                            media_type="application/json",
+                            size_hint=None, fingerprint=fp, extra={})
+        if node.kind == PgKind.TABLE_ROWS:
+            cnt, max_ts = await self._table_stats(node.schema, node.table)
+            return FileStat(path=path, type="file",
+                            media_type="application/x-ndjson",
+                            size_hint=cnt * 200,
+                            fingerprint=f"{max_ts}:{cnt}",
+                            extra={"row_count_hint": cnt, "lazy": True})
+
+    async def list(self, path):
+        node = resolve(path)
+        if node.kind == PgKind.ROOT:
+            return ([Entry("database.json", "file", "application/json", None, {})]
+                  + [Entry(s, "dir", None, None, {}) for s in self.config.schemas])
+        if node.kind == PgKind.SCHEMA_DIR:
+            return [Entry("tables", "dir", None, None, {}),
+                    Entry("views",  "dir", None, None, {})]
+        if node.kind == PgKind.TABLES_DIR:
+            tables = await self._list_tables(node.schema)
+            return [Entry(t, "dir", None, None, {}) for t in tables]
+        if node.kind == PgKind.TABLE_DIR:
+            return [Entry("schema.json", "file", "application/json", None, {}),
+                    Entry("rows.jsonl",  "file", "application/x-ndjson",
+                          None, {"lazy": True})]
+        raise NotADirectoryError(path)
+
+    # ─── read_records（chunker 直接用 dict 流；read 由基类自动 wrap） ───
+    async def read_records(self, path, range=None):
+        node = resolve(path)
+        if node.kind == PgKind.TABLE_SCHEMA:
+            yield await self._schema_json(node.schema, node.table)
+            return
+        if node.kind != PgKind.TABLE_ROWS:
+            return None
+        offset = range.start if range else 0
+        limit  = (range.end - range.start) if range else self.config.max_read_rows
+        async with self.pool.acquire() as c:
+            async for r in c.cursor(
+                f'SELECT * FROM "{node.schema}"."{node.table}" '
+                f'ORDER BY {self._pk_cols(node.table)} '
+                f'LIMIT {limit} OFFSET {offset}'
+            ):
+                yield dict(r)
+
+    # ─── fingerprint / sync ───
+    async def fingerprint(self, path):
+        return (await self.stat(path)).fingerprint
+
+    async def sync(self, opts):
+        cursors = {} if opts.full else (await self.state.get("cursors") or {})
+        if opts.since:
+            cursors = {k: opts.since for k in cursors}
+
+        for schema in self.config.schemas:
+            for table in await self._list_tables(schema):
+                yield ObjectChange(f"/{schema}/tables/{table}/schema.json", "modified")
+                rows_uri = f"/{schema}/tables/{table}/rows.jsonl"
+                last_ts = cursors.get(f"{schema}.{table}")
+                if opts.full or await self._has_changes(schema, table, last_ts):
+                    yield ObjectChange(rows_uri, "modified")
+                    cursors[f"{schema}.{table}"] = await self._max_updated_at(schema, table)
+                    await self.state.set("cursors", cursors)
+                    await self.state.checkpoint()    # cursor 型 state，安全
+
+    # ─── grep 下推 ───
+    async def grep(self, pattern, path, options):
+        node = resolve(path)
+        if node.kind != PgKind.TABLE_ROWS:
+            return None     # 用 framework 默认线性扫
+        text_fields = options.text_fields    # framework 从 ObjectConfig 注入
+        if not text_fields:
+            return None
+        where = " OR ".join(f'"{c}"::text ILIKE $1' for c in text_fields)
+        cfg = self.ctx.object_config_for(path)
+        pk_cols = cfg.locator_fields
+        async def gen():
+            async with self.pool.acquire() as c:
+                async for r in c.cursor(
+                    f'SELECT * FROM "{node.schema}"."{node.table}" '
+                    f'WHERE {where} LIMIT 1000', f"%{pattern}%"):
+                    yield GrepMatch(
+                        path=path,
+                        locator={c: r[c] for c in pk_cols},
+                        content=json.dumps(dict(r), default=str),
+                    )
+        return gen()
+
+    def object_kind_of(self, path):
+        return {
+            PgKind.DATABASE_JSON: "document",
+            PgKind.TABLE_SCHEMA:  "table_schema",
+            PgKind.TABLE_ROWS:    "table_rows",
+        }.get(resolve(path).kind, "directory")
+
+    # ─── helper（实际还有更多，省略）───
+    async def _list_tables(self, schema):
+        async with self.pool.acquire() as c:
+            return [r['table_name'] for r in await c.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = $1", schema)]
+    # _table_stats / _max_updated_at / _has_changes / _schema_fp /
+    # _schema_json / _pk_cols 略
 ```
 
-### 用户体验
+注意几个用到新接口的地方：
+
+- 没写 `__init__`，基类已经接 `ctx` 注入了 `self.state` / `self.ctx`
+- `sync(self, opts)` 用 `opts.full` / `opts.since` 而不是猜
+- `read_records` 直接 yield dict，**没写 `read`**——基类自动把 dict 序列化成 jsonl bytes 兜底
+- `grep` 拿 `options.text_fields`（framework 从 connector TOML 的 `[[objects]]` 解析后注入）
+- `GrepMatch` 用 `locator` 而不是不存在的"行号"
+- `self.state.checkpoint()` 是 cursor 型 state，安全调
+
+### 6.2 Web connector（动态发现 path tree）
+
+**`connectors/web/plugin.py`** 骨架：
+
+```python
+import aiohttp
+from html2text import HTML2Text
+from mfs_server.connectors.base import (
+    ConnectorPlugin, Capabilities, FileStat, Entry, ObjectChange,
+)
+
+class WebPlugin(ConnectorPlugin):
+    NAME = "web"
+    URI_SCHEME = "web"
+    PROMPT = open(__file__.replace("plugin.py", "PROMPT.md")).read()
+    CONFIG_SCHEMA = WebConfig
+    CAPABILITIES = Capabilities(grep_pushdown=False, paged_cat=False)
+
+    async def connect(self):
+        self.session = aiohttp.ClientSession()
+    async def close(self):
+        await self.session.close()
+
+    # ─── stat / list 都查 state 里的虚拟 tree ───
+    async def stat(self, path):
+        if path == "/" or self._is_intermediate_dir(path):
+            return FileStat(path=path, type="dir", media_type=None,
+                            size_hint=None, fingerprint=None, extra={})
+        pages = await self.state.get("pages") or {}     # {path: {etag, size, ...}}
+        if path in pages:
+            p = pages[path]
+            return FileStat(path=path, type="file",
+                            media_type="text/markdown",
+                            size_hint=p["size"], fingerprint=p["etag"],
+                            extra={"url": p["url"]})
+        raise FileNotFoundError(path)
+
+    async def list(self, path):
+        pages = await self.state.get("pages") or {}
+        # 列出 path 下一级的孩子（path tree 自维护）
+        children = self._children_of(pages, path)
+        return [Entry(name=c, type=t, media_type=mt, size_hint=None, extra={})
+                for c, t, mt in children]
+
+    # ─── 纯字节 read，不实现 read_records ───
+    async def read(self, path, range=None):
+        pages = await self.state.get("pages") or {}
+        md = pages[path].get("content_md")
+        if not md:
+            md = await self._fetch_and_convert(pages[path]["url"])
+        yield md.encode()
+
+    async def fingerprint(self, path):
+        pages = await self.state.get("pages") or {}
+        return pages.get(path, {}).get("etag")
+
+    # ─── sync：BFS crawl，state 里维护 visited set + pages map ───
+    async def sync(self, opts):
+        visited = set(await self.state.get("visited") or [])
+        pages = await self.state.get("pages") or {}
+        if opts.full:
+            visited.clear()
+            pages.clear()
+
+        queue = list(self.config.start_urls)
+        crawled = 0
+        while queue and crawled < self.config.max_pages:
+            url = queue.pop(0)
+            if url in visited or not self._allowed(url):
+                continue
+            visited.add(url)
+            etag_old = pages.get(self._url_to_path(url), {}).get("etag")
+            resp = await self._fetch(url, if_none_match=etag_old)
+            if resp.status == 304:
+                continue
+            if resp.status == 200:
+                path = self._url_to_path(url)        # URL canonicalization，详见 §10.7
+                md = self._html_to_md(resp.body)
+                pages[path] = {"url": url, "etag": resp.etag,
+                               "size": len(md), "content_md": md}
+                yield ObjectChange(path, "modified")
+                queue.extend(self._extract_links(resp.body, url))
+            crawled += 1
+            if crawled % 20 == 0:
+                # visited 集合 + pages map 是 "单调推进 set + 关联 map"，可 checkpoint
+                await self.state.set("visited", list(visited))
+                await self.state.set("pages", pages)
+                await self.state.checkpoint()
+
+        await self.state.set("visited", list(visited))
+        await self.state.set("pages", pages)
+
+    def object_kind_of(self, path):
+        return "document" if path.endswith(".md") else "directory"
+```
+
+注意：
+
+- **不实现 `read_records`**——web page 不是结构化数据，bytes 自然形态
+- **`list` 自维护 path tree**——枚举 state 里 `pages` map 的 path prefix。framework 不提供 path tree helper（每个动态 connector 自己几行实现），如果常见可以 v0.5+ 抽出 `VirtualPathTree` helper
+- **checkpoint 是合法的**——`visited` 集合单调推进，`pages` map 跟 visited 同步增长，下次接续会跳过 visited，BFS 续跑（详见 [04 §5.6.1](04-connector-and-ingest.md#561-哪些-state-能调-checkpoint)）
+
+### 6.3 用户体验
 
 ```bash
-mfs add example://demo --config .mfs/connectors/example-demo.toml
-mfs ls example://demo
-# file  hello.txt        text/plain          12 B
-# file  counters.jsonl   application/x-ndjson 21 KB    1000 records
-mfs cat example://demo/hello.txt
-# Hello, World!
-mfs head -n 3 example://demo/counters.jsonl
-# {"n": 0}
-# {"n": 1}
-# {"n": 2}
-mfs search "hello" example://demo
-# [1] example://demo/hello.txt  score=0.91
-#  1  Hello, World!
+# Postgres
+mfs add postgres://prod --config .mfs/connectors/prod.toml
+mfs ls postgres://prod/public/tickets
+# file  schema.json     application/json     2.1 KB
+# file  rows.jsonl      application/x-ndjson ~1.2 GB   ~12.4M rows (lazy)
+mfs grep "ERR_TOKEN" postgres://prod/public/tickets/rows.jsonl
+# 走 SQL ILIKE 下推，1 RPC 几秒返回
+
+# Web
+mfs add web://acme-docs --config .mfs/connectors/acme-docs.toml
+mfs tree web://acme-docs/pages -L 2
+# pages/
+# └── docs.acme.com/
+#     ├── Guide/
+#     ├── api/
+#     └── index.md
+mfs cat web://acme-docs/pages/docs.acme.com/Guide/Start.md
 ```
 
 ## 7. 注册 plugin
@@ -359,11 +680,12 @@ from .file import FilePlugin
 from .postgres import PostgresPlugin
 from .slack import SlackPlugin
 from .web import WebPlugin
-from .example import ExamplePlugin
+from .github import GitHubPlugin
+# ...
 
 REGISTRY = {
     cls.URI_SCHEME: cls
-    for cls in [FilePlugin, PostgresPlugin, SlackPlugin, WebPlugin, ExamplePlugin]
+    for cls in [FilePlugin, PostgresPlugin, SlackPlugin, WebPlugin, GitHubPlugin]
 }
 ```
 

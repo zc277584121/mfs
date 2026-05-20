@@ -558,7 +558,59 @@ Milvus DELETE WHERE namespace_id = X
 
 per_row 模式下用 locator 做 record-level 删除。per_group 模式（slack thread）只能用粗粒度（删整 group 重新写）。
 
-## 13. 搜索可用性 (search availability)
+## 13. 什么时候不进 Milvus
+
+不是所有 object 都需要走 chunk + embedding → Milvus 这条路。两种情况：
+
+### 13.1 默认就不索引的 object_kind
+
+[§6](#6-各-object_kind-的-chunk-来源) 列了哪些 object_kind 默认不进 Milvus：
+
+| object_kind | 默认行为 | 仍能做什么 |
+|---|---|---|
+| `text_blob` (json / csv / log 真实文件) | 不进 Milvus | `cat / head / tail / grep` 兜底（grep 走线性扫或 connector pushdown） |
+| `binary` | 不进 Milvus（metadata only） | `cat --meta` 看元数据，`cat --raw` 看原字节 |
+| `directory` | 不进 Milvus | `ls / tree` 看结构，开启 `directory_summary` chunk_kind 才进 Milvus |
+
+这些靠 `object_kind_of(path)` 判定，**不需要用户配置**。
+
+### 13.2 显式不索引：`indexable = false`
+
+某些 object 默认 object_kind 会进 Milvus，但业务上不想索引（敏感数据 / 量太大 / 没语义搜需求）——用 `indexable = false` 显式跳过：
+
+```toml
+[[objects]]
+match = "public.audit_*"
+indexable = false        # 整张表都不进 Milvus
+
+[[objects]]
+match = "internal.users"
+indexable = false        # 用户表 grep 找用户名足够，不需要语义搜
+```
+
+效果：
+
+- 不进 Milvus（零 embedding API 调用 + 零 Milvus storage）
+- 仍能 `cat / head / tail / grep`——grep 走 connector pushdown 或线性扫
+- 不能 `mfs search`——`mfs status` 显示该 object `not indexed (indexable=false)`
+
+### 13.3 典型场景
+
+| 场景 | 该用什么 |
+|---|---|
+| 巨量 audit log / event log | `indexable=false` 或 `chunk_strategy=sampled` |
+| 用户 / 用户名 / 邮箱列表 | `indexable=false`，靠 grep |
+| 二进制 / 媒体（不开 VLM 时） | 默认就不进，无需配 |
+| 数据敏感不想嵌入向量 | `indexable=false` |
+| 表太大、chunk_max 兜不住 | `indexable=false` 或加 `filter_expr` 缩范围 |
+
+`mfs ls --json` 的 `capabilities.indexable` 字段会暴露给 agent 看，避免 agent 试 search 无果。
+
+### 13.4 跟 search availability 的关系
+
+下面 §14（原 §13）`mfs status` 输出里的 `unavailable` 状态正是"无任何 chunks"的标识——包括"未配 text_fields"和"全部 indexable=false"两种成因。
+
+## 14. 搜索可用性 (search availability)
 
 `mfs status` 输出包含每个 connector 的 search 状态：
 
@@ -582,7 +634,7 @@ Index:
 Search: partial
 ```
 
-## 14. JSON envelope (search/grep)
+## 15. JSON envelope (search/grep)
 
 ```json
 {

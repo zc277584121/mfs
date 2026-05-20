@@ -194,7 +194,7 @@ framework 全局配置（chunk size、embedding model 等）放 server 端 `serv
 
 ```python
 class ConnectorPlugin:
-    async def sync(self) -> AsyncIterator[ObjectChange]:
+    async def sync(self, opts: SyncOptions) -> AsyncIterator[ObjectChange]:
         """流式 yield 每个变化的 object。cursor/manifest/etag/hash 怎么算、
         存哪、schema 长什么样，全在 connector 内部，framework 不 introspect。"""
 
@@ -208,9 +208,16 @@ class ObjectChange:
     uri:     str
     kind:    Literal["added", "modified", "deleted", "renamed"]
     old_uri: Optional[str] = None    # 仅 renamed：原 path / URI
+
+@dataclass
+class SyncOptions:
+    full:  bool = False              # 用户 --force-index 时为 True
+    since: Optional[str] = None      # 用户 --since <date>
 ```
 
 `renamed` 是个可选 kind——connector 能可靠识别"同内容换 path"时主动 yield，让 framework 跳过重 chunk / 重 embed，只改 Milvus 的 chunk_id 主键。其他 connector 不强制实现，照旧 yield `added` + `deleted` 也正确（只是更贵）。详见 [§5.7](#57-rename-detection)。
+
+`SyncOptions` 由 framework 注入。connector 用 `opts.full` 决定要不要走全量扫描而非游标增量，用 `opts.since` 覆盖 state 里的 cursor。不支持 `since` 的 connector 看到非 None 时报 `since_unsupported`。
 
 Connector 内部 state（cursor / manifest / etag 表）用 framework 提供的 KV store 持久化：
 
@@ -490,11 +497,20 @@ framework 拿到 checkpoint 调用 → 一个事务把 `connector_jobs.state_sna
 | state 形态 | 例 | 能调 | 理由 |
 |---|---|---|---|
 | 单调推进 cursor | postgres `max(updated_at)` / slack `{ch: max(ts)}` / gmail `historyId` / linear `updatedAt` / s3 `last_key` / mongodb `resume_token` | ✅ 推荐 | cursor 单调，半截 commit 后下次从该 cursor 接续，不丢数据 |
+| 单调推进的 set + 关联 map | web crawl `visited_urls` 集合 + `{url: etag}` map | ✅ 推荐 | visited 集合只增不减，是 cursor 等价物——下次接续会"跳过已 visited"，合法 |
 | paged token | gdrive `next_page_token` | 看 provider | gdrive token 长期有效 → OK；某些 provider token 短期失效 → 不推荐 |
 | commit hash 类（A→B） | github code `commit_sha` / git tag / bigquery snapshot_time | ❌ | 一次 sync 是"从 A 跳到 B"的原子转换，没有合法的"半 commit" |
-| 全量 map 快照 | file `{path: hash}` / web crawl `{url: etag}` | ❌ | 全量 map 半截不能宣称是某一时刻的真相 |
+| 快照型全量 map（要原子替换才合法） | file `{path: hash}`（必须反映"此刻整棵目录树"） | ❌ | 半截的 map 不能宣称是某一时刻的快照真相 |
 
-判断准则：你的 state 在 `checkpoint()` 那一瞬间，是不是一个**合法的"从此处接续"的起点**？是 → 可以调；不是 → 别调。
+判断准则：你的 state 在 `checkpoint()` 那一瞬间，是不是一个**合法的"从此处接续"的起点**？
+
+- 是 → 可以调（包括 cursor 类、单调推进 set + map）
+- 不是（"原子替换才合法"的全量快照 / 中间转换状态） → 别调
+
+举例对比：
+
+- **web crawl** 的 `visited_urls = {url_a, url_b, ...}` 是单调增长——commit 到这个 set 后崩了重启，下次跑会跳过已 visited，BFS 继续。合法 ✓
+- **file connector** 的 `manifest = {path: hash}` 是"对完整目录树的快照"——半截的 map 没法说"已扫的就是真相"，下次再 walk 时拿不出"deleted = manifest - current_paths"这个集合的正确答案。不合法 ✗
 
 #### 5.6.2 推荐用法
 
