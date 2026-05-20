@@ -424,9 +424,9 @@ $ mfs search "why did we change pricing limit" --all --top-k 5
 
 Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 connector 的结果，envelope 一样。
 
-## 10. Embedding & Summary providers
+## 10. Embedding / Summary / VLM / Converter providers
 
-framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
+四类外部加工工具走同一种插件化模型——都是 fingerprint chain 里"产出 cache 或 chunk"的可换组件。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
 
 ```toml
 [embedding]
@@ -445,13 +445,31 @@ min_size_kb = 8                 # auto 时阈值
 provider = "openai"
 model    = "gpt-4o-mini"        # 必须是 vision 模型
 prompt   = "Describe this image..."
+
+[converter]
+default = "pymupdf"             # pymupdf | docx2txt | llamaparse | marker | docling | mineru
+                                # 文档 → markdown 的解析器，按文件类型自动路由
+
+# 按 path glob 路由到特定 converter（可选）
+[[converter.routes]]
+match = "**/scanned/*.pdf"
+provider = "llamaparse"         # 扫描件 / 复杂表格 / 公式上 LLM-based 质量更好
+
+[[converter.routes]]
+match = "**/papers/*.pdf"
+provider = "marker"             # 学术 PDF
 ```
 
 切换 embedding model 让所有 chunk 的 `embedding_fingerprint` 失效，触发 DELETE + re-INSERT（chunk 文本不变，只 embed 重算；Milvus 不支持列级 update 所以是整行替换）。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
 
-切换 summary / vlm 模型只影响对应 `chunk_kind` 的行（`summary` / `directory_summary` / `schema_summary` / `vlm_description`），其他 chunk 不动。
+切换 summary / vlm / converter 模型只影响对应层 cache / chunk 的 fp：
 
-完整的 per-artifact fingerprint chain 设计见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)。
+- 换 summary / vlm → 只影响 `summary` / `directory_summary` / `schema_summary` / `vlm_description` 这几种 chunk_kind 的行，body chunk 不动
+- 换 converter → `cache_fp(converted_md)` 失效（公式含 `converter_name + converter_version`），重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
+
+这套是 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain) fingerprint chain 的直接应用——每层产物的 fp 公式都把所属 provider / model / version 揉进去，换工具自动失效对应层。
+
+**converter 路线图**：v0.4 内置 `pymupdf` + `docx2txt`，作为 plugin scheme 预留 `llamaparse / marker / docling / mineru` 等高质量 converter——它们对复杂表格、嵌入公式、扫描件的解析质量显著优于传统库，用户按文件类型路由即可。
 
 ## 11. 大对象索引控制
 
