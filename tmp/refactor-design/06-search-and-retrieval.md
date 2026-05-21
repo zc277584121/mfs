@@ -426,7 +426,7 @@ Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 co
 
 ## 10. Embedding / Summary / VLM / Converter providers
 
-四类外部加工工具走同一种插件化模型——都是 fingerprint chain 里"产出 cache 或 chunk"的可换组件。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
+四类外部加工工具走同一种插件化模型——都是 fingerprint chain 里"产出 artifact 或 chunk"的可换组件。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
 
 ```toml
 [embedding]
@@ -462,14 +462,49 @@ provider = "marker"             # 学术 PDF
 
 切换 embedding model 让所有 chunk 的 `embedding_fingerprint` 失效，触发 DELETE + re-INSERT（chunk 文本不变，只 embed 重算；Milvus 不支持列级 update 所以是整行替换）。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
 
-切换 summary / vlm / converter 模型只影响对应层 cache / chunk 的 fp：
+切换 summary / vlm / converter 模型只影响对应层 artifact / chunk 的 fp：
 
 - 换 summary / vlm → 只影响 `summary` / `directory_summary` / `schema_summary` / `vlm_description` 这几种 chunk_kind 的行，body chunk 不动
-- 换 converter → `cache_fp(converted_md)` 失效（公式含 `converter_name + converter_version`），重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
+- 换 converter → `artifact_fp(converted_md)` 失效（公式含 `converter_name + converter_version`），重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
 
 这套是 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain) fingerprint chain 的直接应用——每层产物的 fp 公式都把所属 provider / model / version 揉进去，换工具自动失效对应层。
 
 **converter 路线图**：v0.4 内置 `pymupdf` + `docx2txt`，作为 plugin scheme 预留 `llamaparse / marker / docling / mineru` 等高质量 converter——它们对复杂表格、嵌入公式、扫描件的解析质量显著优于传统库，用户按文件类型路由即可。
+
+### 10.1 Transformation cache：跨调用复用 API 结果
+
+embedding / vlm / summary 都是 **纯函数 + 贵**——同一段输入经过同一模型必然产出同一结果。framework 在这三类 client 外面包一层 **content-addressable transformation cache**，跨对象 / 跨连接器 / 跨 namespace 复用 API 结果。
+
+```
+worker → CachingEmbeddingClient.batch_embed(texts)
+            │
+            ├── cache.batch_get(keys)
+            │     hit → 复用 vector，零 API
+            │     miss ↓
+            ├── BatchingEmbeddingClient.embed_many(miss_texts)
+            │     → 真 API call
+            └── cache.enqueue_put(...)  (异步写回，不阻塞主流程)
+```
+
+命中场景：
+
+- 同一段 boilerplate / 文档段落 出现在多个文件 → 只 embed 一次
+- Slack 里有人贴了 GitHub issue 的内容 → 只 embed 一次
+- Milvus collection drop 重建 → cache 还在，零 API 重 embed
+- embedding model 回滚 v2 → v1 → cache 里 v1 vector 还在
+
+完整 schema / client 包装层 / 异步 writer / LRU eviction / observability 详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。
+
+**Converter（PDF→md / DOCX→md）v0.4 不进 transformation cache**——它的产物已经按 object_uri 进了 [artifact cache](#10.2)，跨 connector 同 PDF 的场景少，BLOB 大文件入 SQLite cache 收益不抵复杂度。v0.5+ 看实际情况再决定要不要补。
+
+**两层 cache 关系速查**：
+
+| 名字 | 寻址 | 谁用 | 文档 |
+|---|---|---|---|
+| **artifact cache** | `object_uri + artifact_kind` | `cat / head / chunker` 读派生产物 | [02 §10.2](02-architecture.md#102-object-store) / [05 §10](05-browse-and-read.md#10-artifact-cache-层细节) |
+| **transformation cache** | `sha1(input) + provider + model + version + config` | embedder / vlm / summary 跳过重复 API | [02 §10.4](02-architecture.md#104-transformation-cache计算缓存) |
+
+两层物理上分文件、职责完全独立，不会互相干扰。
 
 ## 11. 大对象索引控制
 
@@ -532,13 +567,12 @@ sample_rate = 0.01              # 1% 抽样
 
 ```text
 $ mfs add postgres://prod
-Probing connector and sampling 1% of objects...
+Probing connector and sampling records (local tokenizer only, no embedding API)...
 
-Estimated work (based on sample, ±50% accuracy):
+Estimated (±50% accuracy):
   scan:      12.4M rows across 38 tables
-  chunks:    ~14M
-  tokens:    ~2.4M  (use your provider's rate to compute cost)
-  storage:   ~3.2GB index + cache
+  chunks:    ~14M    (chunker dry-run on sample)
+  tokens:    ~2.4M   (apply your provider's per-token rate to estimate $)
 
 Continue? [y/N]
   Or limit scope:
@@ -549,11 +583,11 @@ Continue? [y/N]
 估算流程：
 
 1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
-2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
-3. 按抽样外推总 chunks / tokens / storage，明示 ±50% 精度
+2. 抽样小批量 record（默认 `min(1000, 1%)`）跑 **chunker + 本地 tokenizer**——chunker 确定性、tokenizer 本地，零外部成本，不调 embedding，不写 Milvus
+3. 按抽样外推总 chunks / tokens，明示 ±50% 精度
 4. 用户决定继续 / 限定范围 / 取消
 
-**只给物理量，不给钱和时间**：embedding provider 价格不同（OpenAI / Voyage / Cohere / 自部署 / 企业协议），时间受 worker 并发 / rate limit / 网络浮动 10x。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。实际进度上线后看 `mfs status`。
+**估算阶段零计费**：用户看到 prompt 时还没花一分钱。**只给物理量，不给钱、时间、storage**：embedding provider 价格不同（OpenAI / Voyage / Cohere / 自部署 / 企业协议），时间受 worker 并发 / rate limit / 网络浮动 10x，storage 强依赖 embedding dim。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。实际进度上线后看 `mfs status`。
 
 ## 12. 删除与一致性
 

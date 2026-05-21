@@ -23,7 +23,7 @@ Connector 暴露两类方法：
 
 只实现 6 个 abstract method 就能跑起来（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
 
-framework 不暴露更深的扩展点（自定义 chunker 内部、自定义 cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
+framework 不暴露更深的扩展点（自定义 chunker 内部、自定义 artifact cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
 
 ## 1. 你需要写什么（vs 不需要写什么）
 
@@ -39,7 +39,7 @@ framework 不暴露更深的扩展点（自定义 chunker 内部、自定义 cac
 | chunk 切分 / embedding / summary / VLM | | framework pipeline |
 | `cat / head / tail / grep / ls / tree` | | framework shell helpers |
 | Retrieval Index（Milvus） | | framework |
-| metadata DB / cache 存储 | | framework storage |
+| metadata DB / artifact cache 存储 | | framework storage |
 | HTTP API / SDK | | framework |
 | `mfs add / connector / status` | | framework engine |
 
@@ -127,7 +127,7 @@ class ConnectorPlugin(ABC):
     @abstractmethod
     async def fingerprint(self, path: str) -> str | None:
         """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。
-        framework 用这个跟自己存的对比，决定 cache / chunk / embedding 哪层失效。"""
+        framework 用这个跟自己存的对比，决定 artifact / chunk / embedding 哪层失效。"""
 
     @abstractmethod
     async def sync(self, opts: SyncOptions) -> AsyncIterator[ObjectChange]:
@@ -194,7 +194,15 @@ class Capabilities:
     watch: bool = False                 # 仅 file connector true
     cursor_kind: str | None = None      # "updated_at" / "snowflake" / "etag" / None
     full_scan: bool = True
-    delete_detection: bool = True
+
+    # deletion detection 模式（决定 framework 怎么走 deletion reconcile，详见 02 §7.4）
+    delete_detection: Literal[
+        'never',              # 源头不能识别 delete（如 slack message）→ 永远跳过 deletion
+        'explicit',           # 只在 yield "deleted" event 时删（最保守，默认）
+        'full_scan_diff',     # 每次 sync 都 full scan，framework 可推断 delete
+        'periodic_full_scan', # 部分 sync 是 full（connector 在 SyncOptions 里告诉 framework 本次是不是 full）
+        'state_change',       # 用 state 变化（closed/locked/archived）替代 delete
+    ] = 'explicit'
 
     # object access（声明 connector 是否重写了对应方法、有更高效的实现）
     grep_pushdown: bool = False          # 重写了 grep()，做 SQL ILIKE / provider search / S3 Select
@@ -881,7 +889,7 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 | 自定义 `namespace_id` 行为 | 不行，由 framework 注入 |
 | 用新的 URI scheme（如 `myco://`） | 可以，注册即可 |
 | 让 cat 渲染特殊格式 | 可以，在 `object_kind_of` 标合适的 kind 用 framework handler |
-| 在 `self.state` 里存任意 schema | 可以，由 connector 自己定义（cursor / manifest / etag map），framework 不 introspect |
+| 在 `self.state` 里存任意 schema | 可以，由 connector 自己定义（cursor / etag map / 任意小 JSON 状态），framework 不 introspect。**注意**：大规模 path/object 级别的全量映射不要塞 `self.state`——v0.4 用 `self.state` K/V 装这种数据会很重。file connector 就是因此走专属的 `file_state` 结构化表（详见 04 §5.5），是 framework 唯一的特例 |
 | 用 `task_priority` 控制 object 索引顺序 | 可以（可选），返回 int 越小越先，不写默认 FIFO |
 
 ## 12. 写 connector 前的设计检查
@@ -890,11 +898,12 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 
 1. connector root 下要暴露哪些 object？
 2. 每个 object 是什么 media_type、什么 object_kind？
-3. 列目录 / 读对象的成本如何？需要 cache 吗？
+3. 列目录 / 读对象的成本如何？需要 artifact cache 吗？
 4. 怎么判断对象变化？fingerprint 算什么？
 5. 哪些对象要索引（进 chunk）？text_fields 默认是什么？
 6. 能否下推 grep / search / tail？
-7. 凭据是什么？OAuth scope 要哪些？
-8. 用户必填配置最少是什么？
+7. **upstream 能不能识别 delete？属于 `delete_detection` 的哪一档**（`never` / `explicit` / `full_scan_diff` / `periodic_full_scan` / `state_change`）？详见 [02 §7.4](../02-architecture.md#74-deletion-策略)
+8. 凭据是什么？OAuth scope 要哪些？
+9. 用户必填配置最少是什么？
 
 回答完了再开始写。

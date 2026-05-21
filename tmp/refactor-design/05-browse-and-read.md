@@ -1,6 +1,6 @@
 # 浏览与读取
 
-这一篇讲 `ls / tree / cat / head / tail / grep` 这六个命令的后台行为：cache 怎么用、大对象怎么处理、密度视图什么时候生效。
+这一篇讲 `ls / tree / cat / head / tail / grep` 这六个命令的后台行为：artifact cache 怎么用、大对象怎么处理、密度视图什么时候生效。
 
 ## 1. ls 与 tree 的后台行为
 
@@ -180,23 +180,23 @@ try:
 ```
 mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100
   │
-  ├─ 1. 查 metadata DB：该 object 是否有 cache？
+  ├─ 1. 查 metadata DB：该 object 是否有 artifact cache？
   │
-  ├─ 2a. 有 cache && fresh（fingerprint 一致）：
-  │       从 object store 读 cache bytes（按 range 切片）→ 流回 client
+  ├─ 2a. 有 artifact && fresh（fingerprint 一致）：
+  │       从 object store 读 artifact bytes（按 range 切片）→ 流回 client
   │
-  ├─ 2b. 有 cache && stale：
-  │       异步触发 cache rebuild
-  │       本次仍用 stale cache（附 `(stale)` 提示）
+  ├─ 2b. 有 artifact && stale：
+  │       异步触发 artifact rebuild
+  │       本次仍用 stale artifact（附 `(stale)` 提示）
   │
-  ├─ 2c. 无 cache：
+  ├─ 2c. 无 artifact：
   │       connector.read(path, range) → 流回 client
-  │       同时写 cache（如该 object 的 cache_kind 配置允许）
+  │       同时写 artifact_cache（如该 object 的 artifact_kind 配置允许）
   │
   └─ 3. 按 media_type 渲染输出
 ```
 
-cache 不是必须——有些对象（小文件、纯文本）不值得 cache，每次现拉即可。每类 connector 在 `objects` 表里标记每个对象是否要 cache。
+artifact cache 不是必须——有些对象（小文件、纯文本）不值得 cache，每次现拉即可。每类 connector 在 `objects` 表里标记每个对象是否要 cache。
 
 ## 6. grep 的派发
 
@@ -212,8 +212,8 @@ mfs grep "ERR_TIMEOUT" <path>
   ├─ 2b. object 在 Milvus 里（chunks 已建索引）且 --mode index：
   │       Milvus sparse_vec BM25 召回 → 返回带行号的 chunk
   │
-  ├─ 2c. object 在 cache 里：
-  │       线性扫 cache 字节
+  ├─ 2c. object 在 artifact cache 里：
+  │       线性扫 artifact 字节
   │
   └─ 2d. 否则：
         connector.read() 流式扫描 + 限速
@@ -245,9 +245,9 @@ cat 按 media_type 决定渲染方式：
 | `application/json` | pretty print（缩进 2 空格） |
 | `application/x-ndjson` | 原文（每行一个 JSON） |
 | `text/csv` | 表格对齐渲染；`--raw` 出原 CSV |
-| `application/pdf` | converted markdown（从 cache 取） |
+| `application/pdf` | converted markdown（从 artifact cache 取） |
 | `application/vnd.openxmlformats-...` (docx) | converted markdown |
-| `image/*` | 提示 `<binary image, 1.2MB>` + cache 中的 VLM description；`--raw` 输出 bytes |
+| `image/*` | 提示 `<binary image, 1.2MB>` + artifact 里的 VLM description；`--raw` 输出 bytes |
 | 其他 binary | 提示 `<binary, X bytes>`；`--raw` 输出 bytes |
 
 `--raw` 强制原始字节。`--meta` 输出 metadata + 缩略 preview。`--json` 走 envelope。
@@ -266,7 +266,7 @@ cat 按 media_type 决定渲染方式：
 
 - `--peek`: metadata DB（无需 Milvus）
 - `--skim`: Milvus 查该 path 下的 `directory_summary` / `summary` / `vlm_description` chunk，没有则降级到 `--peek`
-- `--deep`: Milvus + 取 cache head
+- `--deep`: Milvus + 取 artifact cache head
 
 对结构化对象（rows.jsonl / messages.jsonl / records.jsonl / schema.json / sample / page_cache）传 `--peek / --skim / --deep` 直接报错：
 
@@ -296,26 +296,28 @@ watch -n 30 'mfs add slack://eng && mfs head -n 50 slack://eng/...'
 
 视用户呼声决定是否 v0.5+ 引入，届时优先支持 file connector 和 slack / discord 这种自带 push 的源。
 
-## 10. Cache 层细节
+## 10. Artifact cache 层细节
 
-### 10.1 `caches` 表 schema
+> 名词约定：MFS 内部有两层 cache，**职责完全独立**——这里讲的 **artifact cache** 是按 object_uri 寻址的派生产物缓存（converted markdown / VLM 描述 / page cache 等），给 `cat / head / chunker` 用。另一层 **transformation cache** 是按 content_hash 寻址的计算缓存，给 embedder / vlm / summary client 跳过重复 API 调用用，物理上独立 SQLite 文件，详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。
+
+### 10.1 `artifact_cache` 表 schema
 
 ```sql
-caches (
+artifact_cache (
   namespace_id     TEXT DEFAULT 'default',   -- 进主键，避免跨 namespace 同名 object_uri 撞车
   object_uri       TEXT,
-  cache_kind       TEXT,            -- "converted_md" | "page_cache" | "head_cache" | "vlm_text" | "schema_dump"
-  storage_path     TEXT,            -- ~/.mfs/cache/caches/<namespace_id>/<sha1(object_uri)>/<cache_kind>
+  artifact_kind    TEXT,            -- "converted_md" | "page_cache" | "head_cache" | "vlm_text" | "schema_dump"
+  storage_path     TEXT,            -- ~/.mfs/cache/artifacts/<namespace_id>/<sha1(object_uri)>/<artifact_kind>
   fingerprint      TEXT,            -- 同上游 fingerprint，用于 stale check
   size_bytes       INTEGER,
   built_at         TIMESTAMP,
-  PRIMARY KEY (namespace_id, object_uri, cache_kind)
+  PRIMARY KEY (namespace_id, object_uri, artifact_kind)
 )
 ```
 
-### 10.2 几种 cache 类型
+### 10.2 几种 artifact 类型
 
-| cache_kind | 来源 | 谁用 |
+| artifact_kind | 来源 | 谁用 |
 |---|---|---|
 | `converted_md` | PDF / DOCX / gdoc / HTML 转 markdown | `cat` 直接出 / chunker 输入 |
 | `page_cache` | DB rows / Slack messages / S3 list | `cat / head / tail / grep` |
@@ -323,24 +325,24 @@ caches (
 | `vlm_text` | 图片的 VLM description | `cat --meta` / `cat --skim` |
 | `schema_dump` | DB schema / Mongo sample-inferred schema | `cat schema.json` |
 
-### 10.3 何时 cache、何时不 cache
+### 10.3 何时建 artifact、何时不建
 
 **核心原则：大集合（`rows.jsonl` / `messages.jsonl` 等虚拟集合对象）不全量物化。** 它们在外部数据源里不真的以文件形态存在——是 MFS 为了让用户能 `cat / head / grep` 而呈现的虚拟接口。MFS 不会把 12M 行的 postgres 表全量 dump 成本地 jsonl（也没人真的会去 cat 12M 行），保持 lazy + 选择性 head_cache 就够。
 
 每个 connector plugin 自己决定细节，一般规则：
 
-- 真实文件（本地文件、GitHub blob、S3 object）→ 不 cache，每次 connector.read() 直接拉（要么 fast，要么需要凭据隔离）
-- 小元数据（schema.json、users.jsonl 这种几 KB）→ cache，访问频繁
+- 真实文件（本地文件、GitHub blob、S3 object）→ 不建 artifact，每次 connector.read() 直接拉（要么 fast，要么需要凭据隔离）
+- 小元数据（schema.json、users.jsonl 这种几 KB）→ 建 artifact，访问频繁
 - 大集合（rows.jsonl / messages.jsonl）→ **不全量物化**。`cat --range A:B` 直接走 connector pushdown（如 SQL `OFFSET LIMIT`）；可选 head_cache 缓存前 N 条加速 `mfs head`
-- 图片 VLM → cache description 文本，不 cache 图片本身
-- PDF / DOCX / HTML 转 markdown → cache markdown（converter 贵），原文件还在 source
+- 图片 VLM → 建 description 文本 artifact，不存图片本身
+- PDF / DOCX / HTML 转 markdown → 建 markdown artifact（converter 贵），原文件还在 source
 
-### 10.4 cache 淘汰
+### 10.4 artifact_cache 淘汰
 
 server 端 `server.toml`：
 
 ```toml
-[cache]
+[artifact_cache]
 max_size_gb = 10
 eviction = "lru"
 ```

@@ -20,7 +20,7 @@ Cache      ─ 一个 object 的本地缓存字节（可选，让 cat/head/tail 
 Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
 ```
 
-整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 cache 和 chunks。
+整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 artifact cache（PDF→md / 图片→VLM 描述 等派生产物）和 chunks。
 
 **本地文件也是一种 connector**：scheme 是 `file`，用户写普通 path 即可。`postgres connector` / `slack connector` / `file connector` 在概念上一视同仁——同样的 list / stat / read / fingerprint 契约，同样的 chunk pipeline，同样的搜索能力。
 
@@ -46,7 +46,7 @@ Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
             │   ┌──────────┐  ┌──────────┐  ┌──────────┐ │
             │   │ Metadata │  │  Object  │  │  Milvus  │ │
             │   │   DB     │  │  store   │  │ 一张表   │ │
-            │   │          │  │ (cache)  │  │          │ │
+            │   │          │  │(artifact)│  │          │ │
             │   └──────────┘  └──────────┘  └──────────┘ │
             └─────────────────────────────────────────────┘
 ```
@@ -56,7 +56,7 @@ Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
 | 存什么 | 存在哪 | 目的 |
 |---|---|---|
 | Connector / Object / Cache / Job 关系 + 状态 | Metadata DB（SQLite 或 Postgres） | path index、状态、变化检测 |
-| Cache 字节（converted markdown / page cache / VLM description） | Object store（本地 fs / S3 / R2 / MinIO） | 让 `cat / head / tail` 不打回 connector |
+| Artifact cache 字节（converted markdown / page cache / VLM description） | Object store（本地 fs / S3 / R2 / MinIO） | 让 `cat / head / tail` 不打回 connector |
 | 可检索的 chunk | Milvus 一张 collection | search / grep 召回 |
 
 具体后端由 server 配置决定，跟 client 端 profile 无关。
@@ -106,7 +106,9 @@ mfs job list/inspect/cancel
 | 分页用 `--range A:B`，不需要 cursor token | [05 §4](05-browse-and-read.md#4-分页与大对象) |
 | Milvus 一张 collection，partition_key 按 connector_uri | [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema) |
 | 检索字段配置：text_fields / metadata_fields / locator_fields + chunk_strategy | [06 §4](06-search-and-retrieval.md#4-字段配置) |
-| Fingerprint chain：upstream → cache → chunk → embedding，分层失效 | [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain) |
+| Fingerprint chain：upstream → artifact → chunk → embedding，分层失效 | [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain) |
+| 两层 cache：artifact cache（per object_uri）+ transformation cache（per content_hash + model），跨对象复用 embedding/VLM/summary 调用 | [02 §10.4](02-architecture.md#104-transformation-cache计算缓存) |
+| Deletion：incremental 不删 / full scan 全集 diff 推断；抖动靠 retry + 枚举契约挡，不设阈值 | [02 §7.4](02-architecture.md#74-deletion-策略) |
 | HTTP 只走 control plane；client 上传只在 remote profile + 本地路径时发生 | [02 §4](02-architecture.md#4-控制面-vs-数据面) |
 | 社区贡献新 connector ~500-1500 行 Python，集中在 `connectors/<name>/` | [07](07-contributing-connector.md) |
 
@@ -120,7 +122,7 @@ mfs job list/inspect/cancel
 | 02 | [02-architecture.md](02-architecture.md) | client/server、profile、存储、队列、一致性、并发、多租户 | 所有人，运维和贡献者重点看 |
 | 03 | [03-cli-commands.md](03-cli-commands.md) | 16 个公开命令、行为契约、JSON envelope、错误码 | 用户、agent 集成方 |
 | 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、ingest 流程、fingerprint chain、checkpoint | 用户、贡献者 |
-| 05 | [05-browse-and-read.md](05-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、cache、大对象 | 用户、agent skill 作者 |
+| 05 | [05-browse-and-read.md](05-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、artifact cache、大对象 | 用户、agent skill 作者 |
 | 06 | [06-search-and-retrieval.md](06-search-and-retrieval.md) | Milvus schema、chunk_kind、locator、字段配置、preset | 用户（高级配置）、贡献者 |
 | 07 | [07-contributing-connector.md](07-contributing-connector.md) | 插件接口、骨架、对象命名规范 | 贡献者 |
 | 08 | [08-agent-skill.md](08-agent-skill.md) | 给 LLM agent skill 作者的指南 | Skill 作者、prompt 工程师 |
@@ -141,6 +143,6 @@ MFS 跟 Mirage 的核心区别：
 |---|---|---|
 | 协议 | FUSE mount + VFP | HTTP /v1，不挂载 |
 | 检索 | 不做 | 混合检索（向量 + BM25） |
-| 索引产物 | 仅 TTL cache | 持久化 cache + Milvus chunks |
+| 索引产物 | 仅 TTL cache | 持久化 artifact cache + Milvus chunks |
 | LLM/VLM 增强 | 不做 | summary、VLM description |
 | 目标用户 | 想把数据源当文件系统的 agent | 想用 shell 命令做语义搜索的 agent |

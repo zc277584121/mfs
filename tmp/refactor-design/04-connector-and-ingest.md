@@ -64,7 +64,7 @@ mfs add <target>
        捕获 framework 配置变化（换 embedding 模型等）
   │
   ⑥ Worker 跑 build task
-       cache → chunk → embed → 写 Milvus
+       artifact → chunk → embed → 写 Milvus
        chunker 按 object_kind 分派：
          document → markdown chunker
          code → AST chunker
@@ -72,9 +72,14 @@ mfs add <target>
          message_stream → thread aggregator
          record_collection → per-record chunker
          image → VLM description
+       embed/vlm/summary 都走 CachingXxxClient → transformation cache (02 §10.4)
+       命中 → 零 API；miss → 真 API + 异步写回 cache
   │
-  ⑦ 删除消失的对象
-       Milvus DELETE WHERE connector_uri = X AND object_uri NOT IN (current_set)
+  ⑦ Deletion reconcile（详见 [02 §7.4](02-architecture.md#74-deletion-策略)）
+       incremental sync → 跳过（cursor 只 yield 变化，推不出删除）
+       full scan sync   → 全集 diff，to_delete = (objects ∩ Milvus) - 本次全集，DELETE
+       explicit "deleted" event → 任何模式都直接删
+       （枚举不完整时 connector 必须 raise → sync 失败 → 不删，详见 §7.4.3 契约）
   │
   ⑧ commit connector state + 更新 job 状态
 ```
@@ -83,8 +88,8 @@ mfs add <target>
 
 | 部署 | queue 位置 | worker |
 |---|---|---|
-| 本机 server | server 内 SQLite queue | server 内 worker pool（建议 concurrency=1） |
-| 远端 server | Postgres queue（同 metadata DB） | `mfs-worker` 进程 |
+| 本机 server | server 内 SQLite queue | server 内 worker pool（默认自适应：SQLite 强制 concurrency=1） |
+| 远端 server | Postgres queue（同 metadata DB） | `mfs-worker` 进程（默认自适应：Postgres 默认 concurrency=4） |
 
 HTTP 主要走 control plane，唯一例外是 remote profile 下本地文件 upload（详见 [02 §4](02-architecture.md#4-控制面-vs-数据面)）。
 
@@ -94,21 +99,22 @@ HTTP 主要走 control plane，唯一例外是 remote profile 下本地文件 up
 $ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
-Estimated work (based on 1% probe sample, ±50% accuracy):
-  chunks:    ~14M
-  tokens:    ~2.4M (use your provider's rate to compute cost)
-  storage:   ~3.2GB index + cache
+Estimated (local chunker + tokenizer only — no embedding API calls):
+  chunks:    ~14M    (chunker dry-run on a sample of up to 1000 records)
+  tokens:    ~2.4M   (apply your provider's per-token rate to estimate $)
 
 Continue? [y/N]
 ```
 
 估算流程：
 
-1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容）
-2. 抽样 1% 对象跑完整 chunk + embed（真实测一段）
-3. 按抽样外推总 chunks / tokens / storage，明示 ±50% 精度
+1. 探测 connector 暴露的对象总数和 size_hint（不读对象内容，只走 metadata 类 API：`SELECT count(*)` / `list objects` 等）
+2. 抽样小批量 record（默认 min(1000, 1%)）跑 **chunker + 本地 tokenizer**：
+   - chunker 是确定性算法、tokenizer 是本地库，零外部成本
+   - 不调 embedding API，不写 Milvus
+3. 按抽样外推总 chunks / tokens，明示 ±50% 精度
 
-**只给物理量，不给钱和时间**——钱因 embedding provider 而异（OpenAI / Voyage / Cohere / 自部署 / 企业协议价都不同），时间受并发 / rate limit / 网络浮动 10x，硬给反而误导。token 数靠抽样 tokenizer 算出来，是个可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。
+**估算阶段零计费**——这是个硬约束：用户敲 `mfs add` 看到 prompt 时，不能已经把钱花了。**只给物理量，不给钱和时间**——钱因 embedding provider 而异（OpenAI / Voyage / Cohere / 自部署 / 企业协议价都不同），时间受并发 / rate limit / 网络浮动 10x，硬给反而误导。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。**storage 不估**（≈ chunks × dim × 4byte，跟选哪个 embedding model 强相关，误差比 chunks/tokens 还大）。
 
 `--yes` 或本地路径直接开始：
 
@@ -200,7 +206,7 @@ class ConnectorPlugin:
 
     async def fingerprint(self, path: str) -> str | None:
         """返回 path 的当前 upstream fingerprint。framework 用这个跟自己
-        存的对比，决定 cache / chunk / embedding 失效。"""
+        存的对比，决定 artifact / chunk / embedding 失效。"""
 
 
 @dataclass
@@ -230,7 +236,7 @@ async def sync(self):
     await self.state.set("last_ts", new_ts)
 ```
 
-framework 不看 `self.state` 里存的是什么——postgres 存 `updated_at`、slack 存 ts、s3 存 page token、file 存 manifest map、github 存 `commit_sha`，schema 各不相同。
+framework 不看 `self.state` 里存的是什么——postgres 存 `updated_at`、slack 存 ts、s3 存 page token、github 存 `commit_sha`，schema 各不相同。**file connector 是特例**：它的 path manifest 走专属的 `file_state` 表而不是 `self.state` K/V（详见 §5.5），但其他状态（如 `platform_id`）仍然存 `self.state`。
 
 ### 5.2 Fingerprint chain
 
@@ -243,10 +249,10 @@ framework 拿到 upstream fingerprint 后，自己组合 chunker / embedding mod
 ```python
 @dataclass
 class ArtifactSpec:
-    kind:          str           # "cache.converted_md" / "chunk.body" / "embedding"
+    kind:          str           # "artifact.converted_md" / "chunk.body" / "embedding"
     depends_on:    list[str]     # 上游产物 kind（"upstream" 是特殊源）
     config_inputs: list[str]     # 影响 fp 的 framework 配置 key
-    storage:       Literal["cache_table", "milvus_field", "milvus_row"]
+    storage:       Literal["artifact_cache_table", "milvus_field", "milvus_row"]
 ```
 
 framework 把这些声明组装成 DAG，每条边代表"我依赖什么"。各 object_kind 的链路：
@@ -258,11 +264,11 @@ document (md/code/text)
                               ↑ [embedding_model, embedding_version]
 
 document (pdf/docx/gdoc)
-    upstream → cache.converted_md → chunk.body → embedding
+    upstream → artifact.converted_md → chunk.body → embedding
                 ↑ [converter_name, converter_version]
 
 image
-    upstream → cache.vlm_text → chunk.vlm_description → embedding
+    upstream → artifact.vlm_text → chunk.vlm_description → embedding
                 ↑ [vlm_model, vlm_prompt, vlm_provider]
 
 table_rows (postgres rows.jsonl)
@@ -298,24 +304,24 @@ def compute_artifact_fp(spec: ArtifactSpec, upstream_fps: dict, config: dict) ->
 各层公式（按 storage 字段对应到存哪里）：
 
 ```
-upstream_fp                = connector.fingerprint(path)          ← objects.fingerprint
+upstream_fp                  = connector.fingerprint(path)          ← objects.fingerprint
 
-cache_fp(converted_md)     = sha1( upstream + converter_name + converter_version )
-cache_fp(vlm_text)         = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
-cache_fp(page_cache)       = sha1( upstream )
-cache_fp(head_cache)       = sha1( upstream + N )
-                                                                  ← caches.fingerprint
+artifact_fp(converted_md)    = sha1( upstream + converter_name + converter_version )
+artifact_fp(vlm_text)        = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
+artifact_fp(page_cache)      = sha1( upstream )
+artifact_fp(head_cache)      = sha1( upstream + N )
+                                                                    ← artifact_cache.fingerprint
 
-chunk_fp(body)             = sha1( cache_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
-chunk_fp(row_text)         = sha1( upstream + text_fields + template_version )
-chunk_fp(thread_aggregate) = sha1( upstream + group_by + agg_template_version )
-chunk_fp(vlm_chunk)        = sha1( cache_fp(vlm_text) )
-chunk_fp(schema_summary)   = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
-chunk_fp(directory_summary)= sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
-                                                                  ← Milvus 行 chunk_fingerprint
+chunk_fp(body)               = sha1( artifact_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
+chunk_fp(row_text)           = sha1( upstream + text_fields + template_version )
+chunk_fp(thread_aggregate)   = sha1( upstream + group_by + agg_template_version )
+chunk_fp(vlm_chunk)          = sha1( artifact_fp(vlm_text) )
+chunk_fp(schema_summary)     = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
+chunk_fp(directory_summary)  = sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
+                                                                    ← Milvus 行 chunk_fingerprint
 
-embedding_fp               = sha1( chunk_fp + embedding_model + embedding_model_version )
-                                                                  ← Milvus 行 embedding_fingerprint
+embedding_fp                 = sha1( chunk_fp + embedding_model + embedding_model_version )
+                                                                    ← Milvus 行 embedding_fingerprint
 ```
 
 Connector 不参与这套逻辑，只提供 upstream fingerprint。下游全由 framework 算。
@@ -334,11 +340,11 @@ Step 1: upstream 层比对
   old_fp = objects.fingerprint
   if new != old: enqueue full rebuild → return
 
-Step 2: cache 层比对（仅对适用的 cache_kind）
-  for cache_kind in processor.applicable_caches(object_kind):
+Step 2: artifact cache 层比对（仅对适用的 artifact_kind）
+  for artifact_kind in processor.applicable_artifacts(object_kind):
     new_fp = compute_artifact_fp(...)
-    if new != caches.fingerprint:
-      enqueue cache_rebuild → 触发下游 chunk + embed
+    if new != artifact_cache.fingerprint:
+      enqueue artifact_rebuild → 触发下游 chunk + embed
       continue
 
 Step 3: chunk 层比对
@@ -363,7 +369,65 @@ for object in 当前 connector 下未在本次 yield 的 object:
   跑 Reconcile 4 步比对
 ```
 
-这一步让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed" 能 work，用户不需要加 `--force-index`。性能：sweep 是只读比对（不读 upstream），只查 metadata DB + Milvus 字段，100 万 chunk 几秒钟级。
+这一步让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed" 能 work，用户不需要加 `--force-index`。
+
+> **Sweep 永不删除。** 它只比对 fp 入队 rebuild。删除是完全独立的 [02 §7.4](02-architecture.md#74-deletion-策略) deletion step。两步都遍历"未 yield 集合"但目的相反（一个重建一个删除），实现上必须分开，不能在同一个 loop 里既 rebuild 又 delete。
+
+##### config-hash gate：避免每次 sync 全量扫
+
+sweep 是只读比对（不读 upstream），但在 **incremental sync 下"未 yield 的 object" ≈ 全部对象**——每次 sync 都全量扫几十万~几百万 fp，而框架配置 99% 的 sync 根本没变，纯白跑。
+
+用一个 config fingerprint 把它 gate 掉：
+
+```python
+# config 指纹是 per-connector 的，把所有"connector 看不见但能让下游产物 stale"的配置揉进去：
+current_cfg_fp = sha1(
+    # ── framework 全局配置（server.toml）──
+    embedding_model + embedding_version +
+    chunker_name + chunker_config + tokenizer_version +
+    converter_name + converter_version +
+    summary_model + summary_prompt +
+    vlm_model + vlm_prompt +
+    # ── 该 connector 的 object 配置（connector TOML [[objects]] 段）──
+    #    text_fields / metadata_fields / chunk_strategy / template_version /
+    #    filter_expr / group_by ... —— 这些进 chunk_fp 公式，改了下游就 stale
+    connector_object_config_serialized
+)
+
+last_swept_fp = connector_state.get("last_swept_config_fp")   # 持久化，重启不丢
+
+if current_cfg_fp == last_swept_fp:
+    skip sweep                       # 99% 的 sync 走这条，零扫描
+else:
+    run full sweep                   # 配置真变了才全量比对
+    connector_state.set("last_swept_config_fp", current_cfg_fp)
+```
+
+效果：
+
+- 配置没变（绝大多数 sync）→ 整步跳过，成本为 0
+- 真换 embedding model / 升级 chunker → 下一次 sync 触发一次全量 sweep，跑完归零
+- `last_swept_config_fp` 存在 `connector_state`（持久化），framework 重启不会丢——不会因为重启而退化成"每次都扫"
+
+##### update_config 天然接进这条路
+
+`mfs connector update <uri> --config new.toml` 改了 `text_fields` / `chunk_strategy` 等 object 配置后：
+
+```
+① update_config job 更新 connectors 表的 config_json + config_hash
+② 紧接着触发一个 sync_job（用新配置）
+③ sync 末尾 config-hash gate 比对：connector_object_config 变了 → current_cfg_fp 变了
+   → gate 打开 → 跑全量 sweep
+④ sweep 对每个 object 跑 Reconcile 4 步：
+   text_fields 进 chunk_fp 公式 → chunk_fp 失效 → 入队 chunk rebuild → 重 chunk + 重 embed
+   （embed 走 transformation cache，未变的文本片段命中复用）
+```
+
+所以**改 text_fields 不需要专门的"重建"命令**——`mfs connector update` 走完，下一次 sync 的 sweep 自动把受影响的 object 重 chunk。用户感知就是"改配置 → 自动生效"，跟"换 embedding model → 自动重 embed"是同一条机制。
+
+更新 config 但**没改任何进 fp 的字段**（比如只改了 `label` 展示名）→ current_cfg_fp 不变 → gate 不开 → sweep 跳过，零浪费。
+
+性能：跳过时 0；触发时是只读比对（只查 metadata DB + Milvus 字段，不读 upstream），100 万 chunk 几秒钟级。
 
 ### 5.3 Milvus 上的失效行为
 
@@ -430,48 +494,59 @@ Milvus 不支持只更新一列。任何 fingerprint 变化最终都是 **DELETE
 
 ### 5.5 file connector 实现示例
 
-file connector 的 sync 完整流程：
+**状态存储**：file connector 不用 `self.state` K/V（其他 connector 存 cursor 的地方），而用 framework 提供的 `self.file_state` 表接口（背后是 02 §10.1 的 `file_state` 表）。理由：
+
+- 几十万 path 不挤进一个 JSON blob
+- CS 模式 upload commit 步骤要直接 UPSERT `status='staged'` / `renamed_from` 字段（02 §4.2 ④）
+- 按 `status` 索引能直接查"还没索引的"
+
+file connector 的 sync 流程：
 
 ```
 1. scan：os.walk(root) 应用 ignore rules（.gitignore + .mfsignore + 默认 binary 规则）
    得到当前 paths 集合 current_paths
 
-2. 对每个 path 跟 self.state 里的 manifest 对比：
-   - manifest 里有 + (size, mtime_ns) 完全一致 → 跳过
-   - manifest 里有 + (size, mtime_ns) 变化 → 算 sha1(content)
-     - sha1 跟 manifest 一致 → 只是 touch 了 mtime，更新 manifest.mtime_ns，跳过
+2. 对每个 path 跟 file_state 对比 (stat-first lazy hashing):
+   - file_state 里有 + (size, mtime_ns) 完全一致 → 跳过
+   - file_state 里有 + (size, mtime_ns) 变化 → 算 sha1(content)
+     - sha1 跟 file_state 一致 → 只 touch 了 mtime，UPDATE file_state.mtime_ns，跳过
      - sha1 不一致 → 加进 modified 候选
-   - manifest 里没有 → 加进 added 候选
+   - file_state 里没有 → 加进 added 候选
 
-3. manifest 里有但 current_paths 没有 → 加进 deleted 候选
+3. file_state 里有但 current_paths 没有 → 加进 deleted 候选
 
-4. Rename detection（详见 §5.7.2）：对 added × deleted 做 inode + sha1 配对
+4. 处理已有 renamed_from 标记（CS 模式 commit 步预写）:
+   - 对 file_state.status='staged' AND renamed_from IS NOT NULL 的行
+     直接 yield ObjectChange("renamed", new=path, old_uri=renamed_from)
+     不走下面的配对算法
+
+5. 剩余 added × deleted 做 inode + sha1 配对（详见 §5.7.2）：
+   - 本机模式：这是 rename detection 的主路径
+   - CS 模式：作为 client 端配对失败的兜底——client 没识别出来 rename 时，
+              client 会按 added + deleted 上报，bytes 上传到 staging；
+              这里 sha1 配对仍能匹配，yield "renamed"，省下 embed 钱（但带宽已花）
+   配对结果:
    - inode 一致（同 fs mv）→ yield ObjectChange("renamed", new, old_uri=old)，零 sha1
    - inode 不可信 / 失败 → size 预过滤后算 sha1，匹配 → yield "renamed"
    - 都没匹配 → yield "added" / "deleted"
 
-5. 更新 self.state 里的 manifest（写新 sha1 / size / mtime / inode）
+6. yield ObjectChange，framework 处理:
+   - 处理完写入 file_state: 更新 sha1 / size / mtime / inode，
+                           status='indexed', renamed_from=null, indexed_at=now()
 ```
 
-manifest 结构：
+`file_state` 表行的核心字段：`(path, size, mtime_ns, inode, sha1, status, renamed_from)`，完整 schema 见 [02 §10.1](02-architecture.md#101-metadata-db)。
 
-```python
-manifest = {
-  path: {
-    "size":     int,
-    "mtime_ns": int,
-    "inode":    Optional[int],   # 不可信平台为 None，退化 sha1 配对
-    "sha1":     str,
-  },
-  ...
-}
-```
+平台漂移处理：file connector 用 `connector_state` 表（K/V）存一个 `platform_id` 键，值是当前 inode 来源平台标识（如 `linux:ext4:/dev/sda1` / `darwin:apfs` / `windows:ntfs`）。connector 启动时比对当前 platform_id 跟 K/V 里存的：
 
-manifest 是 file connector 自己定义的结构，存在 `self.state` 里。其他 connector 按各自需要存自己的 state，framework 不 introspect。
+- 一致 → file_state 的 inode 字段可信，正常 inode 配对
+- 不一致 → 视所有 inode 字段为 NULL（rename 配对直接走 sha1 fallback，避免"另一平台上的 inode 数字撞到当前平台某个文件 inode"），sha1 字段仍可信
 
-**file connector 不调 checkpoint**——它的 state 是全量 map 形态，半截 commit 不合法（详见 §5.6.1）。
+这处理"备份 `~/.mfs` 跨平台搬迁 / Docker volume 挂到不同 host fs"的场景：mtime 保留时常规变化检测照常 size+mtime 匹配跳过，**只有真的被 mv 的文件才进 sha1 配对路径**，不雪崩。
 
-注意：file connector 的 manifest 只包含**文件本身的 fingerprint**（path / size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化由 §5.2 的 sweep 步骤捕获，跟 manifest diff 无关。
+**file connector 不调 checkpoint**——file_state 是全量结构化映射，半截 commit 不合法（详见 §5.6.1）。
+
+注意：file_state 只包含**文件本身的 fingerprint**（size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化由 §5.2 的 sweep 步骤捕获，跟 file_state 无关。
 
 ### 5.6 Mid-job checkpoint
 
@@ -500,7 +575,7 @@ framework 拿到 checkpoint 调用 → 一个事务把 `connector_jobs.state_sna
 | 单调推进的 set + 关联 map | web crawl `visited_urls` 集合 + `{url: etag}` map | ✅ 推荐 | visited 集合只增不减，是 cursor 等价物——下次接续会"跳过已 visited"，合法 |
 | paged token | gdrive `next_page_token` | 看 provider | gdrive token 长期有效 → OK；某些 provider token 短期失效 → 不推荐 |
 | commit hash 类（A→B） | github code `commit_sha` / git tag / bigquery snapshot_time | ❌ | 一次 sync 是"从 A 跳到 B"的原子转换，没有合法的"半 commit" |
-| 快照型全量 map（要原子替换才合法） | file `{path: hash}`（必须反映"此刻整棵目录树"） | ❌ | 半截的 map 不能宣称是某一时刻的快照真相 |
+| 快照型全量映射（要原子替换才合法） | file `file_state` 表（必须反映"此刻整棵目录树"） | ❌ | 半截的映射不能宣称是某一时刻的快照真相 |
 
 判断准则：你的 state 在 `checkpoint()` 那一瞬间，是不是一个**合法的"从此处接续"的起点**？
 
@@ -510,7 +585,7 @@ framework 拿到 checkpoint 调用 → 一个事务把 `connector_jobs.state_sna
 举例对比：
 
 - **web crawl** 的 `visited_urls = {url_a, url_b, ...}` 是单调增长——commit 到这个 set 后崩了重启，下次跑会跳过已 visited，BFS 继续。合法 ✓
-- **file connector** 的 `manifest = {path: hash}` 是"对完整目录树的快照"——半截的 map 没法说"已扫的就是真相"，下次再 walk 时拿不出"deleted = manifest - current_paths"这个集合的正确答案。不合法 ✗
+- **file connector** 的 `file_state` 表是"对完整目录树的快照"——半截的映射没法说"已扫的就是真相"，下次再 walk 时拿不出"deleted = file_state - current_paths"这个集合的正确答案。不合法 ✗
 
 #### 5.6.2 推荐用法
 
@@ -547,19 +622,17 @@ yield ObjectChange(kind="renamed", uri=new_uri, old_uri=old_uri)
 
 #### 5.7.2 配对算法（推荐 inode + sha1 fallback）
 
-file connector 用两层配对，**绝大多数场景零 sha1 计算**：
+两层配对，**绝大多数场景零 sha1 计算**。算法相同，跑在哪边由部署模式决定：
+
+- **本机模式**：file connector sync 跑在 server 内，对 `file_state` 表 vs 真实目录树做配对
+- **CS 模式**：client 端跑（基于 `/v1/files/manifest` 响应里的 `deletion_candidates`），结果作为 `renames_hint` 提交。Server 端 commit 步用 sha1 验证后直接写 `file_state.renamed_from`——server file connector sync 不再二次配对
 
 ```python
-# manifest schema 扩展：加 inode 字段
-manifest = {
-  path: {"size": ..., "mtime_ns": ..., "inode": 12345, "sha1": "..."},
-  ...
-}
-
-# 配对算法
-deleted_by_inode = {manifest[p].inode: p for p in deleted_paths
-                    if manifest[p].inode is not None}
-deleted_by_sha1  = {manifest[p].sha1:  p for p in deleted_paths}
+# 本机模式下 file connector sync 用到的配对（CS 模式下 client 端跑同一套，只是替换数据源）
+# 把 deleted/added 各自按可配对的 key 索引，遍历 added 路径优先 inode 配对、失败回退 sha1。
+deleted_by_inode = {file_state[p].inode: p for p in deleted_paths
+                    if file_state[p].inode is not None}
+deleted_by_sha1  = {file_state[p].sha1:  p for p in deleted_paths}
 
 for new_path in sorted(added_paths):                  # 字典序保证 deterministic
     new_inode = get_stable_inode(new_path)            # os.stat().st_ino，平台不可信时返 None
@@ -568,15 +641,15 @@ for new_path in sorted(added_paths):                  # 字典序保证 determin
     if new_inode and new_inode in deleted_by_inode:
         old_path = deleted_by_inode[new_inode]
         # 双重校验防 inode 复用
-        if manifest[old_path].size == os.stat(new_path).st_size:
+        if file_state[old_path].size == os.stat(new_path).st_size:
             yield ObjectChange("renamed", new_path, old_uri=old_path)
             deleted_by_inode.pop(new_inode)
-            deleted_by_sha1.pop(manifest[old_path].sha1, None)
+            deleted_by_sha1.pop(file_state[old_path].sha1, None)
             continue
 
     # inode 配对失败（跨 fs / 网络 fs / inode 复用），按 size 预过滤再算 sha1
     new_size = os.stat(new_path).st_size
-    has_size_match = any(manifest[p].size == new_size for p in deleted_by_sha1.values())
+    has_size_match = any(file_state[p].size == new_size for p in deleted_by_sha1.values())
     if has_size_match:
         new_sha1 = compute_sha1(new_path)             # 真读盘
         old_path = deleted_by_sha1.pop(new_sha1, None)
@@ -594,6 +667,8 @@ for old_path in set(deleted_by_sha1.values()):
 
 `get_stable_inode` 在不可信平台（Windows FAT32 / 部分网络 fs）返回 None，直接退到 sha1 路径——**没 inode 也能跑**，只是慢点。
 
+CS 模式下 client 端跑同样算法时，`file_state[p]` 的字段是从 `/v1/files/manifest` 响应里的 `deletion_candidates` 携带的（server 把这些 path 的 size/inode/sha1 一起发回 client，详见 [02 §4.2 ③](02-architecture.md#42-本地文件-upload-flow不共享-fs-时)）。
+
 #### 5.7.3 Framework 处理 `renamed`
 
 renamed event 进 framework 后，**chunk 内容、所有 fingerprint 都不变**——只有 chunk_id 主键变（因为 `chunk_id = sha1(... + object_uri + ...)`）。处理流程：
@@ -606,10 +681,10 @@ renamed event 进 framework 后，**chunk 内容、所有 fingerprint 都不变*
   ③ INSERT 新行（向量 + content + 所有 fp 字段直接复用，不调 embedder）
   ④ DELETE 旧行（按旧 chunk_id 或按 object_uri 批量删）
 
-caches 表:   UPDATE object_uri = new_uri WHERE object_uri = old_uri
-objects 表:  UPDATE object_uri = new_uri, parent_path = ... WHERE object_uri = old_uri
-object_store: 物理 mv cache 目录
-  ~/.mfs/cache/caches/<ns>/<sha1(old_uri)>/  →  ~/.mfs/cache/caches/<ns>/<sha1(new_uri)>/
+artifact_cache 表: UPDATE object_uri = new_uri WHERE object_uri = old_uri
+objects 表:        UPDATE object_uri = new_uri, parent_path = ... WHERE object_uri = old_uri
+object_store:      物理 mv artifact cache 目录
+  ~/.mfs/cache/artifacts/<ns>/<sha1(old_uri)>/  →  ~/.mfs/cache/artifacts/<ns>/<sha1(new_uri)>/
 ```
 
 `chunk_fp` / `embedding_fp` 公式里都不含 `object_uri`（详见 [§5.2](#52-fingerprint-chain)），所以 rename 后 fp 真的不变，零外部 API 调用。
@@ -664,8 +739,12 @@ mfs add ./repo --watch --interval 60s
 - daemon 内启 watcher（`watchfiles` 或 OS-native）
 - watch 事件只作触发信号，最终事实仍来自 scan + manifest 对比
 - 查看正在 watch：`mfs status --watch`
-- 停止：`mfs remove ./repo` 或 Ctrl+C
+- 停止单个 watch（保留 connector）：`mfs add ./repo --no-watch`
+- 连 connector 一起删：`mfs remove ./repo`
+- 停整个 daemon（所有 watch 一起停）：`mfs serve stop`
 - 外部 connector 不支持 watch，用 scheduler 周期触发
+
+> Ctrl+C `mfs add --watch` CLI 进程只杀 CLI 自己，**不影响 daemon 内已经登记的 watcher**——watch 的生命周期跟 daemon 绑定，不跟启动它的那次 CLI 调用绑定。
 
 首次 watch 某目录时弹权限确认：
 
@@ -726,7 +805,7 @@ daemon 内置简单 scheduler（基于 SQLite + APScheduler 风格），用户�
 |---|---|
 | `mfs add <uri>` 已注册 | 新 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
 | `mfs add <uri> --force-index` | 所有 object 视为 modified，跳过 fp 比对，强制重 chunk + embed |
-| `mfs add ./path --force-upload` | 仅 upload flow：client 忽略 manifest cache 全量重传 + server 强制重 index |
+| `mfs add ./path --force-upload` | 仅 upload flow：跳过 manifest diff，所有 path 按 stale 处理全量重传 + server 强制重 index |
 | `mfs add <uri>` 在前次失败后 | 前次 state 未 commit，从上一个成功的 state 重跑——失败的 object 自然再次出现 |
 | `mfs add <uri>` 在前次还 running | 拒绝 `sync_already_running, see job <id>` |
 | `mfs remove <uri>` 在前次 sync running | preempt：sync 标 cancelling，当前 task 完成后退出，remove 接管 |

@@ -18,7 +18,7 @@ MFS 对外公开 16 个顶级命令：11 个 POSIX 风格动词 + 5 个名词管
 | `mfs head <uri>` | 前 N 行/记录 |
 | `mfs tail <uri>` | 后 N 行/记录（v0.4 不支持 `-f` 流式跟随） |
 | `mfs export <uri> <file>` | 把对象写到本地文件 |
-| `mfs remove <uri>` | 注销 connector + 删 chunks / cache / state（destructive，默认 confirm） |
+| `mfs remove <uri>` | 注销 connector + 删 chunks / artifact cache / state（destructive，默认 confirm） |
 
 ### 名词管理命令
 
@@ -95,8 +95,9 @@ mfs connector probe postgres://prod --config x.toml
 | `--config <toml>` | 外部 connector 首次注册必填；已注册时忽略（要改配置用 `mfs connector update`） |
 | `--yes` | 跳过 confirm。默认行为：首次注册外部 connector 估算成本后等确认；本地小目录直接跑 |
 | `--watch` | 仅本地路径有效，启动 daemon 内 watcher |
-| `--force-index` | 跳过 fingerprint 比对，server 端强制重 chunk + embed。**不重传字节**（upload flow 下 manifest diff 仍然有效）。覆盖 95% "我要 force" 的场景 |
-| `--force-upload` | 仅 upload flow（remote profile + 本地路径）有效；忽略 client manifest cache，全量重传整个目录。imply `--force-index`。仅当怀疑 staging 字节本身坏了时用 |
+| `--no-watch` | 仅本地路径有效，停止该路径上 daemon 内已登记的 watcher（保留 connector + 索引） |
+| `--force-index` | 跳过 fingerprint 比对，server 端强制重 chunk + embed。**不重传字节**（upload flow 下 manifest diff 仍然有效）。覆盖 95% "我要 force" 的场景。**默认 confirm**：会重新跑 estimate（chunker + 本地 tokenizer，不打 embedding API）展示要重 embed 的 chunks / tokens 量，按 y/N 决定；`--yes` 跳过 |
+| `--force-upload` | 仅 upload flow（remote profile + 本地路径）有效；跳过 manifest diff，所有 path 都按 stale 处理，全量重新上传字节。imply `--force-index`。仅当怀疑 server staging 字节本身坏了时用 |
 | `--since <date>` | 仅时间游标 connector（postgres updated_at / slack ts / github / gmail）有效；其他报 `since_unsupported` |
 
 不提供 `--force` 短写法——避免歧义（到底重传不重传？）。shared fs 场景下 `--force-upload` 报错 `upload_not_applicable`。
@@ -107,17 +108,16 @@ mfs connector probe postgres://prod --config x.toml
 $ mfs add postgres://prod --config .mfs/connectors/prod-postgres.toml
 Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
-Estimated work (based on 1% probe sample, ±50% accuracy):
-  chunks:    ~14M
-  tokens:    ~2.4M (use your provider's rate to compute cost)
-  storage:   ~3.2GB index + cache
+Estimated (local chunker + tokenizer only — no embedding API calls):
+  chunks:    ~14M    (chunker dry-run on a sample of up to 1000 records)
+  tokens:    ~2.4M   (apply your provider's per-token rate to estimate $)
 
 Continue? [y/N]
 ```
 
-只给确切估得到的物理量。**钱不估**（每个 embedding provider 价格不同，自部署、企业协议价、Azure / Voyage / Cohere 都不一样）。**时间不估**（受 worker 并发 / API rate limit / 网络浮动 10x）。实际成本上线后看 `mfs status` 实时进度。
+只给本地能算清的物理量。**估算阶段不打任何计费 API**——chunker 是确定性算法，tokenizer 是本地库（tiktoken / hf-tokenizers），都免费，用户看到 prompt 时还没花一分钱。**钱不估**（每个 embedding provider 价格不同）。**时间不估**（受 worker 并发 / API rate limit / 网络浮动 10x）。**storage 不估**（≈ chunks × dim × 4byte，跟所选 embedding model 强相关，误差比 chunks/tokens 还大）。实际成本上线后看 `mfs status` 实时进度。
 
-`--yes` 或本地路径直接开始：
+`--yes` 或本地小目录直接开始：
 
 ```text
 $ mfs add ./repo
@@ -125,6 +125,20 @@ Processing 184 files under /repo
 Indexed: 184 files scanned, 37 touched, 2 deleted, 412 chunks queued.
 Worker running in background. Run `mfs status` to check progress.
 ```
+
+本地大目录（默认阈值：超过 5000 个 indexable 文件，或抽样外推 chunks > 50k）也进 estimate + confirm 路径，跟外部 connector 一致：
+
+```text
+$ mfs add ./huge-monorepo
+Scanning ./huge-monorepo ... 84,231 files, 6.2 GB
+Estimated (local chunker + tokenizer only — no embedding API calls):
+  chunks:   ~412k    (chunker dry-run on sample)
+  tokens:   ~89M     (apply your provider's per-token rate to estimate $)
+
+Continue? [y/N]
+```
+
+阈值由 server.toml `[estimate] local_confirm_files` / `local_confirm_chunks` 控制；`--yes` 跳过；CI / 脚本里习惯 `--yes` 的用户不受影响。
 
 如果检测到 rename（`mv ./repo/projects/old ./repo/projects/new` 后），输出多一行 `N renames`：
 
@@ -233,7 +247,7 @@ slack://eng/channels/incidents/2026-05-10/messages.jsonl
 派发规则（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）：
 
 - connector 声明 `grep_pushdown=true` → 下推为 SQL `ILIKE` / Slack search API / S3 Select
-- 有 cache → 扫 cache
+- 有 artifact cache → 扫 artifact
 - 否则 connector.read() 流式扫
 - 标记 `indexable=true` 且对象已建 chunk → 走 Milvus BM25 召回
 
@@ -286,7 +300,7 @@ mfs cat ./docs/diagram.png --meta                                # 看 VLM descr
 |---|---|---|
 | `--peek` | 只列名字 / 标题骨架 | metadata DB |
 | `--skim` | + 每条 summary 一行 | Milvus 查 `directory_summary` / `summary` / `vlm_description` |
-| `--deep` | 展开更多结构 | Milvus + cache head |
+| `--deep` | 展开更多结构 | Milvus + artifact cache head |
 
 ```bash
 mfs tree --peek -L 2 ./
@@ -314,7 +328,7 @@ mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
 
 - `head -n N` / `tail -n N` 无状态
 - v0.4 不支持 `-f` 流式跟随——需要每个 connector 单独实现 push/poll 通道，工程成本高、受益场景窄。监控类用例可以脚本化 `mfs add <uri>` 周期同步 + `mfs head -n N` 看快照
-- `export` 完整写到本地文件，是大对象遍历的标准做法
+- `export` 完整写到本地文件，是大对象遍历的标准做法。**估算 size > `export.warn_size`（server.toml 默认 1 GiB）会先 confirm**（展示 size_hint + 走 connector 是否会触发 API quota），`--yes` 跳过；估算 size > `export.max_size`（默认 100 GiB，0 = 不限）直接拒绝，让用户 `--range` 分批，避免 agent 不假思索拖整张 100 GB 表。错误码 `export_too_large`
 
 ## 9. Status
 
@@ -344,7 +358,7 @@ Search:  available
 
 健康检查、watch 状态、诊断都收敛到 `status` 这一个命令。
 
-## 10. Connector / Profile / Serve / Job 管理
+## 10. Connector / Profile / Serve / Job / Config 管理
 
 ### `mfs connector`
 
@@ -379,14 +393,14 @@ mfs remove postgres://prod --yes        # 跳过 confirm
 $ mfs remove postgres://prod
 This will permanently delete:
   - 12,453 chunks in Milvus
-  - 3.2 GB cache in object store
+  - 3.2 GB artifact cache in object store
   - 38 indexed objects
   - 1 running sync job (will be cancelled)
 
 Continue? [y/N]
 ```
 
-confirm 后流程：取消正在跑的 sync（如有）→ Milvus `DELETE WHERE connector_uri = X`（按 partition_key 路由，只扫该桶）+ 清 cache + 删 metadata → 注销 connector。详见 [02 §8](02-architecture.md#8-并发协调)。
+confirm 后流程：取消正在跑的 sync（如有）→ Milvus `DELETE WHERE connector_uri = X`（按 partition_key 路由，只扫该桶）+ 清 artifact cache + 删 metadata → 注销 connector。详见 [02 §8](02-architecture.md#8-并发协调)。
 
 幂等性：
 
@@ -432,7 +446,36 @@ mfs job inspect job_01HX...
 mfs job cancel job_01HX...
 ```
 
+`mfs job cancel` 的实际停止有延迟——单个 in-flight `object_task` **不打断**（避免半截 chunks 进 Milvus 的脏状态），先标 `cancelling`、跑完手头 task 再退。CLI 立即返回：
+
+```text
+$ mfs job cancel job_01HX...
+Cancellation requested. Current in-flight task will finish first.
+  in-flight:   tables/public/events/rows.jsonl (started 8m ago)
+  pending:     1,243 tasks (will be marked cancelled)
+Watch progress: mfs job inspect job_01HX...
+```
+
+详见 [02 §8.3](02-architecture.md#83-sync-中的-remove-流程)。
+
 失败时 `mfs add <uri>` 即可（幂等），所以不提供 `job retry`。
+
+### `mfs config`
+
+```bash
+mfs config show                          # 当前 profile 的 client + server 合并视图
+mfs config show --effective <uri>        # 某个 connector / 对象的最终生效配置（合并 server.toml + connector TOML + [[objects]] 段）
+mfs config set <key> <value>             # 写 client.toml（仅 client 端可改的项）
+```
+
+`mfs config set` **只改 client 端 `~/.mfs/client.toml`**——典型用途：默认 profile、CLI 输出格式、超时等。可改 key 由 CLI 内嵌的 schema 限定，乱写报 `unknown_config_key`。
+
+Server 端配置（`server.toml`：metadata backend、object store、Milvus URI、embedding provider 等）**不通过 CLI 改**：
+
+- 本机 server：编辑 `~/.mfs/server.toml` → `mfs serve restart`
+- 远端 server：编辑 `/etc/mfs/server.toml` → `mfs-server reload`（或重启进程）
+
+`mfs config show` 跨 client/server 拉数据时，server 端只回敏感字段 redacted 过的副本（token / DSN 不出现）。
 
 ## 11. `--json` envelope
 
@@ -536,6 +579,8 @@ JSON：
 | `sync_already_running` | 同 connector 已有 in-flight sync；返回 `see job <id>` |
 | `connector_removing` | connector 正在被 remove，拒绝新 add/sync |
 | `op_conflict` | 通用并发拒绝（如 sync 中又来 update_config） |
+| `export_too_large` | export 估算 size 超过 `export.max_size`；建议改 `--range` 分批 |
+| `unknown_config_key` | `mfs config set` 收到未识别的 key |
 
 ## 13. Pipe 行为
 

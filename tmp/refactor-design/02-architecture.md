@@ -106,7 +106,7 @@ CLI、SDK 是 client，所有重活在 server。server 有两种部署位置：
 | 文件 | 路径 | 内容 | 谁读 |
 |---|---|---|---|
 | client 配置 | `~/.mfs/client.toml` | profiles、endpoint URL、API token | `mfs` CLI |
-| server 配置 | `~/.mfs/server.toml`（本机）<br>`/etc/mfs/server.toml`（远端） | 存储后端、worker、embedding、cache 等 | `mfs-server` |
+| server 配置 | `~/.mfs/server.toml`（本机）<br>`/etc/mfs/server.toml`（远端） | 存储后端、worker、embedding、artifact_cache 等 | `mfs-server` |
 
 只装 CLI 的用户只接触 `client.toml`；只装 server 的运维只接触 `server.toml`。
 
@@ -163,7 +163,9 @@ profile.is_local = (client_machine_id == server_resp["machine_id"])
 
 machine-id 用来判 is_local，**不**用来当 client 长期身份。原因：machine-id 在 Docker 容器、`systemd-machine-id-setup --commit`、系统重装等场景会变。如果用 machine-id 进 `connector_uri`，那些场景下已有的 file connector 都会变成孤儿。
 
-所以 `client_id` 由 CLI 首次启动生成（UUIDv7），写在 `client.toml` 里。`file://<client_id>/<abs-path>` 是 file connector 的稳定标识。备份 `~/.mfs` 就能跨机器迁移；Docker 容器把 `~/.mfs` 挂成 volume 就能跨重启保持身份。
+所以 `client_id` 由 CLI 首次启动生成（UUIDv7），写在 `client.toml` 里。`file://<client_id>/<abs-path>` 是 file connector 的稳定标识。备份 `client.toml` 就能跨机器迁移；Docker 容器把 `~/.mfs` 挂成 volume 就能跨重启保持身份。
+
+**client.toml 之外 client 端不持久化任何状态**——manifest 全部在 server 端 `file_state` 表里，上传协议 stateless（详见 [§4.2](#42-本地文件-upload-flow不共享-fs-时)）。CI / 临时 runner / 切机器场景下 client 重启零成本。
 
 ### 3.5 Server 端存储后端跟 profile 无关
 
@@ -227,90 +229,124 @@ HTTP API 主要走 control plane（路径、option、状态、搜索结果），
 | 共享 fs | 本地路径 | server 直接读本机文件 → 内部 chunk → 内部写 Milvus | 仅 path + options |
 | 共享 fs | 外部 URI | connector 调外部 API → 内部 chunk → 内部写 Milvus | 仅 URI + options |
 | 不共享 | 外部 URI | 远端 server 调外部 API → 内部 chunk → 内部写 Milvus | 仅 URI + options |
-| 不共享 | 本地路径 | client manifest diff → upload 变化的 bytes → server 处理 | **bytes**（§4.2） |
+| 不共享 | 本地路径 | server-driven diff（基于 file_state）→ client 上传变化的 bytes → server 处理 | **bytes**（§4.2） |
 
-除了"不共享 + 本地路径"这一条，client 都不传 bytes，也不算 hash、不拆 chunk、不上传 embedding——这些都是 server 的事。
+除了"不共享 + 本地路径"这一条，client 都不传 bytes、不拆 chunk、不上传 embedding——这些都是 server 的事。这一条下 client 也只做 stat 扫描 + 对 server 指定的少数 path 算 sha1，不拆 chunk / 不调 embedding。
 
 ### 4.2 本地文件 upload flow（不共享 fs 时）
 
-`mfs add ./repo` 在 remote profile 下走四步协议：
+`mfs add ./repo` 在 remote profile 下走 **2 个 HTTP RTT**，之后后台 sync 异步跑。**client 端不持久化任何 manifest**——所有比对状态都在 server 端 `file_state` 表里（详见 [§10.1](#101-metadata-db)），client.toml 里只放 profile / `client_id`。
+
+概念上跟本地模式统一：两种模式都是 **reality vs `file_state`** 的 stat-first 对比，差别只在 reality 怎么到达 server——本地模式 server 直接读盘，CS 模式经过下面的上传协议把字节落到 staging area。对比逻辑和 file_state 一张表，两边共用。
 
 ```
-① client scan + 本地 manifest cache (~/.mfs/clients/<server>/<connector>/manifest.db)
-  得到当前的 (path, size, mtime_ns, inode, sha1) 集合
-  client 本地做 inode + sha1 配对，得到 renames_hint（详见 04 §5.7）
+① client scan: os.walk + stat，拿 (path, size, mtime_ns, inode)
+   纯 stat 操作，不算 sha1。1M 文件几秒钟。
 
 ② POST /v1/files/manifest
-  body: {
-    connector_uri,
-    paths: [...],
-    renames_hint: [{old_path, new_path, sha1}, ...]   // client 自己 inode 配对的结果
-  }
-  server 比对自己的 manifest，返回:
-    missing            → client 端新增的（需上传）
-    stale              → client hash 变了的（需上传）
-    extra              → server 多余的（client 本地删了的）
-    renames_accepted   → server 验证 sha1 一致后接受的 rename（零字节上传）
-    renames_rejected   → sha1 验证失败 / server manifest 里没 old_path，退化为 missing + extra
+   body: {
+     connector_uri,
+     files: [(path, size, mtime_ns, inode), ...]
+   }
+   server 拿 file_state 算 diff:
+     stat 全等 (size + mtime_ns) → 跳过，client 不用做事
+     stat 不等 → 加进 need_sha1
+     file_state 里有但 client 没 → deletion_candidates
+   返回 {
+     need_sha1:           [path, ...],
+     deletion_candidates: [(path, size, inode, sha1), ...]
+       // ↑ 带上 file_state 里这些 path 的字段，供 client 端
+       //   做 inode + sha1 配对识别 rename
+   }
 
-③ client 把 missing + stale 文件打成 zip，
-  PUT /v1/files/upload?connector_uri=...
-  server 把字节放到 staging area: object_store://uploads/<connector_uri>/<temp_file_id>.zip
-  返回 temp_file_id
-  （renames_accepted 不上传字节）
+③ client 本地处理:
+   - 对 need_sha1 中每个 path 算 sha1(content)
+   - inode 配对识别 rename:
+       need_sha1 中 file_state 不存在的 path × deletion_candidates
+       inode + size 都对得上 → 视为 rename
+   - 准备 upload 数据:
+       hashes:       need_sha1 全部的 (path, sha1, size, mtime_ns, inode)
+       renames_hint: [(old, new, sha1), ...]
+       deletions:    deletion_candidates 减去 renames 用到的 old paths
+       bundle.zip:   need_sha1 中的文件字节（renames 不打包）
 
-④ POST /v1/files/commit
-  body: {
-    connector_uri,
-    temp_file_id,
-    renames:   [...],     // accepted rename 列表
-    deletions: [...]      // 真删了的
-  }
-  server:
-    - 解压 zip 到 staging files/<connector_uri>/
-    - 处理 renames:
-        · staging files OS-level rename: old_path → new_path
-        · 触发 §10.3 Milvus 改 chunk_id 流程（向量复用，零 embedding API）
-        · UPDATE caches / objects 表
-    - 处理 deletions（删 staging files + Milvus chunks + objects 行）
-    - 触发 file connector sync（扫 staging area → chunk → embed → 写 Milvus）
-    - 更新 server 端 manifest
-    - bundle.zip 处理完删除，staging files 树保留作为 cache
-  返回 job_id
+④ PUT /v1/files/upload  (multipart: hashes + renames_hint + deletions + bundle.zip)
+   server commit (一个事务):
+     a) 验 hashes，对每条 (path, sha1):
+          一致（mtime-touch） → UPDATE file_state.mtime_ns，bundle.zip 里同 path 字节丢弃
+          不等                → 用 bundle.zip 里的字节，UPSERT file_state
+                                (sha1, size, mtime, inode, status='staged')
+     b) 验 renames_hint，对每条 (old, new, sha1):
+          server_sha1 = file_state[old].sha1
+          一致 → accept
+            · staging OS mv: old → new (保留 inode)
+            · file_state: DELETE old 行；INSERT new 行
+              (同 sha1/size/mtime/inode, status='staged', renamed_from=old)
+          不等 / old 不存在 → reject，退化为 missing + extra
+                              （client 那边会重新归类，下次重传补字节）
+     c) 处理 deletions: rm staging 文件，DELETE file_state 行
+        Milvus 行此时不动，待 sync 跑到时统一删
+     d) 删 bundle.zip
+     e) 触发 file connector sync_job
+   返回 job_id
+
+⑤ file connector sync (后台异步，跟本机模式同一份代码):
+   扫 staging area + 跟 file_state 对比 → yield ObjectChange (详见 04 §5.5)
+     - file_state.renamed_from 不为空的行 → 直接 yield "renamed"，
+                                            framework 走 [04 §5.7.3] chunk_id rewrite
+                                            (零 embedding API)
+     - 普通 added / modified → 标准 chunk + embed pipeline
+     - deleted（file_state 没有但 Milvus 还有）→ sync 末尾 reconcile pass 统一删
+       (Milvus DELETE WHERE connector_uri = X AND object_uri NOT IN (file_state.path))
+   处理完: UPDATE file_state SET status='indexed',
+                                renamed_from=null,
+                                indexed_at=now()
 ```
 
-一致性保证：每次 `mfs add` 上传完成后，server 端 file connector 看到的目录树跟 client 当前目录树一致——本地新增/修改 → 上传；本地删除 → 通过 commit deletions 同步删除；本地 rename → 通过 commit renames 路径迁移，不传字节。
+一致性保证：`/v1/files/upload` 成功返回后，**file_state + staging area 字节双双跟 client scan 看到的盘面对齐**——后台 sync 完成后 Milvus 也跟 file_state 对齐。
+
+中途重传零浪费：
+
+```
+client 上传完了但没收到响应、Ctrl+C 重跑 mfs add:
+  ① scan 拿 stat
+  ② POST manifest，server 用 file_state 算 diff:
+       commit 已经写过的 path → stat 全等 → 跳过
+       commit 没写的 path     → 进 need_sha1
+  ③ client 只对真还需要的 path 算 sha1
+  ④ 只上传真没传完的字节
+```
 
 设计取舍：
 
-- **海量小文件**打 zip 一次上传，HTTP roundtrip 数量不随文件数线性增长
+- **client 无持久状态**：不需要本地 manifest SQLite，重装 / 切机器 / Docker 重建无成本
+- **海量小文件**打 zip 一次上传，HTTP roundtrip 不随文件数线性增长
 - **巨大单文件**（超过 `max_bundle_size_mb`）不打包，独立 multipart streaming PUT
-- **rename**：client inode 配对识别后只传一个 rename 列表（几 KB），不传文件字节。即使 mv 1GB 文件也是零带宽
-- 不做 chunk-level rsync / 断点续传（v0.4 范围内 ROI 不划算）
+- **rename**：client inode 配对后只传 rename 列表（几 KB），不传字节。mv 1GB 文件零带宽
+- **mtime-touch**（mtime 变但 sha1 不变的少数文件）：会被算 sha1 + 字节进 bundle.zip，server 验证 sha1 一致后丢弃字节。一次浪费就是这几个文件的 sha1 计算 + 几 KB 上传，可接受
+- 不做 chunk-level rsync / 断点续传（v0.4 范围 ROI 不划算）
 
 #### Rename 验证
 
-server 端不存 inode（client-local 概念，跨 client 不可信），用 **sha1 验证**：
+client 提交的 renames_hint 由 server 用 sha1 验证（client 端 inode 跨 client 不可信，但 sha1 是内容指纹）：
 
 ```
-对 client 报告的每条 rename (old_path → new_path, sha1=X):
-   server_sha1 = upload_manifests[connector_id][old_path].sha1
+对每条 rename (old_path → new_path, sha1=X):
+   server_sha1 = file_state[old_path].sha1
    if server_sha1 is None:
-       reject → server 端没见过 old_path，当 missing 处理
+       reject → server 没见过 old_path，当 missing 处理
    elif server_sha1 != X:
-       reject → client / server manifest 不同步，退化为 missing + extra（真上传）
+       reject → 状态不一致，退化为 missing + extra（client 重传补字节）
    else:
-       accept → 加进 renames_accepted
+       accept → 按 §④b 流程改写 file_state
 ```
 
-退化路径保证 manifest 不一致也能恢复一致——坏情况下退化为常规上传，不会数据损坏。
+退化路径保证 file_state 不一致也能恢复一致——坏情况下退化为常规上传，不会数据损坏。
 
 错误恢复：
 
-- 上传到一半失败：server 不写任何状态，下次重新 manifest diff
-- commit 没成功：staging zip 留着没解压，下次 `mfs add` 重新走
-
-Client 端 manifest cache（SQLite）记录每个 path 的 `(size, mtime_ns, inode, sha1, last_seen)`，每次启动只 stat 比对 size+mtime，不变就复用旧 sha1。**rename 检测主要靠 inode 配对**，几乎零 sha1 重算（详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)）。
+- 上传到一半失败 / multipart 没完成：server 不动 file_state，下次重跑 manifest diff 自然识别
+- commit 解压过程中崩：file_state UPSERT 还没执行 → 下次 sync 扫到没记录的 staging 文件按 stale 处理
 
 `connector_uri` 构造为 `file://<client_id>/<abs-path>`；一个 connector_uri 一辈子绑定一个 client，v0.4 禁止多 client 共写同一 connector。
 
@@ -414,22 +450,16 @@ SQLite 路径建议 `concurrency = 1`，多 worker 在 SQLite 上互相 serializ
 
 ### 6.4 Batching
 
-两层 batching，互不影响。
+**三层叠加**，对 worker 透明：
 
-**第一层：每个外部 API 调用都有 client-side micro-batcher**（DataLoader 模式）
-
-embedding / summary / VLM / converter 这类外部 API 调用，client 包一层 micro-batcher——多个并发 await 自动合并成一次 API 调用，对调用方透明：
-
-```python
-class BatchingEmbeddingClient:
-    """攒到 max_batch 或超时就 flush，对 worker 透明。
-    embedding / summary / VLM / converter 各有一个独立实例，互不干扰。"""
-    async def embed(self, text: str) -> Vector: ...
+```
+worker_loop
+  └── 第三层: CachingXxxClient   (§10.4 transformation cache)
+       └── 第二层: BatchingXxxClient   (micro-batcher)
+            └── 外部 API call
 ```
 
-这层是吞吐的关键——一次 API 调用做几十到几百个 chunks 远比逐个调省钱省时间。配合 worker 内的 `asyncio.gather`（下面）多个 task 并发调用 API，micro-batcher 自然把它们合并掉。Milvus 不需要 client batcher（worker 显式 batch 写入）。
-
-**第二层：worker 一次拉 N 个 task，并行处理**
+**第一层：worker 一次拉 N 个 task，并行处理**
 
 ```python
 async def worker_loop():
@@ -443,8 +473,9 @@ async def worker_loop():
         chunk_lists = await asyncio.gather(*[chunk_object(t) for t in tasks])
         all_chunks = [c for lst in chunk_lists for c in lst]
 
-        # embedding micro-batcher 会自动 batch；这里 await 一次拿到全部
-        vecs = await asyncio.gather(*[embedding_client.embed(c.content) for c in all_chunks])
+        # CachingEmbeddingClient：先查 transformation cache，miss 走 BatchingEmbeddingClient
+        # 一次调用就能拿到全部 vector（命中的 + API 跑出来的）
+        vecs = await embedding_client.batch_embed([c.content for c in all_chunks])
         for c, v in zip(all_chunks, vecs):
             c.dense_vec = v
 
@@ -455,12 +486,54 @@ async def worker_loop():
 
 `chunk_object(t)` 按 object_kind 分派到对应 processor（document → markdown chunker / pdf → converter → markdown chunker / image → VLM / table_rows → row text 拼接 / ...）。CPU 重的部分（AST 切分、JSONL 流处理、大目录 scan）走 server-rs 的 Rust PyO3 模块，调用时释放 GIL，所以 `asyncio.gather` 在多核上是真并行。
 
+**第二层：micro-batcher（DataLoader 模式）**
+
+embedding / summary / VLM / converter 这类外部 API 调用，client 包一层 micro-batcher——多个并发 await 自动合并成一次 API 调用：
+
+```python
+class BatchingEmbeddingClient:
+    """攒到 max_batch 或超时就 flush。
+    embedding / summary / VLM / converter 各有一个独立实例，互不干扰。"""
+    async def embed(self, text: str) -> Vector: ...
+    async def embed_many(self, texts: list[str]) -> list[Vector]: ...
+```
+
+这层是吞吐的关键——一次 API 调用做几十到几百个 chunks 远比逐个调省钱省时间。Milvus 不需要 client batcher（worker 显式 batch 写入）。
+
+**第三层：transformation cache 包装**（详见 [§10.4](#104-transformation-cache计算缓存)）
+
+```python
+class CachingEmbeddingClient:
+    """worker 直接调这个。先查 transformation cache，miss 才进 BatchingEmbeddingClient。"""
+    async def batch_embed(self, texts: list[str]) -> list[Vector]:
+        # 1) 算 cache_key
+        # 2) cache.batch_get  (一次 SQL IN-clause 拿全部命中)
+        # 3) miss 进 BatchingEmbeddingClient → 真 API
+        # 4) async 写回 cache（不阻塞主流程）
+        # 5) 拼回原顺序返回
+```
+
+CachingVlmClient / CachingSummaryClient 同模式。`[transformation_cache] enabled = false` 时这层退化成透明 passthrough。
+
+**两层 batch_size 协调**：
+
+| 配置 | 典型值 | 含义 |
+|---|---|---|
+| `embedding.batch_size` | 100 | micro-batcher 单次 API 调用上限 |
+| `transformation_cache.lookup_batch_size` | 1000 | cache lookup 单次 SQL IN-clause 上限 |
+
+cache lookup 比 API 调用便宜得多，能一次查更多。worker 攒到 500 chunks → 一次 SQL 查完 → 没命中的可能还有 200 个 → 拆成 2 个 API batch。两层数量级解耦。
+
 ### 6.5 配置
 
 ```toml
 # server.toml
 [worker]
-concurrency = 4                  # asyncio task 数（SQLite 设 1）
+# concurrency 不写或写 "auto" 时按 metadata backend 自适应：
+#   SQLite  → 强制 1（多 worker 互相 serialize 没收益）
+#   Postgres → 默认 4
+# 显式写数字会覆盖自适应（SQLite 下写 >1 会启动时报警并降到 1）。
+concurrency = "auto"
 batch_size = 50
 poll_interval_ms = 200
 heartbeat_interval_s = 30
@@ -506,7 +579,7 @@ chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind
 
 ```
 object_task.status = 'succeeded'
-   ↔ 该 object 的所有 chunks 写入 Milvus 且 cache 已更新
+   ↔ 该 object 的所有 chunks 写入 Milvus 且 artifact cache 已更新
 ```
 
 中途任一步失败 → object_task 保持 'running' 或退 'failed'，下次 sync 重试整个 object。
@@ -519,19 +592,23 @@ object_task.status = 'succeeded'
 
 外部 API 大数据量场景（Slack / Gmail 等）可以调 `self.state.checkpoint()` 主动 commit 当前 state，避免崩溃后整批重跑被 rate limit 打爆。详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint-api)。
 
-**④ Sync 末尾 reconcile pass**
+**④ Sync 末尾 reconcile pass（sweep）**
 
-connector 只负责报告 upstream 变化，但下游产物（cache / chunk / embedding）可能因 framework 配置变化（换 embedding 模型 / chunker 升级）而 stale，connector 不感知。每次 sync_job 在 connector yield 完后，framework 跑一遍 sweep：
+connector 只负责报告 upstream 变化，但下游产物（artifact / chunk / embedding）可能因 framework 配置变化（换 embedding 模型 / chunker 升级）而 stale，connector 不感知。framework 在 sync 末尾跑一遍 sweep：
 
 ```
 for object in 当前 connector 下未在本次 yield 的 object:
   跑 fingerprint chain 比对：
-    cache 层 fp 变了？     → 入队 cache rebuild
-    chunk 层 fp 变了？     → 入队 chunk rebuild
-    embedding 层 fp 变了？ → 入队 embed only
+    artifact cache 层 fp 变了？  → 入队 artifact rebuild
+    chunk 层 fp 变了？           → 入队 chunk rebuild
+    embedding 层 fp 变了？       → 入队 embed only
 ```
 
-这条让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed"能 work，用户不需要加 `--force-index`。完整逻辑见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)。
+这条让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed"能 work，用户不需要加 `--force-index`。
+
+**config-hash gate**：incremental sync 下"未 yield 的 object" ≈ 全部对象，每次 sync 全量扫 fp 太浪费。framework 用一个 **per-connector config fingerprint** gate 掉——揉进 framework 全局配置（embedding model / chunker / converter / summary / vlm）**和该 connector 的 object 配置**（text_fields / chunk_strategy 等）。config fp 跟上次 sweep 时一致就**整步跳过**，只有配置真变了才跑全量 sweep。`mfs connector update` 改了 text_fields 这类字段也是通过这条路自动重 chunk（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）。`last_swept_config_fp` 持久化在 `connector_state`，重启不丢。
+
+> **Sweep 永不删除**——只比对 fp 入队 rebuild。删除是完全独立的 [§7.4](#74-deletion-策略) deletion step，两步必须分开实现。
 
 framework 不暴露 `commit()` 给 connector（只暴露 `checkpoint()`），commit 时机由 framework 控制。
 
@@ -611,7 +688,7 @@ consecutive_fatal_threshold = 5     # 连续这么多 fatal 触发整 job abort
 |---|---|
 | `mfs add <uri>` 已注册 | 新建 sync_job → connector.sync() 从 connector_state 接续 → 增量出 ObjectChange |
 | `mfs add <uri> --force-index` | 所有 object 视为 modified，跳过 fp 比对，强制重 chunk + embed |
-| `mfs add ./path --force-upload` | 仅 upload flow：client 忽略 manifest cache 全量重传 + server 强制重 index |
+| `mfs add ./path --force-upload` | 仅 upload flow：跳过 manifest diff，所有 path 按 stale 处理全量重传 + server 强制重 index |
 | `mfs add <uri>` 在前次失败后 | state 未 commit，从上一个成功的 state 重跑 |
 | 第二次 `mfs add <uri>` 在前次还 running | 拒绝 `sync_already_running, see job <id>` |
 
@@ -634,6 +711,84 @@ running_timeout_hours = 24      # 超过 24h 视为僵尸标 failed
 ```
 
 server 启一个 housekeeping coroutine，每天跑两步：标僵尸 + 按 retention 删过期。`finished_at` 而不是 `created_at`——长 sync 的 created_at 不该作为归档基准。
+
+### 7.4 Deletion 策略
+
+framework 怎么决定 "Milvus 里哪些 chunk 该删"？核心约束：**"没 yield" 不等于"被删"**——它可能只是增量 sync 里"没变化"。能不能推断删除，取决于这次 sync 是不是全量枚举。
+
+只有两条规则，没有阈值、没有 confirm 命令：
+
+```
+① Sync 模式决定能不能推断删除
+     incremental sync  → 跳过 deletion 整步
+                         (cursor 只 yield 变化，"没 yield" 推不出"删了")
+     full scan sync    → 全集 diff，推断删除：
+                         to_delete = (objects 表 ∩ Milvus) - 本次 yield 的全集
+                         对 to_delete 执行 Milvus DELETE
+
+② explicit "deleted" event 任何模式都直接处理
+     connector 能从上游拿到删除信号时（gdrive changes / CDC / S3 delete marker）
+     直接 yield ObjectChange("deleted")，framework 立即删，不依赖全量 diff
+```
+
+模式信号来源：
+
+- `SyncOptions.full = True`（用户 `--force-index`）
+- connector 内部周期逻辑声明本次是 full scan（例：postgres "每 N 次增量后跑一次全量 PK diff" 那一次）
+- `delete_detection = 'never'` 的 connector（如 slack）→ 永远跳过 deletion
+
+#### 7.4.1 为什么不需要阈值 / confirm 这类防护
+
+抖动导致"数据没拉全 → 误删"这件事，**根本到不了 deletion 这一步**：
+
+```
+deletion 是 sync 末尾、枚举成功之后才跑的。抖动时：
+  connector.sync() 拉一半挂 → raise → sync_job 标 failed → 流程到不了 ⑦ → 不删
+  或连续 fatal → circuit breaker (§7.1) abort → 同样到不了 ⑦ → 不删
+```
+
+所以**靠 retry + circuit breaker + connector 契约就挡住了抖动**，不用再叠 50% 阈值这种难调的数字。手动误删（用户改 config 缩小 scope）则是用户的选择，framework 不拦。
+
+唯一能骗过这套的是 connector 拉一半出错、自己 catch 了假装拉完——这是 connector bug，由契约（§7.4.3）禁止，不靠 framework 兜。
+
+万一真有 connector bug 漏报导致误删，[§10.4 transformation cache](#104-transformation-cache计算缓存) 让恢复变便宜：下次正确 sync 重新 yield → re-chunk + cache 命中 → 零 API 钱 + 秒级恢复。cache 是这里的**兜底，不是删除前的前置闸门**。
+
+#### 7.4.2 几种 connector 的 deletion 行为
+
+| Connector | sync 模式 | `delete_detection` | 实际行为 |
+|---|---|---|---|
+| `file` (本机 / CS) | 每次都是 full scan + manifest diff | `'full_scan_diff'` | 每次 sync 都能推断删除 |
+| `postgres rows` | 增量 cursor + 周期 full PK diff | `'periodic_full_scan'` | 增量跑时跳过；周期 full 跑时推断删除 |
+| `slack messages` | ts cursor 单调推进 | `'never'` | 永远跳过 deletion（消息不会被删的语义）|
+| `github issues` | updated_at cursor | `'state_change'` | closed/locked 走 yield "modified"，不删 |
+| `gdrive` | changes API | `'explicit'` | changes API 报 delete 时 yield "deleted" |
+| `s3` | list + 周期 full list | `'periodic_full_scan'` | 同 postgres rows |
+
+`delete_detection` 是 connector 作者在代码 `Capabilities` 里声明的**能力事实**（不是用户配置），完整枚举见 [07 §3](07-contributing-connector.md#3-connectorplugin-契约)。新 connector 不声明默认 `'explicit'`（最保守，只删上游明确报删的）。
+
+#### 7.4.3 Connector 枚举契约
+
+deletion 推断的正确性全靠这条契约：
+
+> **full scan 模式下，connector.sync() 要么完整枚举整个全集，要么 raise。不准拉到一半静默返回部分结果。**
+
+理由：full scan 的删除推断是 `objects 表 - 本次 yield 全集`。如果 connector 因为分页中断 / API 抖动只 yield 了部分就正常返回，framework 会把没 yield 的当成"删了"——误删。
+
+正确做法：
+
+- 分页拉取中途出错 → 把异常抛出去，让 sync_job 失败、state 不 commit、下次重跑
+- 用 `self.state.checkpoint()`（§5.6）保住已推进的 cursor，重跑不必从头
+- **绝不** `try/except: pass` 后继续正常返回
+
+incremental 模式不受这条约束（它本来就不做删除推断）。
+
+#### 7.4.4 失败恢复
+
+deletion step 自身失败（中途 DB error / 网络断）时：
+
+- 没真删的 chunk 留着，下次 full sync 重新进 to_delete 集合再试
+- chunk_id 幂等 + transformation cache 命中 → 即便重删重建也不损坏、不烧钱
+- 最坏是延后一次恢复
 
 ## 8. 并发协调
 
@@ -706,9 +861,9 @@ CREATE UNIQUE INDEX ux_connector_jobs_one_queued
    ⑤ remove_job 从 'queued' → 'running'，开始清理：
         Milvus:    DELETE WHERE namespace_id = X AND connector_uri = <root>
                    （按 partition_key 路由，只扫该 connector 的桶，不是全表）
-        Object store: 删 cache + staging files/
-        Metadata DB:  删 caches / objects / connector_state /
-                          upload_manifests / object_tasks / connector_jobs
+        Object store: 删 artifact cache + staging files/
+        Metadata DB:  删 artifact_cache / objects / connector_state /
+                          file_state / object_tasks / connector_jobs
    ⑥ connectors 表行 DELETE
    ⑦ remove_job 标 'succeeded'
 ```
@@ -872,16 +1027,18 @@ objects (
   INDEX (connector_id, parent_path)
 );
 
-caches (
+-- artifact cache：per-object 派生产物（按 object_uri 寻址，给 cat/head/chunker 用）
+-- 与之对应的 transformation cache 是 v0.5+ 的按 content_hash 寻址的计算缓存，见 [06 §10.1]
+artifact_cache (
   namespace_id    VARCHAR DEFAULT 'default',
   object_uri      VARCHAR,
-  cache_kind      VARCHAR,
+  artifact_kind   VARCHAR,
   storage_path    VARCHAR,
   fingerprint     VARCHAR,
   size_bytes      INTEGER,
   built_at        TIMESTAMP,
   last_accessed   TIMESTAMP,
-  PRIMARY KEY (namespace_id, object_uri, cache_kind)
+  PRIMARY KEY (namespace_id, object_uri, artifact_kind)
 );
 
 -- 任务队列
@@ -934,26 +1091,35 @@ watch_grants (
   granted_at      TIMESTAMP
 );
 
--- Upload flow（client → server 上传本地文件）
-upload_manifests (
+-- file connector 专属状态表（替代旧 upload_manifests + connector_state 里的 manifest blob）
+-- 其他 connector 的状态走 connector_state K/V 表（见上面），不用 file_state
+file_state (
+  namespace_id    VARCHAR DEFAULT 'default',
   connector_id    VARCHAR REFERENCES connectors(id),
   path            VARCHAR,
   size            INTEGER,
   mtime_ns        BIGINT,
-  sha1            VARCHAR,
-  last_commit_at  TIMESTAMP,
-  PRIMARY KEY (connector_id, path)
+  inode           BIGINT,                   -- 平台不可信时为 NULL（详见 04 §5.5）
+  sha1            VARCHAR(40),
+  status          VARCHAR,                  -- 'staged' | 'indexed'
+  renamed_from    VARCHAR,                  -- 仅 commit 步刚写入 rename 后存在；
+                                            -- sync 完成 chunk_id rewrite 后清空
+  staged_at       TIMESTAMP,                -- commit 步写入
+  indexed_at      TIMESTAMP,                -- sync 完成时写入
+  PRIMARY KEY (namespace_id, connector_id, path)
 );
-
-upload_staging (
-  temp_file_id    VARCHAR PRIMARY KEY,
-  connector_id    VARCHAR,
-  storage_path    VARCHAR,
-  size_bytes      INTEGER,
-  uploaded_at     TIMESTAMP,
-  expires_at      TIMESTAMP                 -- 默认 1h 后自动清理未 commit 的
-);
+CREATE INDEX ix_file_state_staged
+  ON file_state (namespace_id, connector_id, status)
+  WHERE status = 'staged';
 ```
+
+v0.4 上传协议是单次 PUT（同一个请求里发字节 + 改状态，详见 [§4.2 ④](#42-本地文件-upload-flow不共享-fs-时)），不需要跨请求追踪 temp upload；连接断开 = 整个 PUT 失败 = server 不留任何痕迹。v0.5+ 加分块续传 / 大文件断点续传时再引入 `upload_staging` 表跟踪 `temp_file_id`。
+
+`file_state` 跟其他 connector 的 `connector_state` K/V 不一样：
+
+- `connector_state` 是任意 schema 的 K/V，适合 cursor / etag / token 这类小状态
+- `file_state` 是结构化表，每 path 一行，支持按 status 索引和 commit 协议直接 UPSERT
+- 只有 file connector 用 file_state，其他 connector （postgres / slack / github 等）不需要——它们 retry 时靠 cursor + chunk_id 幂等 + fingerprint chain 就够了，不存在"客户端传字节给服务端"这个中间环节
 
 所有顶层表都以 `namespace_id` 作为物理分区主键。v0.5+ 多租户上线只加 mapping 表，底层 schema 不动。
 
@@ -961,25 +1127,27 @@ upload_staging (
 
 存两类东西：
 
-- **cache 文件**：每个有 cache 的 object 的产物（每个 object 通常只对应一个 cache_kind）
+- **artifact cache 文件**：每个有 artifact cache 的 object 的派生产物（每个 object 通常只对应一个 artifact_kind）
 - **upload staging**：client 上传的 zip bundle + 解压后的文件树（仅 §4.2 upload flow 用）
 
-cache_kind 跟 object 类型的对应：
+> **transformation cache**（按 content_hash 寻址的计算缓存）跟这里的 artifact cache 是不同的两层，物理上也分开（独立 SQLite 文件），详见 [§10.4](#104-transformation-cache计算缓存)。
 
-| object 类型 | cache_kind | 例子 |
+artifact_kind 跟 object 类型的对应：
+
+| object 类型 | artifact_kind | 例子 |
 |---|---|---|
-| PDF / DOCX 等可转 markdown | `converted_md` | `manual.pdf` 的 markdown 缓存 |
+| PDF / DOCX 等可转 markdown | `converted_md` | `manual.pdf` 的 markdown |
 | DB rows / API records 集合 | `page_cache.jsonl` | DB 物化页 |
-| DB rows 的 head 预拉取 | `head_cache.jsonl` | 前 100 行预 cache，加速 head 命中 |
+| DB rows 的 head 预拉取 | `head_cache.jsonl` | 前 100 行预拉取，加速 head 命中 |
 | 图片 | `vlm_text` | 图片 VLM description |
 | DB schema dump | `schema_dump.json` | postgres schema.json 的物化 |
-| markdown / code / 纯文本真实文件 | **无 cache** | 直接 read |
+| markdown / code / 纯文本真实文件 | **无 artifact cache** | 直接 read |
 
 目录布局（**按 namespace_id 切**）：
 
 ```
 ~/.mfs/cache/
-  caches/
+  artifacts/                                 ← artifact cache 物理目录
     <namespace_id>/                          ← v0.4 恒为 "default"
       <sha1(./repo/manual.pdf)>/
         converted_md
@@ -991,14 +1159,14 @@ cache_kind 跟 object 类型的对应：
         schema_dump.json
   uploads/
     <namespace_id>/<connector_id>/
-      <temp_file_id>.zip                     ← commit 后删
+      <request_id>.zip                       ← 单次 PUT 请求期间临时存在，处理完即删
   files/
-    <namespace_id>/<connector_id>/           ← upload flow 解压后的真实文件树，作为 cache 保留
+    <namespace_id>/<connector_id>/           ← upload flow 解压后的真实文件树
       src/cli.py
       README.md
 ```
 
-按 namespace_id 切的原因：cache 内容来自 object_uri 的 sha1，但两个 namespace 可能注册同名 connector → object_uri 相同 → cache key 撞。v0.4 单 namespace 只是 `default/` 一层，没成本；v0.5+ 已经物理隔离不需要重组。
+按 namespace_id 切的原因：artifact 内容来自 object_uri 的 sha1，但两个 namespace 可能注册同名 connector → object_uri 相同 → key 撞。v0.4 单 namespace 只是 `default/` 一层，没成本；v0.5+ 已经物理隔离不需要重组。
 
 #### 后端选择
 
@@ -1022,15 +1190,16 @@ S3 看起来比本地慢，但仍然远比 connector 重新拉取外部 API 快�
 不做"S3 + 本机磁盘两级 cache"——v0.4 用户察觉不到 50ms 区别，ROI 不值。
 
 ```toml
-[cache]
+[artifact_cache]
 max_size_gb = 10
 eviction = "lru"
 
 [upload]
 max_bundle_size_mb = 500
 staging_path = "uploads/"
-staging_expiry_hours = 1
-per_namespace_quota_gb = 0           # 0 = 不限；多租户部署可按 namespace 设
+# staging_expiry_hours 不需要——v0.4 单次 PUT 设计下 temp upload 是请求级，
+#                      失败即清除，没有跨请求残留
+# per_namespace_quota_gb 在 v0.5+ 多租户上线后引入，v0.4 不预留 toml 配置项
 ```
 
 ### 10.3 Milvus
@@ -1075,6 +1244,251 @@ uri = "~/.mfs/milvus.db"               # 默认 Lite
 ```
 
 v0.4 整个 MFS 一张 `mfs_chunks` collection，所有 namespace / connector 共享，用 partition_key 物理分桶 + namespace_id scalar filter 隔离。多 collection 切分策略（per_connector / per_namespace）是 v0.5+ 看数据量规模再做的事，会带配套迁移工具一起设计，v0.4 不预留配置项以免误用。
+
+### 10.4 Transformation cache（计算缓存）
+
+跟 §10.2 的 **artifact cache** 是不同层的两套机制，**职责完全独立、物理上也分文件**。两层都叫 cache 但解决不同问题：
+
+| 维度 | artifact cache（§10.2）| transformation cache（本节）|
+|---|---|---|
+| key | `(namespace_id, object_uri, artifact_kind)` | `sha1(input + kind + provider + model + version + config)` |
+| 谁用 | `cat / head / chunker` 读派生产物 | `embedder / vlm / summary client` 跳过 API 调用 |
+| 物理存储 | metadata DB `artifact_cache` 表 + object store `artifacts/` 目录 | 独立 SQLite `~/.mfs/transformation_cache.db` |
+| 命中场景 | 同对象重复访问 | 跨对象 / 跨连接器 / 跨 namespace 的内容重复 |
+| 丢失代价 | 重跑 converter / vlm / summary（要花 API 钱）| Milvus 行还在的话基本没影响 |
+| 设计目的 | I/O 服务（按对象寻址快速读）| 纯函数 memoization（按内容寻址跳过计算）|
+
+v0.4 覆盖三类 transformation：
+
+| Kind | 输入 | 输出 | 单次成本 | 期望命中率 |
+|---|---|---|---|---|
+| **embedding** | chunk text | dense vector | ★★★ 真烧钱 | 高（boilerplate / 跨文件重复段落多）|
+| **vlm** | image bytes | description text | ★★★ 真烧钱 | 中（同图复用少，attachment 重复多）|
+| **summary** | long text | summary text | ★★ 烧钱 | 中 |
+
+不覆盖 **converter**（PDF→md 等）——它的产物已经按 object_uri 进 artifact cache，跨 connector 同 PDF 的场景少，引入需要 BLOB 大文件特殊处理，v0.5+ 再做。
+
+#### 10.4.1 Schema
+
+独立 SQLite 文件，**不进 metadata DB**：
+
+```sql
+-- ~/.mfs/transformation_cache.db
+transformation_cache (
+  cache_key       VARCHAR(64) PRIMARY KEY,    -- sha1(input + kind + provider + model + version + config)
+  kind            VARCHAR(16),                -- 'embedding' | 'vlm' | 'summary'
+  input_hash      VARCHAR(40),                -- sha1(input)，调试用
+  provider        VARCHAR(32),                -- 'openai' / 'voyage' / 'google' / ...
+  model           VARCHAR(64),
+  model_version   VARCHAR(32),
+  output_bytes    BLOB,                       -- embedding: float32 packed；vlm/summary: utf-8 text
+  output_size     INTEGER,
+  hit_count       INTEGER DEFAULT 0,
+  created_at      TIMESTAMP,
+  last_hit_at     TIMESTAMP
+);
+CREATE INDEX ix_tx_lru ON transformation_cache (last_hit_at);
+CREATE INDEX ix_tx_kind ON transformation_cache (kind);
+```
+
+`cache_key` 是单一 sha1 哈希主键，所有维度（输入内容、kind、模型、版本、prompt/config 等）都揉进去 hash。这样 lookup 是 `WHERE cache_key IN (...)` 一句 SQL，不需要多列匹配。
+
+**为什么独立 DB 文件**：
+
+- cache 写量大（每次 sync 几千到几万行），跟 metadata DB 共用会拖累事务关键路径
+- LRU eviction 频繁删/insert，跟核心 schema 隔离
+- 丢失或清空 cache 不影响业务正确性，独立文件方便整体重置
+- WAL mode 多读单写，跟 ingest worker 并发友好
+
+```python
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")  # cache best-effort，不要 FULL
+```
+
+#### 10.4.2 Client 包装层
+
+每个 `BatchingXxxClient`（§6.4）外面再包一层 `CachingXxxClient`，对 worker 透明：
+
+```python
+class CachingEmbeddingClient:
+    """worker 实际调这个。lookup cache → miss 进 BatchingEmbeddingClient → 写回 cache"""
+
+    def __init__(self, cache: TransformationCache,
+                 batcher: BatchingEmbeddingClient,
+                 provider: str, model: str, version: str):
+        ...
+
+    async def batch_embed(self, texts: list[str]) -> list[Vector]:
+        # 1) 算 cache_key
+        keys = [self._key(t) for t in texts]
+
+        # 2) 一次 SQL IN-clause 拿到所有命中
+        cached = await self.cache.batch_get(keys)
+
+        # 3) miss 进 batcher 跑真 API（micro-batcher 自动攒 batch）
+        miss_idx = [i for i, k in enumerate(keys) if cached[k] is None]
+        miss_vecs = await self.batcher.embed_many([texts[i] for i in miss_idx])
+
+        # 4) 异步写回 cache（不阻塞，主流程继续）
+        self.cache.enqueue_put([(keys[miss_idx[j]], v)
+                                for j, v in enumerate(miss_vecs)])
+
+        # 5) 拼回原顺序
+        result: list[Vector] = [None] * len(texts)
+        miss_iter = iter(miss_vecs)
+        for i, k in enumerate(keys):
+            result[i] = decode_vec(cached[k]) if cached[k] is not None else next(miss_iter)
+        return result
+
+    def _key(self, text: str) -> str:
+        return sha1(f"{sha1(text)}|embedding|{self.provider}|{self.model}|{self.version}".encode()).hexdigest()
+```
+
+`CachingVlmClient` / `CachingSummaryClient` 同模式。worker 只跟 `CachingXxxClient` 打交道，不感知 cache 是否启用——`[transformation_cache] enabled = false` 时这一层退化成透明 passthrough。
+
+#### 10.4.3 异步 batch writer
+
+cache 写**不进主流程关键路径**——主流程 enqueue 后立即返回，后台 task 定期 flush：
+
+```python
+class AsyncCacheWriter:
+    def __init__(self, db: sqlite3.Connection, flush_interval_s: float, buffer_max: int):
+        self.buffer: list[tuple] = []
+        self.lock = asyncio.Lock()
+        asyncio.create_task(self._flush_loop())
+
+    def enqueue(self, entries: list[tuple]):
+        self.buffer.extend(entries)
+        if len(self.buffer) >= self.buffer_max:
+            asyncio.create_task(self._flush())   # 满了直接触发一次
+
+    async def _flush_loop(self):
+        while True:
+            await asyncio.sleep(self.flush_interval_s)
+            await self._flush()
+
+    async def _flush(self):
+        async with self.lock:
+            if not self.buffer:
+                return
+            batch, self.buffer = self.buffer, []
+        await db.executemany(
+            "INSERT OR REPLACE INTO transformation_cache "
+            "(cache_key, kind, input_hash, provider, model, model_version, "
+            " output_bytes, output_size, created_at, last_hit_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            batch
+        )
+```
+
+容错性：buffer 没 flush 就 crash → 那一批 cache 丢了，**下次同样的 text 来还能 hit Milvus 那条 row 复用 vector；最坏 case 是重算一次 embedding，没数据损坏**。Cache 整套都是 best-effort 优化。
+
+#### 10.4.4 LRU eviction
+
+不在每次写时跑，**后台 task 周期清理**：
+
+```python
+async def eviction_loop():
+    while True:
+        await asyncio.sleep(config.eviction_interval_s)
+        size = await db.fetchone("SELECT sum(output_size) FROM transformation_cache")[0]
+        if size > config.max_size_bytes:
+            # 删 oldest 20%，水位下到 80%
+            await db.execute("""
+                DELETE FROM transformation_cache WHERE cache_key IN (
+                    SELECT cache_key FROM transformation_cache
+                    ORDER BY last_hit_at ASC
+                    LIMIT CAST((SELECT count(*) * 0.2 FROM transformation_cache) AS INTEGER)
+                )
+            """)
+```
+
+超额几百 MB 没事，10 分钟跑一次清理足够。
+
+#### 10.4.5 跟 fingerprint chain 的关系
+
+**互补不冲突**——两者解决不同粒度的"我做过吗"：
+
+```
+fingerprint chain (04 §5.2)        transformation cache (本节)
+──────────────────────             ─────────────────────────
+per-object 决定                     per-input 决定
+"chunk_fp/embedding_fp 变了吗？"    "embed(text, model) 做过吗？"
+变了 → 真处理                       做过 → 零 API
+没变 → 跳过整个对象                 没做过 → 调 API + 写 cache
+```
+
+- 同对象重复 sync 命中率高的是 fingerprint chain（整对象短路）
+- 跨对象 / 模型回滚 / Milvus 重建 命中率高的是 transformation cache（per-call 复用）
+
+举例：换 embedding model `text-embedding-3-small → text-embedding-3-large`：
+
+1. fingerprint chain：所有 `embedding_fp` 失效 → 触发 re-embed
+2. re-embed 跑到时进 `CachingEmbeddingClient`
+3. cache 里 `(text, small)` 都在但 `(text, large)` 全 miss → 真打 API
+4. API 跑完写回 cache → 下次换回 small 时反而能命中
+
+#### 10.4.6 跟 deletion 策略的协同
+
+transformation cache 在 deletion 里只扮演**兜底恢复**的角色，不是删除前的前置检查：
+
+```
+没 cache 时：
+  误删 chunk → 恢复要重打 embedding API → 真花钱
+
+有 cache 时：
+  误删 chunk → 下次正确 sync 重 chunker + cache 命中 → 零 API + 秒级恢复
+```
+
+deletion 本身的判断很简单（详见 [§7.4](#74-deletion-策略)）：incremental sync 不删；full scan sync 用全集 diff 推断删除；explicit "deleted" event 任何模式直接删。**没有 pre-flight cache 检查、没有 50% 阈值、没有 confirm 命令**——抖动靠 retry/circuit-breaker + connector 枚举契约挡住，到不了 deletion；真有 connector bug 漏报误删，cache 让恢复变便宜就够了。
+
+#### 10.4.7 配置
+
+```toml
+# server.toml
+[transformation_cache]
+enabled = true                        # 全局开关，false 时退化成透明 passthrough
+db_path = "~/.mfs/transformation_cache.db"
+max_size_gb = 5                       # LRU 上限
+eviction_interval_s = 600             # 10 min 跑一次清理
+write_flush_interval_s = 2            # 异步 writer 每 2s flush 一次
+write_buffer_max = 5000               # buffer 满这么多项就提前 flush
+lookup_batch_size = 1000              # 单次 SQL IN-clause 上限
+```
+
+**典型 cache 体积**：
+
+| 内容 | 单条大小 | 1M 条规模 |
+|---|---|---|
+| embedding (1536 dim × float32) | ~6 KB | ~6 GB |
+| vlm description | ~800 B | ~800 MB |
+| summary | ~2 KB | ~2 GB |
+
+5 GB max 适合个人 / 中等团队。CS 部署可调到几十 GB，反正 SQLite + LRU eviction 撑得住。
+
+#### 10.4.8 Observability
+
+```bash
+mfs status --transformation-cache --json
+```
+
+```json
+{
+  "enabled": true,
+  "db_path": "~/.mfs/transformation_cache.db",
+  "size_bytes": 3284902341,
+  "entry_count": 542183,
+  "hit_rate_7d": 0.78,
+  "evictions_24h": 12453,
+  "by_kind": {
+    "embedding": {"entries": 489102, "hit_rate_7d": 0.81},
+    "vlm":       {"entries":  21044, "hit_rate_7d": 0.65},
+    "summary":   {"entries":  32037, "hit_rate_7d": 0.71}
+  }
+}
+```
+
+`hit_rate` 在 60-90% 算正常。低于 50% 且长期持续可能说明数据多样性高、cache 收益有限，可以调小 `max_size_gb` 把空间还给其他用途。
 
 ## 11. 凭据
 
