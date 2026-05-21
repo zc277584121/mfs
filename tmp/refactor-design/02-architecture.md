@@ -239,6 +239,31 @@ HTTP API 主要走 control plane（路径、option、状态、搜索结果），
 
 概念上跟本地模式统一：两种模式都是 **reality vs `file_state`** 的 stat-first 对比，差别只在 reality 怎么到达 server——本地模式 server 直接读盘，CS 模式经过下面的上传协议把字节落到 staging area。对比逻辑和 file_state 一张表，两边共用。
 
+```mermaid
+sequenceDiagram
+    participant C as Client (CLI)
+    participant S as Server
+    participant FS as file_state 表
+    participant W as Worker
+
+    Note over C: ① scan，只取 stat(path,size,mtime,inode)，不算 sha1
+    C->>S: ② POST /v1/files/manifest（只发 stat 列表）
+    S->>FS: 按 (size,mtime) 比对
+    FS-->>S: 全等→跳过 / 不等→need_sha1
+    S-->>C: need_sha1 + deletion_candidates(带 sha1/inode)
+    Note over C: ③ 对 need_sha1 算 sha1；inode 配对识别 rename
+    C->>S: ④ PUT /v1/files/upload<br/>hashes + renames + deletions + bundle.zip
+    Note over S: commit（一个事务）
+    S->>FS: 验 hashes/renames，UPSERT staged 行 + 处理 deletions
+    S->>W: 触发 file connector sync_job
+    S-->>C: job_id（client 到此结束）
+    Note over W: ⑤ 后台异步
+    W->>FS: 读 status='staged' → chunk → embed → 写 Milvus
+    W->>FS: 完成 status='indexed'
+```
+
+逐步文字版：
+
 ```
 ① client scan: os.walk + stat，拿 (path, size, mtime_ns, inode)
    纯 stat 操作，不算 sha1。1M 文件几秒钟。
@@ -452,12 +477,18 @@ SQLite 路径建议 `concurrency = 1`，多 worker 在 SQLite 上互相 serializ
 
 **三层叠加**，对 worker 透明：
 
+```mermaid
+flowchart LR
+    w["worker_loop<br/>一批 N 个 task 并行 chunk"] --> cc["CachingEmbeddingClient<br/>(§10.4)"]
+    cc -->|"cache hit"| out["vector"]
+    cc -->|"cache miss"| bc["BatchingEmbeddingClient<br/>micro-batcher 攒 batch"]
+    bc --> api["外部 embedding API"]
+    api --> out
+    cc -.->|"miss 结果异步写回"| tcache[("transformation cache")]
+    out --> mv["batch 写 Milvus"]
 ```
-worker_loop
-  └── 第三层: CachingXxxClient   (§10.4 transformation cache)
-       └── 第二层: BatchingXxxClient   (micro-batcher)
-            └── 外部 API call
-```
+
+worker 只调最外层 `CachingEmbeddingClient`，里面三层各管各的：cache 命中直接出向量，miss 才进 micro-batcher 攒 batch 调 API，结果再异步回写 cache。embedding / VLM / summary 各有一套同构的三层。
 
 **第一层：worker 一次拉 N 个 task，并行处理**
 

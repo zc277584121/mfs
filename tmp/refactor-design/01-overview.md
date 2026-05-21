@@ -30,38 +30,79 @@ Chunk          ─ Milvus 一行：能被 search/grep 召回的最小单元
 
 ## 系统全景
 
-```
-            ┌────────────────── Client ──────────────────┐
-            │ mfs CLI / Python SDK / Skill                │
-            │   parse args · profile · HTTP transport      │
-            └──────────────────┬──────────────────────────┘
-                               │  HTTP /v1（主要是 control plane）
-                               ▼
-            ┌────────────────── Server ──────────────────┐
-            │  API routes  →  Engine  →  Connector        │
-            │      │            │            │            │
-            │      └──→  Object Processor →  Common       │
-            │                                Service      │
-            │                                (embed/VLM)  │
-            │                       │                     │
-            │                       ▼                     │
-            │   ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-            │   │ Metadata │  │  Object  │  │  Milvus  │ │
-            │   │   DB     │  │  store   │  │ 一张表   │ │
-            │   │          │  │(artifact)│  │          │ │
-            │   └──────────┘  └──────────┘  └──────────┘ │
-            └─────────────────────────────────────────────┘
+### 高层抽象
+
+```mermaid
+flowchart TB
+    subgraph C["Client（薄 · 近乎零状态）"]
+        direction LR
+        cli["mfs CLI<br/>Rust 单 binary"]
+        sdk["SDK<br/>Py / TS / Go / Java"]
+        skill["Agent Skill<br/>SKILL.md + PROMPTs"]
+    end
+
+    C ==>|"HTTP /v1（control plane）"| api
+
+    subgraph S["Server（重 · 所有重活）"]
+        direction TB
+        api["API routes"]
+        eng["Engine · 业务编排：路由 → 起 job → 调插件"]
+        conn["Connectors · file / web / postgres / slack / ...<br/>list · stat · read · fingerprint · sync"]
+        proc["Object Processors · 按 object_kind 加工"]
+        comm["Common Services · embedding · VLM · summary · retrieval"]
+        q["DB 任务队列 + Worker pool"]
+        api --> eng --> conn --> proc --> comm --> q
+    end
+
+    q --> meta[("Metadata DB<br/>SQLite / Postgres")]
+    q --> obj[("Object store<br/>artifact cache")]
+    q --> mv[("Milvus<br/>一张 collection")]
+    q --> tc[("Transformation cache<br/>独立 SQLite")]
 ```
 
-三套存储职责清晰，互不重叠：
+CLI 跟 server 走 HTTP、互相不 import。server 按层组织：API → Engine 编排 → Connector 拉数据 → Processor 加工 → Common Service 提供 embedding/VLM/检索 → 四套存储落地。
+
+### 放大：`mfs add` 一次同步里发生了什么
+
+```mermaid
+flowchart TB
+    A["mfs add"] --> B{"路径解析"}
+    B -->|"本地 path"| C["file connector"]
+    B -->|"外部 URI"| D["对应 connector plugin"]
+    C --> E
+    D --> E["connector.sync()<br/>流式 yield ObjectChange<br/>added · modified · deleted · renamed"]
+    E --> F["Reconcile · fingerprint chain 逐层比对<br/>upstream → artifact → chunk → embedding<br/>哪层 fp 变了入队哪层"]
+    F --> G["Sweep · config-hash gate<br/>捕获 framework 配置变化（换 embedding 模型等）"]
+    G --> H
+
+    subgraph H["Worker build task（每个变化对象并行跑）"]
+        direction TB
+        h1["chunker 按 object_kind 切"] --> h2{"transformation<br/>cache 命中?"}
+        h2 -->|"hit"| h3["复用 vector · 零 API"]
+        h2 -->|"miss"| h4["调 embedding / VLM / summary"]
+        h4 --> h5["异步写回 cache"]
+        h3 --> h6
+        h5 --> h6["batch 写 Milvus"]
+    end
+
+    H --> I["Deletion reconcile<br/>incremental 跳过 / full scan 全集 diff / explicit deleted"]
+    I --> J["commit connector state · 更新 job 状态"]
+```
+
+每个方框背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，fingerprint chain 见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)，transformation cache 见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
+
+### 四套存储
+
+职责清晰，互不重叠：
 
 | 存什么 | 存在哪 | 目的 |
 |---|---|---|
-| Connector / Object / artifact cache / Job 关系 + 状态 | Metadata DB（SQLite 或 Postgres） | path index、状态、变化检测 |
+| Connector / Object / artifact cache / Job 关系 + 状态 | Metadata DB（SQLite 或 Postgres） | path index、状态、变化检测，兼当任务队列 |
 | Artifact cache 字节（converted markdown / page cache / VLM description） | Object store（本地 fs / S3 / R2 / MinIO） | 让 `cat / head / tail` 不打回 connector |
-| 可检索的 chunk | Milvus 一张 collection | search / grep 召回 |
+| 可检索的 chunk（dense vector + BM25） | Milvus 一张 collection | search / grep 召回 |
+| embedding/VLM/summary 计算结果（按 content_hash 寻址） | Transformation cache（独立 SQLite） | 跨对象复用 API 结果，避免重复花钱 |
 
-具体后端由 server 配置决定，跟 client 端 profile 无关。
+前三套是面向数据的主存储；第四套 transformation cache 是纯计算缓存（用户感知不到）。具体后端由 server 配置决定，跟 client 端 profile 无关。
 
 ## 设计哲学与原则
 
@@ -129,7 +170,20 @@ MFS 第一受众是 **agent**，不是人。所以主接口是 **shell-native CL
 
 删除是其中最微妙的一块：增量同步**推不出删除**（"没 yield" 只代表"没变"，不代表"删了"），只有全量扫描的 diff 或上游明确的 delete 信号才能确定删除。详见 [02 §7.4](02-architecture.md#74-deletion-策略)。
 
-### 7. 抽象分层 + 框架/贡献者分工：为社区贡献而设计
+### 7. 一切操作幂等，恢复模型因此极简
+
+MFS 把"幂等"当成贯穿全局的硬约束，每一个操作都能安全地重复执行：
+
+- `mfs add` 再跑 = 再同步一次（注册 + 同步同一个入口，幂等）
+- `chunk_id = sha1(namespace + connector + object_uri + locator + chunk_kind)` 内容寻址——写 chunk = DELETE + INSERT，任何 worker / 重试 / 并发对同一 chunk_id 的写都等效
+- `mfs remove` 幂等（目标状态就是"消失"，重复 remove 仍然成功）
+- per-object 原子 + state 末尾提交：中途崩溃 → state 不 commit → 下次从上个成功点重跑
+
+正因为处处幂等，**整个故障恢复模型坍缩成一句话："重跑 = 下次 `mfs add`"**——没有 `job retry` 命令、没有断点续传的复杂状态机、没有"我跑到哪了"的细粒度记录。崩了就重来，结果一致。
+
+这条还是前面好几个设计敢做简单的底气：deletion 敢激进（重删重建不损坏）、transformation cache 敢做 best-effort（丢了重算就行）、抖动敢直接 abort（下次重跑）——全都建立在"重复执行无害"之上。
+
+### 8. 抽象分层 + 框架/贡献者分工：为社区贡献而设计
 
 整个架构最核心的张力是：**统一公共部分，隔离差异部分**。差异部分越薄，贡献一个新数据源越容易。
 
