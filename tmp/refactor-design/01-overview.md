@@ -14,13 +14,15 @@ MFS 是 **Multi-source File-like Search**：让 agent 用一套 shell-native CLI
 ## 四个核心抽象
 
 ```
-Connector  ─ 一个注册的数据连接器       postgres://prod / ./repo / slack://eng
-Object     ─ connector 暴露的一条虚拟文件（path + media_type）
-Cache      ─ 一个 object 的本地缓存字节（可选，让 cat/head/tail 不打回 connector）
-Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
+Connector      ─ 一个注册的数据连接器       postgres://prod / ./repo / slack://eng
+Object         ─ connector 暴露的一条虚拟文件（path + media_type）
+Artifact cache ─ 一个 object 的派生缓存字节（可选，让 cat/head/tail 不打回 connector）
+Chunk          ─ Milvus 一行：能被 search/grep 召回的最小单元
 ```
 
 整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 artifact cache（PDF→md / 图片→VLM 描述 等派生产物）和 chunks。
+
+（还有一层 **transformation cache** 是纯内部计算缓存，用户感知不到，详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。）
 
 **本地文件也是一种 connector**：scheme 是 `file`，用户写普通 path 即可。`postgres connector` / `slack connector` / `file connector` 在概念上一视同仁——同样的 list / stat / read / fingerprint 契约，同样的 chunk pipeline，同样的搜索能力。
 
@@ -55,11 +57,101 @@ Chunk      ─ Milvus 一行：能被 search/grep 召回的最小单元
 
 | 存什么 | 存在哪 | 目的 |
 |---|---|---|
-| Connector / Object / Cache / Job 关系 + 状态 | Metadata DB（SQLite 或 Postgres） | path index、状态、变化检测 |
+| Connector / Object / artifact cache / Job 关系 + 状态 | Metadata DB（SQLite 或 Postgres） | path index、状态、变化检测 |
 | Artifact cache 字节（converted markdown / page cache / VLM description） | Object store（本地 fs / S3 / R2 / MinIO） | 让 `cat / head / tail` 不打回 connector |
 | 可检索的 chunk | Milvus 一张 collection | search / grep 召回 |
 
 具体后端由 server 配置决定，跟 client 端 profile 无关。
+
+## 设计哲学与原则
+
+这一节讲"为什么是这套架构"，是理解后面所有细节文档的底座。
+
+### 1. 客户端薄，重量全压服务端
+
+所有重活——拉数据、转 markdown、切 chunk、调 embedding、写索引、存储——都在 server。client（CLI / SDK）只做四件轻事：解析参数、解析 profile、HTTP transport、渲染输出。
+
+为什么这么分：
+
+- **agent 高频循环调 CLI**，client 必须冷启动快（Rust 单 binary 几十 ms）、零状态。把重逻辑放 client 会让每次调用都背上启动成本和依赖
+- **状态集中在 server 才好做一致性**——connector 状态、索引、变化检测都是有状态的事，放一处统一管比分散到每个 client 强
+- client **几乎无持久状态**：只有 `client.toml`（profile + client_id）。连本地文件的 manifest 都不在 client，而在 server 的 `file_state` 表——client 切机器 / 重装 / Docker 重建零成本
+
+### 2. 面向 agent：CLI + Skill 为主，SDK 为辅
+
+MFS 第一受众是 **agent**，不是人。所以主接口是 **shell-native CLI**——用 agent 已经会的 POSIX 动词（`ls / cat / grep / head / tail / tree`）驱动，不发明新词汇。
+
+配套发一个 **Skill 包**（`SKILL.md` + 每个 connector 的 PROMPT），让 agent 一上来就有正确的心智模型和各 connector 的目录布局，不用试错。
+
+**SDK（Python / TS / Go / Java）是辅助**：给那些已经是程序、不方便 shell-out 调 CLI 的集成方用。CLI / SDK / Skill 三者走的是**同一套 HTTP `/v1`**，没有谁有特权路径——这保证三种入口行为一致，也意味着加一种 SDK 不影响其他。
+
+### 3. 一切皆 connector，但 file 是唯一特例
+
+统一抽象：postgres / slack / github / file 在概念上一视同仁，都实现同一套 `list / stat / read / fingerprint / sync` 契约，走同一条 chunk pipeline，得到同样的搜索能力。
+
+但 **file connector 是唯一的特例**，原因是数据**位置**：
+
+- 大多数 connector 的上游 server 够得着（server 能连 postgres、能调 slack API）→ server 直接拉
+- 只有 file，在 CS 架构下数据在 **client 那台机器上**，server 够不着 → 必须把字节**上传**过来
+
+所以 file connector 比别人多一层"上传协议"（manifest diff → zip 上传 → commit）。这层特殊性被**隔离**得很干净：file connector 的 sync 代码在本地 / CS 两种模式下完全共用，差别只在"字节怎么到达 server 的 scope"——本地直接读盘，CS 经过上传落到 staging area。详见 [02 §4.2](02-architecture.md#42-本地文件-upload-flow不共享-fs-时)。
+
+### 4. 三套存储 + 一层计算缓存，职责正交
+
+为什么不是一个大库装下一切——因为四类数据的**访问模式、持久化要求、扩展特性**完全不同，硬塞一起会互相拖累：
+
+| 存储 | 装什么 | 为什么选它 |
+|---|---|---|
+| **Metadata DB**（SQLite / Postgres） | connector / object / job 状态、path index、fingerprint、`file_state` | 需要事务 + 索引查询；还顺便**当任务队列**用（`SELECT ... FOR UPDATE SKIP LOCKED`），省掉 Redis/Celery 这种额外组件 |
+| **Object store**（fs / S3 / R2） | artifact cache 大字节（converted md / VLM 文本 / page cache）| 大 blob 该放便宜的对象存储，按 object_uri 寻址，给 cat/head 流式读 |
+| **Milvus**（一张 collection） | 可检索的 chunk（dense vector + BM25 sparse）| 向量检索需要专门的 ANN 索引，这是 Milvus 的本职 |
+| **Transformation cache**（独立 SQLite） | embedding/VLM/summary 调用结果，按 content_hash 寻址 | best-effort、高写入churn、丢了不影响正确性 → 单独文件隔离，不拖累 metadata DB 的事务关键路径 |
+
+核心原则：**source of truth 永远是上游**。Metadata DB 只是"我对上游的认知"，object store 和 Milvus 是从 fingerprint 派生出来的产物。派生层坏了的托底是 `mfs remove + mfs add` 重建。
+
+### 5. 怎么避免重复花钱：两道独立的防线
+
+两类成本，两个机制，各打各的：
+
+- **省带宽**——`file_state` per-path manifest：CS 模式下只上传变化的字节；rename 靠 inode 配对识别，mv 1GB 文件零字节上传
+- **省 API 钱**——transformation cache：内容相同 + 模型相同就复用 embedding/VLM/summary 结果，跨 object / 跨 connector / 跨 namespace 都命中，连 Milvus collection 重建、embedding model 回滚都还在
+
+这两道防线让一个看似昂贵的操作（重传、重 embed、误删后恢复）变得廉价——这也是为什么 deletion 策略敢做得简单（详见 §6）。
+
+### 6. 变化检测：上游报变化，框架补配置失效
+
+变化分两层，谁最了解谁负责：
+
+- **upstream 层变化**——外部数据本身变了。**connector 最懂自己的源**，自己探测（file 用 stat-first lazy hashing：先看 size+mtime，变了才算 sha1；DB 用 `updated_at` cursor；web 用 ETag……），通过 `ObjectChange` 流式上报 added / modified / deleted / renamed
+- **framework 层失效**——换 embedding 模型、升级 chunker、改 text_fields。connector 看上游完全没变、啥都不 yield，但下游产物其实 stale。这由 **framework 的 sweep + fingerprint chain** 捕获，connector 不用管
+
+增量同步的精髓就是**connector 只 yield 变化的部分**，framework 用 fingerprint chain 逐层比对决定哪一层产物要重做（artifact / chunk / embedding 分层失效，能复用就复用）。
+
+删除是其中最微妙的一块：增量同步**推不出删除**（"没 yield" 只代表"没变"，不代表"删了"），只有全量扫描的 diff 或上游明确的 delete 信号才能确定删除。详见 [02 §7.4](02-architecture.md#74-deletion-策略)。
+
+### 7. 抽象分层 + 框架/贡献者分工：为社区贡献而设计
+
+整个架构最核心的张力是：**统一公共部分，隔离差异部分**。差异部分越薄，贡献一个新数据源越容易。
+
+从上到下的抽象层：
+
+```
+CLI 动词 (ls/cat/grep/...)
+  → HTTP /v1                    ← 唯一的 client/server 边界
+    → Engine（业务编排）
+      → Connector plugin        ← 唯一暴露给贡献者的接缝
+        → Object Processor（按 object_kind 加工）
+          → Common Service（embedding / VLM / summary / retrieval）
+            → Storage（三套后端）
+```
+
+**framework 包办（贡献者碰不到）**：chunk 切分、embedding、summary、VLM、artifact cache、Milvus schema、检索、HTTP API、任务队列、fingerprint chain、deletion 逻辑、transformation cache。
+
+**贡献者只写一个 connector plugin**（`connectors/<name>/`，约 500–1500 行 Python）：连上游 + 认证、决定虚拟 URI 布局、实现 `stat / list / read`、变化检测（`fingerprint / sync`）、`object_kind` 映射；可选重写 grep / search 下推。
+
+契约就是 **6 个必须实现的方法 + 几个可选重写**。这条分割线是刻意画的——贡献者写完这 500 行，就免费拿到整套 chunk / embed / 检索 / 缓存 / 存储机制。
+
+**这是个为社区设计的架构**：加一个新数据源 = 写一个 connector plugin，不碰框架。目标是靠社区把 connector catalog 做大，就像 Airbyte / Singer 的 connector 生态那样。详见 [07](07-contributing-connector.md)。
 
 ## Client / Server 与 profile
 
@@ -118,7 +210,7 @@ mfs job list/inspect/cancel
 
 | # | 文档 | 内容 | 适合谁 |
 |---|---|---|---|
-| 01 | [01-overview.md](01-overview.md) | 定位、抽象、系统图、决策索引 | 所有人 |
+| 01 | [01-overview.md](01-overview.md) | 定位、抽象、系统图、**设计哲学与原则**、决策索引 | 所有人 |
 | 02 | [02-architecture.md](02-architecture.md) | client/server、profile、存储、队列、一致性、并发、多租户 | 所有人，运维和贡献者重点看 |
 | 03 | [03-cli-commands.md](03-cli-commands.md) | 16 个公开命令、行为契约、JSON envelope、错误码 | 用户、agent 集成方 |
 | 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、ingest 流程、fingerprint chain、checkpoint | 用户、贡献者 |
