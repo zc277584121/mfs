@@ -729,3 +729,32 @@ Search: partial
   }
 }
 ```
+
+### 统一外壳 + per-connector 内核
+
+envelope 的设计原则是**外壳固定、内核可变、可变的部分也被文档化**：
+
+- **固定外壳**（每个 connector 都填同样的顶层 key）：`source / lines / locator / content / score / metadata{kind, chunk_kind, connector_type, media_type, fields}`。agent 只认这层，跨 connector 一致
+- **可变内核**：`locator` 的内部结构（postgres `{schema,table,pk}` / slack `{channel,date,thread_ts}`）和 `metadata.fields` 的字段（ticket 的 status/priority、PR 的 merged_at）per-connector。但每个 connector 的 locator schema 是**文档化的稳定契约**（见 [§3](#3-locator-schema-per-connector) + `mfs connector inspect`），不是自由发挥
+
+agent 读外壳，遇到 locator 内核就查该 connector 文档化的 schema——**差异是"被文档化的差异"**。
+
+### lines 与 locator：独立、不互斥、有优先级
+
+两个都是可选字段，谁有意义填谁，**可以同时非空**：
+
+- `lines = [start, end]`：chunk 在某个文本对象里的行区间，用于 `cat <source> -n A:B` 导航
+- `locator`：容器内单元的 key 定位（row pk / thread_ts / issue number）
+
+agent 用的优先级：**locator 非空就优先用 locator**（精确单元）；只有 lines 非空才用行区间。每种 chunk_kind 填哪些是稳定契约：
+
+| chunk_kind | lines | locator | 重开方式 |
+|---|---|---|---|
+| `body`（document/code）| ✓ | null | `cat -n start:end` |
+| `row_text`（DB row / record）| null | ✓ pk | grep / export+jq by pk |
+| `thread_aggregate`（slack/discord/gmail）| 可有（在 messages.jsonl 的行）| ✓ thread_ts | **优先 locator**，lines 仅辅助 |
+| `record_aggregate`（issue+comments）| 可有 | ✓ number | **优先 locator** |
+| `vlm_description`（图片）| null | null（用 source 本身）| `cat <source> --meta` |
+| `summary` / `directory_summary` / `schema_summary` | 看来源对象 | 看来源对象 | 跟随其来源 object |
+
+`thread_aggregate` / `record_aggregate` 这种两者都有的，**locator 是权威重开 key，lines 只是定位它在 jsonl 文件里大致位置的辅助**。

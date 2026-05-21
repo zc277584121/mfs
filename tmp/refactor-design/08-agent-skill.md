@@ -124,24 +124,24 @@ agent 关心的字段：
 | `metadata.media_type` | 判断对象类型，决定下一步用什么命令 |
 | `metadata.fields` | 不打开对象就能看到的业务字段（status / priority 等） |
 
-### 从结果回到对象的两种方式
+### 从结果回到对象：locator 优先，lines 次之
 
-如果 `lines` 不为 null（document / code）：
+`lines` 和 `locator` 是**两个独立的可选字段，不互斥**——有的 chunk 两个都有（如 slack thread：既在 messages.jsonl 有行位置，又有 thread_ts locator）。agent 按这个优先级用：
 
-```bash
-mfs cat <source> -n <start>:<end>      # 直接读那段
-```
-
-如果 `locator` 不为 null（DB row / issue / ticket / thread）：
+1. **`locator` 非空 → 优先用它**精确定位单元（DB row / issue / ticket / thread）：
 
 ```bash
-# 方式 A：用 grep 找单条
-mfs grep '"id":12' <source>
-
-# 方式 B：导出后过滤（数据量大或要复杂查询）
-mfs export <source> /tmp/data.jsonl
-jq 'select(.id == 12)' /tmp/data.jsonl
+mfs grep '"id":12' <source>                 # 方式 A：grep 找单条
+mfs export <source> /tmp/data.jsonl && jq 'select(.id == 12)' /tmp/data.jsonl   # 方式 B：导出后过滤
 ```
+
+2. **只有 `lines` 非空（locator 为 null）→ 用行区间**（纯文本 / document / code）：
+
+```bash
+mfs cat <source> -n <start>:<end>           # 直接读那段
+```
+
+每种 chunk_kind 填哪些字段是稳定契约，见 [06 §15](06-search-and-retrieval.md#15-json-envelope-searchgrep)。`locator` 的内部 schema per-connector，agent 不要硬编码——遇到陌生 connector 先 `mfs connector inspect <root>` 拿它文档化的 locator schema。
 
 ## 4. 反模式
 

@@ -782,6 +782,27 @@ State is stored under ~/.mfs/.
 Continue? [y/N]
 ```
 
+### 7.1 跨重启恢复
+
+watch 是 daemon 内存里的状态，daemon 挂了/机器重启就没了。靠 `watch_grants` 表（02 §10.1）持久化、daemon 启动时 replay 重建：
+
+```
+daemon 启动:
+  for grant in SELECT path FROM watch_grants:
+    重新登记 watcher（无需再弹权限确认，grant 已记录授权）
+  → mfs serve restart / 机器重启后 daemon 起来，watch 自动续上
+```
+
+为什么这件事不大：
+
+- **watch 只在本机 profile 有意义**——生产 CS 部署根本不用 watch，用 scheduler（§9）周期触发。所以"daemon 重启 watch 丢"在生产场景不存在
+- **就算 watch 真断了一阵也不丢数据**：watch 只是"触发信号"，最终事实来自 scan + manifest 对比（§5.5）。断的这段时间发生的改动，下次 `mfs add`（或 daemon 重启 replay 后第一次扫）会全量对比补上
+- **已索引的成果都在 DB / Milvus，重启不丢**：connector_state（cursor）、file_state、Milvus chunks 都持久化；in-flight 的 `running` job 靠 heartbeat 超时（02 §7.1）重置 pending、幂等重跑
+
+想要本机 daemon 开机常驻（这样 watch 一直活着）的用户，自己挂个 launchd（macOS）/ systemd user unit（Linux）拉起 `mfs serve`，配合上面的 watch_grants replay 就无缝。`MFS_AUTOSTART=1` 只在首次 `mfs add` 检测不到 server 时 spawn 一次，不保证常驻。
+
+> 生产 server（非 watch 场景）的重启恢复是另一回事：server 一般拆成 `mfs-api` + `mfs-worker` 跑在各自 Docker/K8s Pod 里，进程挂了编排器拉起来，状态全在外部 DB，重启即从 DB 续——详见 [02 §5](02-architecture.md#5-server-启动) / [§7.1](02-architecture.md#71-故障恢复)。
+
 ## 8. Connector 能力声明
 
 每个 connector plugin 声明能力，agent 通过 `mfs connector inspect <root>` 看到：
