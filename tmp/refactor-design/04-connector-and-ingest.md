@@ -627,6 +627,30 @@ yield ObjectChange(kind="renamed", uri=new_uri, old_uri=old_uri)
 - **本机模式**：file connector sync 跑在 server 内，对 `file_state` 表 vs 真实目录树做配对
 - **CS 模式**：client 端跑（基于 `/v1/files/manifest` 响应里的 `deletion_candidates`），结果作为 `renames_hint` 提交。Server 端 commit 步用 sha1 验证后直接写 `file_state.renamed_from`——server file connector sync 不再二次配对
 
+每个 added 候选的决策树（逐层退化，坏情况不损坏）：
+
+```
+对每个 added 候选 new_path:
+   │
+   ├─ inode 可信 且 命中 deleted 里同 inode?
+   │     │
+   │     ├─ 是 ─► size 双重校验通过?
+   │     │          ├─ 是 ─► renamed（零 sha1，同 fs mv 的快路径）
+   │     │          └─ 否 ─► 往下（inode 复用，不可信）
+   │     └─ 否 ─► 往下
+   │
+   ├─ size 跟某个 deleted 候选相同?（预过滤，避免无谓 sha1）
+   │     │
+   │     ├─ 是 ─► 算 sha1(new_path)，命中 deleted 里同 sha1?
+   │     │          ├─ 是 ─► renamed（跨 fs / 网络 fs 的慢路径）
+   │     │          └─ 否 ─► added（真新增）
+   │     └─ 否 ─► added（真新增）
+   │
+配对剩下的 deleted 候选 ─► deleted（真删）
+```
+
+退化链：**inode 配对 → sha1 配对 → 当 added+deleted**。每往下一层只是更慢，最坏退到原始行为，不会数据损坏。下面是代码版：
+
 ```python
 # 本机模式下 file connector sync 用到的配对（CS 模式下 client 端跑同一套，只是替换数据源）
 # 把 deleted/added 各自按可配对的 key 索引，遍历 added 路径优先 inode 配对、失败回退 sha1。

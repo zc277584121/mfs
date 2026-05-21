@@ -32,64 +32,79 @@ Chunk          ─ Milvus 一行：能被 search/grep 召回的最小单元
 
 ### 高层抽象
 
-```mermaid
-flowchart TB
-    subgraph C["Client（薄 · 近乎零状态）"]
-        direction LR
-        cli["mfs CLI<br/>Rust 单 binary"]
-        sdk["SDK<br/>Py / TS / Go / Java"]
-        skill["Agent Skill<br/>SKILL.md + PROMPTs"]
-    end
-
-    C ==>|"HTTP /v1（control plane）"| api
-
-    subgraph S["Server（重 · 所有重活）"]
-        direction TB
-        api["API routes"]
-        eng["Engine · 业务编排：路由 → 起 job → 调插件"]
-        conn["Connectors · file / web / postgres / slack / ...<br/>list · stat · read · fingerprint · sync"]
-        proc["Object Processors · 按 object_kind 加工"]
-        comm["Common Services · embedding · VLM · summary · retrieval"]
-        q["DB 任务队列 + Worker pool"]
-        api --> eng --> conn --> proc --> comm --> q
-    end
-
-    q --> meta[("Metadata DB<br/>SQLite / Postgres")]
-    q --> obj[("Object store<br/>artifact cache")]
-    q --> mv[("Milvus<br/>一张 collection")]
-    q --> tc[("Transformation cache<br/>独立 SQLite")]
+```
+┌──────────────────────── Client（薄 · 近乎零状态）────────────────────────┐
+│                                                                          │
+│   mfs CLI (Rust binary)      SDK (Py/TS/Go/Java)      Agent Skill         │
+│        └──────────────────────────┴─────────────────────┘                │
+│                     parse args · 解析 profile · 渲染输出                  │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                      │  HTTP /v1（主要是 control plane）
+                                      ▼
+┌──────────────────────── Server（重 · 所有重活）──────────────────────────┐
+│                                                                          │
+│   API routes ──► Engine ──► Connectors ──► Object ──► Common Services     │
+│   /v1/...        业务编排    file/web/pg/   Processors  embedding · VLM ·  │
+│                             slack/...       按           summary ·        │
+│                             list·stat·read· object_kind  retrieval        │
+│                             fingerprint·sync 加工            │            │
+│                                                              ▼            │
+│                                          DB 任务队列 + Worker pool        │
+│                                                   │                       │
+└───────────────────────────────────────────────────┼───────────────────────┘
+                ┌───────────────┬──────────────────┬─┴──────────────┐
+                ▼               ▼                  ▼                ▼
+        ┌─────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐
+        │ Metadata DB │ │ Object store │ │   Milvus     │ │ Transformation   │
+        │ SQLite / PG │ │ artifact     │ │ 一张         │ │ cache            │
+        │ 状态+path   │ │ cache        │ │ collection   │ │ 独立 SQLite      │
+        │ index+队列  │ │ fs/S3/R2     │ │ vector+BM25  │ │ content-hash 寻址│
+        └─────────────┘ └──────────────┘ └──────────────┘ └──────────────────┘
 ```
 
 CLI 跟 server 走 HTTP、互相不 import。server 按层组织：API → Engine 编排 → Connector 拉数据 → Processor 加工 → Common Service 提供 embedding/VLM/检索 → 四套存储落地。
 
 ### 放大：`mfs add` 一次同步里发生了什么
 
-```mermaid
-flowchart TB
-    A["mfs add"] --> B{"路径解析"}
-    B -->|"本地 path"| C["file connector"]
-    B -->|"外部 URI"| D["对应 connector plugin"]
-    C --> E
-    D --> E["connector.sync()<br/>流式 yield ObjectChange<br/>added · modified · deleted · renamed"]
-    E --> F["Reconcile · fingerprint chain 逐层比对<br/>upstream → artifact → chunk → embedding<br/>哪层 fp 变了入队哪层"]
-    F --> G["Sweep · config-hash gate<br/>捕获 framework 配置变化（换 embedding 模型等）"]
-    G --> H
-
-    subgraph H["Worker build task（每个变化对象并行跑）"]
-        direction TB
-        h1["chunker 按 object_kind 切"] --> h2{"transformation<br/>cache 命中?"}
-        h2 -->|"hit"| h3["复用 vector · 零 API"]
-        h2 -->|"miss"| h4["调 embedding / VLM / summary"]
-        h4 --> h5["异步写回 cache"]
-        h3 --> h6
-        h5 --> h6["batch 写 Milvus"]
-    end
-
-    H --> I["Deletion reconcile<br/>incremental 跳过 / full scan 全集 diff / explicit deleted"]
-    I --> J["commit connector state · 更新 job 状态"]
+```
+mfs add <target>
+   │
+   ├─① 路径解析     本地 path → file connector
+   │                外部 URI  → 对应 connector plugin
+   │
+   ├─② connector.sync()   流式 yield ObjectChange
+   │                       （added / modified / deleted / renamed）
+   │
+   ├─③ Reconcile · fingerprint chain 逐层比对（per-object，early-exit）
+   │       upstream fp 变?  ──► 整套重做
+   │       artifact fp 变?  ──► 重转 artifact + 下游
+   │       chunk fp 变?     ──► 重切 chunk + 重 embed
+   │       embedding fp 变? ──► 只重 embed（chunk 文本不动）
+   │
+   ├─④ Sweep · config-hash gate
+   │       config 没变 ──► 跳过（99% 的 sync）
+   │       config 变了 ──► 全量补检（换 embedding 模型 / 改 text_fields 等）
+   │
+   ├─⑤ Worker build task（每个变化对象并行跑）
+   │       chunker 按 object_kind 切
+   │            │
+   │            ▼
+   │       transformation cache 命中?
+   │            ├─ hit  ──► 复用 vector（零 API 调用）
+   │            └─ miss ──► 调 embedding/VLM/summary ──► 异步写回 cache
+   │            │
+   │            ▼
+   │       batch 写 Milvus
+   │
+   ├─⑥ Deletion reconcile
+   │       incremental ──► 跳过（推不出删除）
+   │       full scan   ──► 全集 diff，删消失的
+   │       explicit "deleted" event ──► 任何模式直接删
+   │
+   └─⑦ commit connector state + 更新 job 状态
 ```
 
-每个方框背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，fingerprint chain 见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)，transformation cache 见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
+每一步背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，fingerprint chain 见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)，transformation cache 见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
 
 ### 四套存储
 

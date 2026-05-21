@@ -2,6 +2,26 @@
 
 MFS 对外公开 16 个顶级命令：11 个 POSIX 风格动词 + 5 个名词管理。CLI 是 HTTP client，所有重活通过 `/v1` API 转给本机或远端的 server。
 
+```
+mfs
+├── 动词命令（POSIX 风格，agent 不学新词）
+│   ├── add <uri>            注册 + 同步（幂等，再跑=再同步）
+│   ├── status [<uri>]       daemon / connector / freshness / job
+│   ├── 浏览       ls · tree
+│   ├── 读取       cat · head · tail · export
+│   ├── 搜索       search（语义混合）· grep（精确，可下推）
+│   └── remove <uri>         注销 + 清理（destructive）
+│
+└── 名词管理（子命令子树）
+    ├── connector   add · probe · list · inspect · update · remove
+    ├── profile     add · use · list · status
+    ├── serve       start · stop · status · logs
+    ├── job         list · inspect · cancel
+    └── config      show · set
+```
+
+`mfs add` / `mfs remove` 是 `mfs connector add/remove` 的高频别名（§3）；其余写操作收敛在 `mfs connector` 子树下。
+
 ## 1. 完整命令清单
 
 ### 动词命令（POSIX 风格）

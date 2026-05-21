@@ -233,6 +233,29 @@ HTTP API 主要走 control plane（路径、option、状态、搜索结果），
 
 除了"不共享 + 本地路径"这一条，client 都不传 bytes、不拆 chunk、不上传 embedding——这些都是 server 的事。这一条下 client 也只做 stat 扫描 + 对 server 指定的少数 path 算 sha1，不拆 chunk / 不调 embedding。
 
+#### 共享 fs 下的本地文件（对照 §4.2）
+
+本机 server 跟 CLI 共享文件系统时，**client 几乎什么都不用做**——把 path 发过去就完事，扫盘 / 比对 / chunk / embed 全在 server：
+
+```mermaid
+sequenceDiagram
+    participant C as Client (CLI)
+    participant S as Server (同机 · 共享 fs)
+    participant FS as file_state 表
+    participant W as Worker
+
+    C->>S: mfs add ./repo（只发 path + options）
+    Note over S: server 直接读本机 ./repo，无需上传
+    S->>FS: file connector 扫盘，stat-first 跟 file_state 对比
+    FS-->>S: 变化集（added / modified / deleted / renamed）
+    S->>W: 起 build task
+    Note over W: chunk → embed → 写 Milvus，全在 server 内
+    W->>FS: 完成后更新 status
+    S-->>C: job_id（client 端到此结束）
+```
+
+跟 §4.2 的 CS 上传流程对照看：**两边的 file connector 是同一份代码**，扫的都是"自己 scope 下的真实目录"——本机模式 scope 直接指向 `./repo`，CS 模式 scope 指向 server 上的 staging area。唯一多出来的就是 §4.2 那段"把 client 的字节搬到 server scope"的上传协议。`file_state` 表、stat-first 对比逻辑、后续 chunk/embed pipeline 两种模式完全共用。
+
 ### 4.2 本地文件 upload flow（不共享 fs 时）
 
 `mfs add ./repo` 在 remote profile 下走 **2 个 HTTP RTT**，之后后台 sync 异步跑。**client 端不持久化任何 manifest**——所有比对状态都在 server 端 `file_state` 表里（详见 [§10.1](#101-metadata-db)），client.toml 里只放 profile / `client_id`。
@@ -897,6 +920,27 @@ CREATE UNIQUE INDEX ux_connector_jobs_one_queued
                           file_state / object_tasks / connector_jobs
    ⑥ connectors 表行 DELETE
    ⑦ remove_job 标 'succeeded'
+```
+
+时序视角（看 remove 怎么"插队"中断 running 的 sync）：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant DB as connector_jobs / connectors
+    participant SW as Sync worker
+    participant RW as Remove worker
+
+    Note over SW: mfs add 正在跑（sync_job = running，可能几小时）
+    U->>DB: mfs remove postgres://prod
+    DB->>DB: ① connectors.status = 'removing'（之后 add/sync 全拒绝）
+    DB->>DB: ② INSERT remove_job（status = 'queued'）
+    DB-->>SW: ③ 发 cancel 信号（不强杀进程）
+    Note over SW: ④ 跑完手头 object_task 再停（per-object 原子）
+    SW->>DB: sync_job 标 'cancelled'
+    DB->>RW: ⑤ remove_job queued → running
+    RW->>RW: 清 Milvus(按 partition_key) + artifact cache + staging + metadata
+    RW->>DB: ⑥ DELETE connectors 行 · ⑦ remove_job = 'succeeded'
 ```
 
 #### 两个关键概念
