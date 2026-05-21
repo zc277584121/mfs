@@ -1055,11 +1055,26 @@ token → user_id → 该 user 能访问的 namespace_id 集合
 | 跨 workspace 共享数据 | 同一 namespace_id 出现在多个 `workspace_namespaces` 行 |
 | 个人迁到团队 | 把 namespace 从 `user_namespaces` 移到 `workspace_namespaces`——数据零迁移 |
 
-### 9.4 Milvus 隔离
+### 9.4 Milvus 隔离：collection_strategy
 
-v0.4 整个 MFS 一张 collection，所有 namespace 共享，靠 `namespace_id IN (...)` scalar filter + chunk_id 含 namespace_id 防撞做隔离。partition_key 物理分桶按 connector_uri，所以同 connector 的查询天然只扫一个桶（详见 [§10.3](#103-milvus)）。
+Milvus 上的 namespace 隔离强度由 server.toml 的 `collection_strategy` 决定，**部署时选定**（后期改要迁移数据）。v0.4 提供两种策略：
 
-数据量大或需要强隔离（合规 / SaaS multi-tenant）时切多 collection（per_connector / per_namespace）是 v0.5+ 范畴——届时会带迁移工具一起设计。v0.4 不预留 toml 配置项以免误用。
+```toml
+[milvus]
+collection_strategy = "shared"        # 默认
+# collection_strategy = "per_namespace"
+```
+
+| 策略 | collection 布局 | namespace 隔离靠 | 适合 |
+|---|---|---|---|
+| **shared**（默认）| 一张 `mfs_chunks` | `namespace_id` scalar filter | 多租户、scale 到上千租户 |
+| **per_namespace** | 每 namespace 一张 `mfs_chunks__<ns>` | collection 物理边界 | 强隔离（合规 / 私有化）、租户少 |
+
+两种策略**字段定义、partition_key（都是 `connector_uri`）、chunk_id 公式完全一致**，唯一差别是 collection 命名和隔离机制——框架用一个 `resolve_collection(namespace_id, strategy)` 决定写/查哪张表，其余代码零分叉。schema 对比见 [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
+
+为什么不做 `per_connector`：`shared` 的 partition_key 已经按 connector_uri 物理分桶，每个 connector 的数据本就在自己桶里、查询直达、删除只扫该桶——per_connector 比它多的只有"独立 collection 生命周期"，却要 connector 上千就 collection 上千，撞 Milvus 的 collection 数量/内存上限，不划算。
+
+v0.4 单 namespace 下两种策略都是一张表（`mfs_chunks` 或 `mfs_chunks__default`），行为等价；等 v0.5+ 多 namespace 落地，`per_namespace` 自动裂成多张。**所以 SaaS 强隔离场景在 v0.4 就能选 `per_namespace` 表达意图**，不必等到 v0.5+ 才有隔离能力——这也是为什么把这个配置提前放进 v0.4，而不是事后再补（事后改 collection 布局要迁移全部数据）。
 
 ## 10. 存储层
 
@@ -1279,7 +1294,26 @@ staging_path = "uploads/"
 
 ### 10.3 Milvus
 
-一张 collection `mfs_chunks`，`partition_key = connector_uri`。详细 schema 见 [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
+collection 布局由 `collection_strategy` 决定（`shared` 默认 / `per_namespace`，见 [§9.4](#94-milvus-隔离collection_strategy)），两种策略都 `partition_key = connector_uri`。详细 schema 见 [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema)。
+
+#### 为什么 partition_key 选 connector_uri，不选 namespace_id
+
+`shared` 策略下，partition_key 该对齐**最高频的查询过滤条件**——MFS 是路径/connector 寻址的，最高频是"在某个 connector 里搜"，不是"搜整个 namespace"：
+
+| 查询 | partition_key=connector_uri | partition_key=namespace_id |
+|---|---|---|
+| `search postgres://prod`（最高频）| 路由到该 connector 桶，只扫一个 ✅ | 扫该 ns 全部 connector 再过滤 ❌ |
+| `search --all`（低频）| scatter 全桶 | 路由到 ns 桶 ✅（唯一占优）|
+
+三个压死的理由：
+
+1. **v0.4 单 namespace**：namespace_id 当 key → 所有 chunk 同一个值 → 全挤进 1 个桶 → 等于没分片；connector_uri 上千值 → 散进 64 桶 → 真分片
+2. **数据倾斜**：namespace_id 当 key，大租户全砸进它那一个桶；connector_uri 当 key，按 connector 散开，粒度更细更均
+3. **dominant query 扫描量**：connector_uri 桶里通常就一个 ns 的一个 connector，scalar filter 几乎不干活；namespace_id 桶里混着该 ns 全部 connector，搜单个还得筛一大堆
+
+想要"按租户物理聚集/强隔离"用 `per_namespace` 策略（整张 collection 分开），不靠"shared 里拿 namespace 当 key"这种半吊子——它既没强隔离又赔上 dominant query 和 v0.4 分片。
+
+#### partition_key vs named partition
 
 **partition_key 不是 named partition**。Milvus 里有两套不同机制：
 
@@ -1318,7 +1352,7 @@ uri = "~/.mfs/milvus.db"               # 默认 Lite
 # token = "..."
 ```
 
-v0.4 整个 MFS 一张 `mfs_chunks` collection，所有 namespace / connector 共享，用 partition_key 物理分桶 + namespace_id scalar filter 隔离。多 collection 切分策略（per_connector / per_namespace）是 v0.5+ 看数据量规模再做的事，会带配套迁移工具一起设计，v0.4 不预留配置项以免误用。
+v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#94-milvus-隔离collection_strategy)）都从 v0.4 实现——单 namespace 下都是一张表，行为等价；v0.5+ 多 namespace 落地后 `per_namespace` 自动裂成多张。布局策略部署时定，后期改要迁移，所以提前给配置让部署表达隔离意图。`per_connector` 不做（理由见 §9.4）。
 
 ### 10.4 Transformation cache（计算缓存）
 

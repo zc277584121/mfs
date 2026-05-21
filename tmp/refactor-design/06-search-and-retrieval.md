@@ -4,11 +4,12 @@
 
 ## 1. Milvus collection schema
 
-整个 MFS 默认只有一张 Milvus collection：`mfs_chunks`。所有 connector / 所有 object_kind / 所有 chunk_kind 共用。
+collection 布局由 server.toml 的 `collection_strategy` 决定（`shared` 默认 / `per_namespace`，见 [02 §9.4](02-architecture.md#94-milvus-隔离collection_strategy)）。**两种策略字段定义、partition_key、chunk_id 公式完全一致**，唯一差别是 collection 命名和 namespace 隔离机制。
+
+字段定义（两种策略共用）：
 
 ```python
-collection_name = "mfs_chunks"
-partition_key   = "connector_uri"        # 每个 connector 一个 partition，加速过滤
+partition_key = "connector_uri"        # 两种策略都一样
 
 fields = [
     Field("chunk_id",       VARCHAR(128),  primary=True),
@@ -30,11 +31,29 @@ index_params = {
     "dense_vec":  {"type": "HNSW",  "metric_type": "COSINE", "params": {"M":16,"efConstruction":200}},
     "sparse_vec": {"type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25"},
 }
+
+# 唯一的分叉点：写/查哪张 collection
+def resolve_collection(namespace_id: str, strategy: str) -> str:
+    if strategy == "per_namespace":
+        return f"mfs_chunks__{namespace_id}"   # 每 namespace 一张
+    return "mfs_chunks"                        # shared：全局一张
 ```
+
+### 两种策略的差异（只有这两点）
+
+| | shared（默认）| per_namespace |
+|---|---|---|
+| collection | 一张 `mfs_chunks` | 每 namespace 一张 `mfs_chunks__<ns>` |
+| namespace 隔离靠 | `namespace_id` scalar filter | collection 物理边界 |
+| 查询 filter | `namespace_id IN (...) AND connector_uri == X ...` | `connector_uri == X ...`（collection 已隔离 ns）|
+| 同名 connector 跨 ns 撞桶 | 有（scalar filter 兜底正确性）| 没有（不同 collection）|
+| partition_key / 字段 / chunk_id | — | **全部相同** |
+
+`namespace_id` 字段在 `per_namespace` 下冗余（恒等于 collection 对应的 ns），但保留——让 write / processor / chunk_id 代码两种策略零分叉，分叉只发生在 `resolve_collection` 这一个点。chunk_id 公式两种策略都含 namespace_id，迁移时 chunk_id 也稳定。
 
 ### Partition by connector_uri（用 `partition_key`，不是 named partition）
 
-`partition_key=connector_uri` 是 schema 阶段必须定死的字段。Milvus 按这个字段自动哈希分桶——不是 named partition（`create_partition / drop_partition` 那一套）。两者差异和取舍详见 [02 §10.3](02-architecture.md#103-milvus)。
+`partition_key=connector_uri` 是 schema 阶段必须定死的字段，Milvus 按它自动哈希分桶。**为什么选 connector_uri 不选 namespace_id**（dominant query / v0.4 分片 / 数据倾斜三个理由）详见 [02 §10.3](02-architecture.md#103-milvus)。
 
 partition_key 带来的加速：
 
@@ -42,18 +61,15 @@ partition_key 带来的加速：
 |---|---|
 | `mfs search "..." postgres://prod` | filter 带 `connector_uri == X` → 只扫该 connector 命中的物理桶 |
 | `mfs search "..." --all` | 多桶并行扫，scatter-gather |
-| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 也按 partition_key 路由，只扫该桶（不是 drop_partition，那需要 named partition） |
-| 大数据量切 collection 时迁移 | 按桶物理切到 `per_connector` collection 容易 |
+| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 按 partition_key 路由，只扫该桶 |
 
 后改 partition key 需要数据迁移，所以一开始定下来。
 
-### namespace_id 字段：scalar filter，不是 partition_key
+### namespace_id 字段：shared 下做 scalar filter
 
-所有 chunk 写入时带上 `namespace_id`，所有查询自动 filter `namespace_id IN (current_request_namespaces)`。v0.4 server 只有一个 `default` namespace，所有 chunk 都写 `"default"`，client 不需要关心。
+`shared` 策略下所有 chunk 带 `namespace_id`，查询自动 filter `namespace_id IN (current_request_namespaces)`。v0.4 server 只有一个 `default` namespace，所有 chunk 都写 `"default"`，client 不感知。两个 namespace 注册同名 connector 会落到同一物理桶，靠 `namespace_id` scalar filter + chunk_id 含 namespace_id 防撞做隔离。
 
-为什么 namespace_id 不是 partition_key：Milvus 单 collection 只能有一个 partition_key 字段，已经被 connector_uri 占了。两个 namespace 注册同名 connector（如双方 alias 都叫 `prod`）会落到同一物理桶，但每行带 `namespace_id` 标签 + chunk_id 已经 hash 了 namespace_id 保证主键不撞，查询按 `namespace_id IN (...)` scalar filter 隔离。
-
-强隔离需求（合规 / SaaS multi-tenant）走多 collection 切分（per_namespace），属于 v0.5+ 范畴，带迁移工具一起设计，详见 [02 §9.4](02-architecture.md#94-milvus-隔离)。v0.4 全 MFS 一张 collection。
+需要强隔离（合规 / SaaS multi-tenant）就用 `per_namespace` 策略——v0.4 就能选，部署时定，详见 [02 §9.4](02-architecture.md#94-milvus-隔离collection_strategy)。
 
 Workspace / User 等组织概念不进 Milvus schema——它们通过 server 端 mapping 表换算成 namespace_id 集合后再 filter。详见 [02 §9](02-architecture.md#9-多租户与-namespace)。
 
