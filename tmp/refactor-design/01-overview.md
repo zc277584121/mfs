@@ -75,17 +75,15 @@ mfs add <target>
    ├─② connector.sync()   流式 yield ObjectChange
    │                       （added / modified / deleted / renamed）
    │
-   ├─③ Reconcile · fingerprint chain 逐层比对（per-object，early-exit）
+   ├─③ Reconcile · fingerprint chain 逐层比对（仅对 yield 出来的 object）
    │       upstream fp 变?  ──► 整套重做
    │       artifact fp 变?  ──► 重转 artifact + 下游
    │       chunk fp 变?     ──► 重切 chunk + 重 embed
    │       embedding fp 变? ──► 只重 embed（chunk 文本不动）
+   │       （框架配置变化 = 换 embedding 模型/chunker → v0.4 用户手动
+   │         mfs add --force-index；自动检测留 v0.5+）
    │
-   ├─④ Sweep · config-hash gate
-   │       config 没变 ──► 跳过（99% 的 sync）
-   │       config 变了 ──► 全量补检（换 embedding 模型 / 改 text_fields 等）
-   │
-   ├─⑤ Worker build task（每个变化对象并行跑）
+   ├─④ Worker build task（每个变化对象并行跑）
    │       chunker 按 object_kind 切
    │            │
    │            ▼
@@ -96,12 +94,12 @@ mfs add <target>
    │            ▼
    │       batch 写 Milvus
    │
-   ├─⑥ Deletion reconcile
+   ├─⑤ Deletion reconcile
    │       incremental ──► 跳过（推不出删除）
    │       full scan   ──► 全集 diff，删消失的
    │       explicit "deleted" event ──► 任何模式直接删
    │
-   └─⑦ commit connector state + 更新 job 状态
+   └─⑥ commit connector state + 更新 job 状态
 ```
 
 每一步背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，fingerprint chain 见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)，transformation cache 见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
@@ -179,7 +177,7 @@ MFS 第一受众是 **agent**，不是人。所以主接口是 **shell-native CL
 变化分两层，谁最了解谁负责：
 
 - **upstream 层变化**——外部数据本身变了。**connector 最懂自己的源**，自己探测（file 用 stat-first lazy hashing：先看 size+mtime，变了才算 sha1；DB 用 `updated_at` cursor；web 用 ETag……），通过 `ObjectChange` 流式上报 added / modified / deleted / renamed
-- **framework 层失效**——换 embedding 模型、升级 chunker、改 text_fields。connector 看上游完全没变、啥都不 yield，但下游产物其实 stale。这由 **framework 的 sweep + fingerprint chain** 捕获，connector 不用管
+- **framework 层失效**——换 embedding 模型、升级 chunker、改 text_fields。connector 看上游完全没变、啥都不 yield，但下游产物其实 stale。**v0.4 不自动检测这类变化**，由用户手动 `mfs add --force-index` 重建（用户改了配置自己知道）；自动检测漂移 + 分级提示是 v0.5+（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）
 
 增量同步的精髓就是**connector 只 yield 变化的部分**，framework 用 fingerprint chain 逐层比对决定哪一层产物要重做（artifact / chunk / embedding 分层失效，能复用就复用）。
 

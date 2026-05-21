@@ -57,13 +57,12 @@ mfs add <target>
   ③ connector.sync() 流式 yield ObjectChange
        added / modified / deleted
   │
-  ④ 对每个 ObjectChange，跑 reconcile 4 步比对（见 §5.2.3）
+  ④ 对每个 ObjectChange（yield 出来的）跑 reconcile 4 步比对（见 §5.2.3）
        fp 不等的层入队，相等的早退
+       （框架配置变化 = 换 embedding 模型/chunker → v0.4 用户手动 --force-index，
+         不在这里自动检测；详见 §5.2 末尾）
   │
-  ⑤ Sweep pass：扫未在 yield 集合里的 object
-       捕获 framework 配置变化（换 embedding 模型等）
-  │
-  ⑥ Worker 跑 build task
+  ⑤ Worker 跑 build task
        artifact → chunk → embed → 写 Milvus
        chunker 按 object_kind 分派：
          document → markdown chunker
@@ -75,13 +74,13 @@ mfs add <target>
        embed/vlm/summary 都走 CachingXxxClient → transformation cache (02 §10.4)
        命中 → 零 API；miss → 真 API + 异步写回 cache
   │
-  ⑦ Deletion reconcile（详见 [02 §7.4](02-architecture.md#74-deletion-策略)）
+  ⑥ Deletion reconcile（详见 [02 §7.4](02-architecture.md#74-deletion-策略)）
        incremental sync → 跳过（cursor 只 yield 变化，推不出删除）
        full scan sync   → 全集 diff，to_delete = (objects ∩ Milvus) - 本次全集，DELETE
        explicit "deleted" event → 任何模式都直接删
        （枚举不完整时 connector 必须 raise → sync 失败 → 不删，详见 §7.4.3 契约）
   │
-  ⑧ commit connector state + 更新 job 状态
+  ⑦ commit connector state + 更新 job 状态
 ```
 
 执行位置：
@@ -360,74 +359,26 @@ Step 4: embedding 层比对
 
 Early-exit：上游 fp 不等就整套重做，跳过下游检查（下游一定也 stale）。
 
-#### Sweep pass：捕获 framework 配置变化
+#### 框架配置变化：v0.4 用户手动重建，自动检测留 v0.5+
 
-`connector.sync()` 只汇报 upstream 变化。换 embedding 模型 / 升级 chunker / 升级 converter 时，connector 看 upstream 完全没变，啥都不 yield。这时 framework 在 sync 末尾跑一遍 sweep：
+reconcile（上面 4 步）只对 **connector yield 出来的 object** 跑——也就是只处理 **upstream 变化**。
 
-```
-for object in 当前 connector 下未在本次 yield 的 object:
-  跑 Reconcile 4 步比对
-```
+但还有一类变化 connector 看不见：换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，upstream 完全没动、connector 啥都不 yield，但下游产物其实 stale。
 
-这一步让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed" 能 work，用户不需要加 `--force-index`。
+**v0.4 对这类变化不做自动检测**——用户改了配置自己知道，手动重建：
 
-> **Sweep 永不删除。** 它只比对 fp 入队 rebuild。删除是完全独立的 [02 §7.4](02-architecture.md#74-deletion-策略) deletion step。两步都遍历"未 yield 集合"但目的相反（一个重建一个删除），实现上必须分开，不能在同一个 loop 里既 rebuild 又 delete。
-
-##### config-hash gate：避免每次 sync 全量扫
-
-sweep 是只读比对（不读 upstream），但在 **incremental sync 下"未 yield 的 object" ≈ 全部对象**——每次 sync 都全量扫几十万~几百万 fp，而框架配置 99% 的 sync 根本没变，纯白跑。
-
-用一个 config fingerprint 把它 gate 掉：
-
-```python
-# config 指纹是 per-connector 的，把所有"connector 看不见但能让下游产物 stale"的配置揉进去：
-current_cfg_fp = sha1(
-    # ── framework 全局配置（server.toml）──
-    embedding_model + embedding_version +
-    chunker_name + chunker_config + tokenizer_version +
-    converter_name + converter_version +
-    summary_model + summary_prompt +
-    vlm_model + vlm_prompt +
-    # ── 该 connector 的 object 配置（connector TOML [[objects]] 段）──
-    #    text_fields / metadata_fields / chunk_strategy / template_version /
-    #    filter_expr / group_by ... —— 这些进 chunk_fp 公式，改了下游就 stale
-    connector_object_config_serialized
-)
-
-last_swept_fp = connector_state.get("last_swept_config_fp")   # 持久化，重启不丢
-
-if current_cfg_fp == last_swept_fp:
-    skip sweep                       # 99% 的 sync 走这条，零扫描
-else:
-    run full sweep                   # 配置真变了才全量比对
-    connector_state.set("last_swept_config_fp", current_cfg_fp)
+```bash
+mfs add <connector> --force-index      # 重建单个 connector
+mfs add --all --force-index            # 重建全部（换全局 embedding 模型时用）
 ```
 
-效果：
+`--force-index` 跳过 fp 比对、把所有 object 当 modified 强制重 chunk + 重 embed（embed 走 transformation cache，内容没变的命中复用、省钱）。
 
-- 配置没变（绝大多数 sync）→ 整步跳过，成本为 0
-- 真换 embedding model / 升级 chunker → 下一次 sync 触发一次全量 sweep，跑完归零
-- `last_swept_config_fp` 存在 `connector_state`（持久化），framework 重启不会丢——不会因为重启而退化成"每次都扫"
+> **简单 breadcrumb（仅记录、不检测）**：建索引 / `--force-index` 跑完时，framework 在 metadata DB 记一条"这次用的什么全局配置"（embedding model/version、chunker version、converter version）。v0.4 **不拿它做任何检测或提示**，纯粹留作 v0.5+ 自动检测的起点。
 
-##### update_config 天然接进这条路
+**为什么 v0.4 不做自动检测**：自动检测要一整套机制——sweep 全量扫 + config-hash gate 防止每次 sync 白扫 + index_state 比对 + 分级提示（embedding 破坏 search 必须重建 / chunker 只是 stale 可选）+ 维度变了要蓝绿重建 collection + 全局 fan-out 到所有 connector。这是一块**相对独立、且偏重**的能力，跟主链路（注册 / sync / 检索）解耦，放 v0.5+ 单独做更干净。v0.4 的原则简单：**用户手动改了配置，用户自己 `--force-index`**。
 
-`mfs connector update <uri> --config new.toml` 改了 `text_fields` / `chunk_strategy` 等 object 配置后：
-
-```
-① update_config job 更新 connectors 表的 config_json + config_hash
-② 紧接着触发一个 sync_job（用新配置）
-③ sync 末尾 config-hash gate 比对：connector_object_config 变了 → current_cfg_fp 变了
-   → gate 打开 → 跑全量 sweep
-④ sweep 对每个 object 跑 Reconcile 4 步：
-   text_fields 进 chunk_fp 公式 → chunk_fp 失效 → 入队 chunk rebuild → 重 chunk + 重 embed
-   （embed 走 transformation cache，未变的文本片段命中复用）
-```
-
-所以**改 text_fields 不需要专门的"重建"命令**——`mfs connector update` 走完，下一次 sync 的 sweep 自动把受影响的 object 重 chunk。用户感知就是"改配置 → 自动生效"，跟"换 embedding model → 自动重 embed"是同一条机制。
-
-更新 config 但**没改任何进 fp 的字段**（比如只改了 `label` 展示名）→ current_cfg_fp 不变 → gate 不开 → sweep 跳过，零浪费。
-
-性能：跳过时 0；触发时是只读比对（只查 metadata DB + Milvus 字段，不读 upstream），100 万 chunk 几秒钟级。
+> v0.5+ 计划：基于上面那条 breadcrumb，在 `mfs status / add / search` 三处检测配置漂移并按严重度提示，用户确认后台重建（含维度变化的蓝绿迁移）。connector 数据版本（DATA_VERSION）的自动失效也一并放 v0.5+。
 
 ### 5.3 Milvus 上的失效行为
 
@@ -546,7 +497,7 @@ file connector 的 sync 流程：
 
 **file connector 不调 checkpoint**——file_state 是全量结构化映射，半截 commit 不合法（详见 §5.6.1）。
 
-注意：file_state 只包含**文件本身的 fingerprint**（size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化由 §5.2 的 sweep 步骤捕获，跟 file_state 无关。
+注意：file_state 只包含**文件本身的 fingerprint**（size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化跟 file_state 无关——v0.4 由用户手动 `--force-index` 处理（详见 §5.2 末尾）。
 
 ### 5.6 Mid-job checkpoint
 

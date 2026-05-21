@@ -646,23 +646,13 @@ object_task.status = 'succeeded'
 
 外部 API 大数据量场景（Slack / Gmail 等）可以调 `self.state.checkpoint()` 主动 commit 当前 state，避免崩溃后整批重跑被 rate limit 打爆。详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint-api)。
 
-**④ Sync 末尾 reconcile pass（sweep）**
+**④ reconcile 只覆盖 upstream 变化；框架配置变化 v0.4 手动重建**
 
-connector 只负责报告 upstream 变化，但下游产物（artifact / chunk / embedding）可能因 framework 配置变化（换 embedding 模型 / chunker 升级）而 stale，connector 不感知。framework 在 sync 末尾跑一遍 sweep：
+reconcile（规则①~③ 走的 fingerprint chain 比对）只对 **connector yield 出来的 object** 跑——即只处理 **upstream 变化**。
 
-```
-for object in 当前 connector 下未在本次 yield 的 object:
-  跑 fingerprint chain 比对：
-    artifact cache 层 fp 变了？  → 入队 artifact rebuild
-    chunk 层 fp 变了？           → 入队 chunk rebuild
-    embedding 层 fp 变了？       → 入队 embed only
-```
+换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，connector 看 upstream 没动、啥都不 yield，下游产物却 stale。**v0.4 对这类变化不自动检测**，由用户手动 `mfs add --force-index`（单 connector）或 `mfs add --all --force-index`（全局，换 embedding 模型时）重建——用户改了配置自己知道。
 
-这条让"换 embedding 模型 → 跑 `mfs add` → 自动重 embed"能 work，用户不需要加 `--force-index`。
-
-**config-hash gate**：incremental sync 下"未 yield 的 object" ≈ 全部对象，每次 sync 全量扫 fp 太浪费。framework 用一个 **per-connector config fingerprint** gate 掉——揉进 framework 全局配置（embedding model / chunker / converter / summary / vlm）**和该 connector 的 object 配置**（text_fields / chunk_strategy 等）。config fp 跟上次 sweep 时一致就**整步跳过**，只有配置真变了才跑全量 sweep。`mfs connector update` 改了 text_fields 这类字段也是通过这条路自动重 chunk（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）。`last_swept_config_fp` 持久化在 `connector_state`，重启不丢。
-
-> **Sweep 永不删除**——只比对 fp 入队 rebuild。删除是完全独立的 [§7.4](#74-deletion-策略) deletion step，两步必须分开实现。
+> **简单 breadcrumb**：建索引 / `--force-index` 跑完时，metadata DB 记一条"用的什么全局配置"，v0.4 不拿它检测、只留作 v0.5+ 的起点。自动检测配置漂移（sweep 全量扫 + config-hash gate + 分级提示 + 维度变蓝绿重建 + 全局 fan-out + connector DATA_VERSION 失效）是一块独立的重能力，整体放 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)。
 
 framework 不暴露 `commit()` 给 connector（只暴露 `checkpoint()`），commit 时机由 framework 控制。
 

@@ -171,20 +171,18 @@ Renames skip re-embedding (content unchanged); only chunk_id is rewritten.
 
 rename 检测算法（inode + sha1 fallback）和触发条件详见 [04 §5.7](04-connector-and-ingest.md#57-rename-detection)。
 
-### 检测到 framework 配置变化时
+### 换了 framework 配置怎么办（v0.4：手动重建）
 
-换了 embedding model / chunker config / converter 版本，下次 `mfs add` 时 reconcile pass 会发现下游 fp 失效（详见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)）。如果失效范围大就先提示一下，让用户明确决定：
+换了 embedding model / chunker config / converter 版本——**v0.4 不自动检测**，普通 `mfs add` 只处理 upstream 变化，不会发现这类框架配置变化。用户改了配置自己知道，手动重建：
 
-```text
-$ mfs add postgres://prod
-Detected framework config change:
-  embedding model: text-embedding-3-small → text-embedding-3-large
-
-This will re-embed 12,453 chunks (~2.4M tokens).
-Continue? [y/N]
+```bash
+mfs add postgres://prod --force-index    # 重建单个 connector
+mfs add --all --force-index              # 换全局 embedding 模型时，重建全部
 ```
 
-`--yes` 跳过 confirm。chunk 文本本身不会重新切，只是重 embed——比从零跑便宜得多。
+`--force-index` 估算受影响 chunks / tokens 后 confirm（`--yes` 跳过），强制重 chunk + 重 embed（embed 走 transformation cache，内容没变的命中复用）。
+
+> 自动检测配置漂移 + 分级提示（`mfs status / add / search` 三处）是 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)。
 
 ### URI 写法
 
