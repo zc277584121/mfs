@@ -448,7 +448,23 @@ Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 co
 >
 > 为什么不能 per-connector（尤其 embedding）——不是加个配置项的事：① 不同 embedding 模型**维度可能不同**，而 Milvus collection 维度建表时定死，一张大表装不下多种维度；② 不同模型 = **不同向量空间**，query 向量没法跨空间比，跨 connector 的 `search --all` 统一排序会失效。
 >
-> **v0.5+ 方向（config-profile）**：定义若干"处理配置组"，每组打包一套 converter + embedding + VLM + summary，并对应一张自己的 collection（**只有 embedding 模型决定 collection 切分**，其余配置不影响）。connector 只需归属一个 config-profile；搜索时按组的 embedding 查该组 collection，跨组各出一份结果（不强行跨空间合并）。它跟 namespace 是不同的轴会组合（collection = f(namespace, config-profile)），slot 进 [02 §9.4](02-architecture.md#94-milvus-隔离collection_strategy) 的 `collection_strategy`。注意它跟 client 端 profile 无关，文档里别用裸 "profile" 称呼。
+> **v0.5+ 方向（config-profile）**：定义若干"处理配置组"，每组打包一套 converter + embedding + VLM + summary，并对应一张自己的 collection（**只有 embedding 模型决定 collection 切分**，其余配置不影响）。connector 只需归属一个 config-profile；搜索时按组的 embedding 查该组 collection，跨组各出一份结果（不强行跨空间合并）。注意它跟 client 端 profile 无关，文档里别用裸 "profile" 称呼。
+>
+> **v0.5+ collection 全景**：collection 切分不是"几选一的 enum"，是**两个独立的轴**——
+>
+> ```
+> 轴① namespace（隔离：谁能访问）        可选（合规才开）
+> 轴② config-profile（向量空间：怎么 embed）多 embedding 模型时强制开（维度不同必须拆表）
+> partition_key = connector_uri          永远，表内按 connector 分桶（软边界）
+>
+> collection 名 = 两轴组合:
+>   都不分           → mfs_chunks                 （v0.4 默认）
+>   只分 namespace   → mfs_chunks__<ns>           （v0.4 的 per_namespace）
+>   只分 profile     → mfs_chunks__<profile>      （单租户多 embedding）
+>   两个都分         → mfs_chunks__<ns>__<profile>
+> ```
+>
+> 每张 collection 内部 schema / partition_key / chunk_id 公式完全一致，唯一不同是 `dense_vec` 维度（跟着该 profile 的 embedding 模型）。config-profile 是被砍掉的 `per_connector` 的"分组修复版"（按组拆而非逐 connector 拆，不爆炸），落在 collection 硬边界这一层。整套 slot 进 [02 §9.4](02-architecture.md#94-milvus-隔离collection_strategy) 的 `collection_strategy`。
 
 ```toml
 [embedding]

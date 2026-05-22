@@ -123,7 +123,7 @@ mfs connector probe postgres://prod --config x.toml
 
 不提供 `--force` 短写法——避免歧义（到底重传不重传？）。shared fs 场景下 `--force-upload` 报错 `upload_not_applicable`。
 
-> 注意 `mfs add --all` 跟 `mfs search --all` 是两个不同的 `--all`：前者是 force-index 的"全部 connector"范围 flag；后者是 search 跨所有 connector 召回。各自语境清楚，不冲突。
+> `mfs add --all` 跟 `mfs search --all` **语义一致**——都表示"对所有 connector"（一个重建、一个搜索）。它们在不同动词上、命令行先打动词，不会混（同 `git add --all` 管文件、`git push --all` 管分支那样，同名按子命令各表其意，是 unix 惯例）。所以不拆成 `--all-connectors` 这种长名。
 
 ### 首次注册外部 connector 的默认行为
 

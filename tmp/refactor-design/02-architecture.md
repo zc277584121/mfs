@@ -455,6 +455,8 @@ mfs serve logs              # ~/.mfs/server.log
 
 所有 sync / remove / update_config 等操作都进 `connector_jobs` 表，按 `op_kind` 区分；具体的 chunk + embed 任务进 `object_tasks` 表。MFS 直接用 metadata DB 表当队列，不引入 Redis / Celery 等额外组件。
 
+> **术语统一**：规范名是 **connector_job**（`connector_jobs` 表的一行，CLI 通过 `mfs job` 操作它）。文中出现的 "sync job / remove job / force_sync job" 都是同一个东西的口语叫法——指 `op_kind = 'sync' / 'remove' / 'force_sync'` 的 connector_job；单说 "job" 也指 connector_job。它跟更细的 `object_task`（job 内的子单元，每个变化对象一个）是两层，别混。
+
 ### 6.1 为什么用 DB 当队列
 
 | 维度 | DB 队列 | 外部 broker |
