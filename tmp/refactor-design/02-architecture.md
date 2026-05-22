@@ -398,6 +398,25 @@ client 提交的 renames_hint 由 server 用 sha1 验证（client 端 inode 跨 
 
 `connector_uri` 构造为 `file://<client_id>/<abs-path>`；一个 connector_uri 一辈子绑定一个 client，v0.4 禁止多 client 共写同一 connector。
 
+> **两个 ID 各司其职，别混**：`machine-id` 判 **is_local**（server 跟 client 是不是同一台机 → 要不要上传），瞬时算、不落库、不同机器必不同所以判得准；`client_id` 当 **file connector 身份**（焊进 connector_uri，每次 add/搜索/删除拿它认出"是不是上次那个 repo / 是 A 的还是 B 的"），要长期稳定所以不能用会变的 machine-id。详见 [§3.4](#34-client_idclient-的稳定身份)。
+
+#### 已知限制：同一份文件、不同 client 环境 = 不同 connector
+
+因为 file connector 身份 = `client_id + path`，**同一份文件从不同 client_id 环境 add 会被当成不同 connector**，重复索引、各花一份 embedding：
+
+| 场景 | 为什么 |
+|---|---|
+| Docker dev container 挂载同一 repo | 容器自己的 `~/.mfs` = 不同 client_id |
+| WSL2 / Windows 双访问同一文件 | 两侧各有 `~/.mfs` |
+| CI / ephemeral runner | 每次全新环境、无持久 `~/.mfs` → 每次新 client_id |
+| 重装没备份 `~/.mfs` | client.toml 丢了 → 新 client_id → 旧 connector 成孤儿 |
+
+> 注意区分：两台**不同机器**各自 clone 的 `/repo`（内容可能不同）→ 不同 connector 是**正确的**，不算限制。限制只在"同一份逻辑文件、不同 client 环境"时浪费。
+
+**缓解**：把 `~/.mfs`（即 client.toml 里的 client_id）在环境间共享——Docker 挂 `~/.mfs` volume、CI 缓存 `~/.mfs`、跨机器备份恢复 client.toml。共享后 client_id 一致 → 同一个 connector，不重复索引。但**只从一处 `mfs add`**（v0.4 禁止多 client 并发写同一 connector，同时从 laptop 和容器 add 会 race）。
+
+彻底解耦身份与 client_id（如 `mfs add /repo --alias my-repo` → `file://my-repo`，谁用这 alias 都写同一个）是 v0.5+——要一并解决多 client 并发写协调。
+
 ## 5. Server 启动
 
 `mfs-server` 是服务端 binary，`mfs serve` 是 client 端的便利封装。

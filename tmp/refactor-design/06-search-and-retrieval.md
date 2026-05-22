@@ -444,6 +444,12 @@ Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 co
 
 四类外部加工工具走同一种插件化模型——都是 fingerprint chain 里"产出 artifact 或 chunk"的可换组件。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
 
+> **已知限制：v0.4 这四类配置全局单一，不能 per-connector**。整个 MFS 实例一个 embedding 模型、一个 converter、一个 VLM、一个 summary LLM，所有 connector 共用。
+>
+> 为什么不能 per-connector（尤其 embedding）——不是加个配置项的事：① 不同 embedding 模型**维度可能不同**，而 Milvus collection 维度建表时定死，一张大表装不下多种维度；② 不同模型 = **不同向量空间**，query 向量没法跨空间比，跨 connector 的 `search --all` 统一排序会失效。
+>
+> **v0.5+ 方向（config-profile）**：定义若干"处理配置组"，每组打包一套 converter + embedding + VLM + summary，并对应一张自己的 collection（**只有 embedding 模型决定 collection 切分**，其余配置不影响）。connector 只需归属一个 config-profile；搜索时按组的 embedding 查该组 collection，跨组各出一份结果（不强行跨空间合并）。它跟 namespace 是不同的轴会组合（collection = f(namespace, config-profile)），slot 进 [02 §9.4](02-architecture.md#94-milvus-隔离collection_strategy) 的 `collection_strategy`。注意它跟 client 端 profile 无关，文档里别用裸 "profile" 称呼。
+
 ```toml
 [embedding]
 provider = "openai"             # openai | onnx | google | voyage | jina | mistral | ollama | local
