@@ -479,6 +479,26 @@ COMMIT;
 
 SQLite 路径建议 `concurrency = 1`，多 worker 在 SQLite 上互相 serialize 没收益。本机部署单 worker 够用。
 
+#### 多个 in-flight job 之间怎么选（$1 怎么定）：v0.4 = FIFO
+
+上面 SQL 里的 `connector_job_id = $1` 把一次 claim 限定在**一个 job 内**（一批 task 共享同一个 connector 上下文，chunk 阶段不用来回切）。但不同 connector 可以同时各有一个 running job（[§8](#8-并发协调) 的 unique 约束是 per-connector），所以要决定 `$1` 在多个 in-flight job 里怎么选。
+
+**v0.4 用 job 间 FIFO**：
+
+```
+pick_next_job(in_flight_jobs):
+    选【入队最早、且还有 pending task】的 job
+    → claim 它的一批 task（job 内按 priority ASC, started_at ASC，见 §6.3）
+    → 抽干了再选下一个最早的 job
+
+多 worker（远端 concurrency=N）:
+    N 个 worker 都收敛到当前最早那个 job → 全扑上去并行啃 → 啃完一起移到下一个
+```
+
+`pick_next_job` 是个**可替换的策略点**——v0.4 用 FIFO，将来按需换 round-robin / per-job worker 上限 / 加权公平，**不动 schema、不动 claim 之外的代码**。
+
+> **已知限制（队头阻塞）**：FIFO 下大 job 会延后后来的小 job——`mfs add postgres`（几小时）后再 `mfs add ./small-repo`（几秒的活），小仓库要等大表啃完才轮到。v0.4 接受它：早期用户很少同时跑多个巨型 job，队列里通常就一两个，FIFO 体感够用。真成痛点了再换 `pick_next_job` 策略（跨 job 公平调度是独立的一块，按需加，不在 v0.4 范围）。
+
 ### 6.3 优先级
 
 `object_tasks.priority` 越小越先。framework 在入队时调一次 `connector.task_priority(change)` 算出 priority 写进 task 行。**默认 0**，FIFO；只有有"首屏可见"诉求的 connector 才重写，比如 file connector 让 README / 核心源码先索引：

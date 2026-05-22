@@ -379,6 +379,8 @@ mfs add --all --force-index            # 重建全部（换全局 embedding 模�
 **为什么 v0.4 不做自动检测**：自动检测要一整套机制——sweep 全量扫 + config-hash gate 防止每次 sync 白扫 + index_state 比对 + 分级提示（embedding 破坏 search 必须重建 / chunker 只是 stale 可选）+ 维度变了要蓝绿重建 collection + 全局 fan-out 到所有 connector。这是一块**相对独立、且偏重**的能力，跟主链路（注册 / sync / 检索）解耦，放 v0.5+ 单独做更干净。v0.4 的原则简单：**用户手动改了配置，用户自己 `--force-index`**。
 
 > v0.5+ 计划：基于上面那条 breadcrumb，在 `mfs status / add / search` 三处检测配置漂移并按严重度提示，用户确认后台重建（含维度变化的蓝绿迁移）。connector 数据版本（DATA_VERSION）的自动失效也一并放 v0.5+。
+>
+> 实现上 v0.5+ 的"per-connector 检测"和"全局 fan-out"**不是两套逻辑，是同一个 reconcile 引擎的两个触发器**：reconcile（扫一个 connector 的 object、比 fp、入队重建）只有一份；per-connector 触发器在该 connector sync 时检查它自己的 config fp，全局触发器在 server 检测到全局配置变化时把同一个 reconcile 对所有 connector 各调一遍。两个触发器对应配置的两个 scope（connector TOML vs server.toml 全局），但不重复实现重建逻辑。
 
 ### 5.3 Milvus 上的失效行为
 

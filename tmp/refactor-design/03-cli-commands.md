@@ -108,7 +108,7 @@ mfs add slack://eng --since 2026-05-01              # 时间游标增量
 mfs connector probe postgres://prod --config x.toml
 ```
 
-6 个核心 flag：
+核心 flag：
 
 | flag | 作用 |
 |---|---|
@@ -117,10 +117,13 @@ mfs connector probe postgres://prod --config x.toml
 | `--watch` | 仅本地路径有效，启动 daemon 内 watcher |
 | `--no-watch` | 仅本地路径有效，停止该路径上 daemon 内已登记的 watcher（保留 connector + 索引） |
 | `--force-index` | 跳过 fingerprint 比对，server 端强制重 chunk + embed。**不重传字节**（upload flow 下 manifest diff 仍然有效）。覆盖 95% "我要 force" 的场景。**默认 confirm**：会重新跑 estimate（chunker + 本地 tokenizer，不打 embedding API）展示要重 embed 的 chunks / tokens 量，按 y/N 决定；`--yes` 跳过 |
+| `--all` | **范围 flag**，配合 `--force-index` 用：把 force-index 应用到所有已注册 connector（不带 `--all` 时只作用于 URI 指定的那一个）。换全局 embedding 模型后一次重建全部用它。底层 = 对每个 connector enqueue 一个 force_sync job，复用同一套重建逻辑（详见 [02 §6.2](02-architecture.md#62-worker-怎么拉-task)）|
 | `--force-upload` | 仅 upload flow（remote profile + 本地路径）有效；跳过 manifest diff，所有 path 都按 stale 处理，全量重新上传字节。imply `--force-index`。仅当怀疑 server staging 字节本身坏了时用 |
 | `--since <date>` | 仅时间游标 connector（postgres updated_at / slack ts / github / gmail）有效；其他报 `since_unsupported` |
 
 不提供 `--force` 短写法——避免歧义（到底重传不重传？）。shared fs 场景下 `--force-upload` 报错 `upload_not_applicable`。
+
+> 注意 `mfs add --all` 跟 `mfs search --all` 是两个不同的 `--all`：前者是 force-index 的"全部 connector"范围 flag；后者是 search 跨所有 connector 召回。各自语境清楚，不冲突。
 
 ### 首次注册外部 connector 的默认行为
 
