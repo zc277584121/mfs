@@ -78,6 +78,7 @@ file  LICENSE         text/plain           11 KB
     "fingerprint": "abc123",
     "last_seen": "2026-05-15T09:21:00Z",
     "indexable": true,
+    "search_status": "indexed",
     "capabilities": {
       "cat": "denied_unless_range",
       "grep": "pushdown",
@@ -88,7 +89,7 @@ file  LICENSE         text/plain           11 KB
 ]
 ```
 
-`capabilities` 告诉 agent 这个对象能用哪些命令——避免 agent 试错。
+`capabilities` 告诉 agent 这个对象能用哪些命令；`search_status`（`indexed` / `building` / `stale` / `not_indexed`）告诉 agent 语义索引就绪没——`indexed` 走 `search`，否则降级 `grep`（详见 [08 §7](08-agent-skill.md#7-让-agent-自己发现能力)）。两个字段一起让 agent 不用试错。
 
 ## 3. tree 的无界处理
 

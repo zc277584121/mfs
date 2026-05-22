@@ -301,6 +301,21 @@ mfs ls <uri> --json                     # 目录 URI 列子项 + 每项 capabili
 
 agent 看到 `cat="denied_unless_range"` 就不要直接 cat，走 head 或 range；看到 `grep="pushdown"` 就用 `mfs grep` 让 server 下推 SQL / API。
 
+### search 建好没：`search_status` 决定走 search 还是 grep
+
+`ls --json` 的每个 object 还带一个 `search_status`，告诉 agent 这个对象的语义索引就绪没（呼应"渐进可用"，agent 不用空等全量索引）：
+
+| search_status | agent 该走 |
+|---|---|
+| `indexed` | `mfs search`（语义混合，最佳） |
+| `stale` | 仍可 `search`（结果可能旧），或 `mfs add` 刷新后再搜 |
+| `building` | 还在建——`mfs status` 等就绪，或先用 grep 兜底 |
+| `not_indexed` | 没语义索引（indexable=false / chunk_max 超限 / 还没建）→ 用 grep |
+
+降级到 grep 时不依赖 Milvus（连接器下推或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)），所以索引没就绪也能精确匹配兜底。
+
+> grep 具体用哪个——`mfs grep`、系统 `grep`、`ripgrep`，还是 agent 框架自带的搜索 tool——**不强制**，用 agent 默认提供的那个即可。MFS 不要求特定实现，`mfs grep` 只是其中一条路径。
+
 这种动态发现让 agent 跟着新 connector 自动适应，不用每加一个 source 就改 skill 文件。
 
 ## 8. 多步骤任务的中断与恢复
