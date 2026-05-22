@@ -537,6 +537,8 @@ pick_next_job(in_flight_jobs):
 
 幂等性不依赖顺序：`chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)` 跟处理顺序无关。priority 只影响体感和调度便利性，不影响正确性。
 
+> **v0.4 这张表是 file connector 代码内置的，用户改不了**——connector TOML 的 `[[objects]]` 段和 `mfs add` flag 都没有 priority 入口。理由正是上一句：priority 只影响体感顺序、不影响正确性，内置启发式够用，不值得为它开一套用户配置面。用户自定义优先级（如 `[[objects]].priority` glob 覆盖）留 v0.5+ 真有人提再加，是纯增量、不动 schema。
+
 ### 6.4 Batching
 
 **三层叠加**，对 worker 透明：

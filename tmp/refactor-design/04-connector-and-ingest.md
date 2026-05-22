@@ -501,6 +501,25 @@ file connector 的 sync 流程：
 
 注意：file_state 只包含**文件本身的 fingerprint**（size / mtime_ns / inode / sha1），**不包含** chunker / embedding model / converter 版本。framework 层的配置变化跟 file_state 无关——v0.4 由用户手动 `--force-index` 处理（详见 §5.2 末尾）。
 
+#### 忽略规则（哪些文件根本不纳入）
+
+scan（上面 step 1）按三层 ignore 规则过滤，**被忽略的文件连 object 都不暴露**——不上传、不 cat、不索引，从一开始就不进 MFS：
+
+1. **默认规则**（framework 内置）：`.git/`、`node_modules/` 等明显无检索价值的目录，常见 binary / 媒体扩展名
+2. **仓库自带 `.gitignore`**：自动尊重，复用用户已经维护好的忽略表，不用重配
+3. **用户的 `.mfsignore`**（放 connector root，**gitignore 语法**）：MFS 专属排除清单，三层里**优先级最高**——可以用 `!pattern` 反选覆盖前两层（例如把 .gitignore 忽略的某个生成目录重新纳入，或排除 .gitignore 没覆盖的敏感目录）
+
+这跟 `indexable = false`（06 §13.2）是**两个不同层次的"排除"**，按需求选：
+
+| 想要 | 用 | 效果 |
+|---|---|---|
+| 文件根本不进 MFS（连 `ls` / `cat` 都看不到） | `.mfsignore` / `.gitignore` | scan 阶段就跳过：不暴露 object、不上传、不索引 |
+| 文件能浏览 / grep，但不进语义搜索（不 embed） | `[[objects]] indexable = false` | 暴露成 object、可 `cat` / `head` / `grep`，只是不进 Milvus |
+
+例：敏感目录不想让 agent 看到 → `.mfsignore` 排除；体量大但偶尔要 grep 的 audit 文件 → 留着但 `indexable = false`。
+
+`.mfsignore` 仅 file connector 有意义（其他 connector 的"排除"靠 connector TOML 的 `[[objects]]` match + `indexable=false` / `filter_expr`）。
+
 ### 5.6 Mid-job checkpoint
 
 [02 §7 规则 ③](02-architecture.md#7-一致性) 的默认行为是"state 末尾提交"：connector 中途崩 → state 不 commit → 下次重头跑。file / github code 这种重跑 cheap 的 connector 没问题；Slack / Gmail / Salesforce 这种被 rate limit 的 connector 重头跑会被打爆。

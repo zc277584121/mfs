@@ -173,7 +173,8 @@ class ConnectorPlugin(ABC):
         """返回该 object_task 在队列里的优先级，越小越先处理。
         默认 0 (FIFO within the job)。只有有"首屏可见"诉求的 connector
         需要重写——例如 file connector 让 README / 配置 / src/ 先索引。
-        Postgres / Slack / GitHub 一般保留默认即可。"""
+        Postgres / Slack / GitHub 一般保留默认即可。
+        v0.4 由 connector 写死，不暴露给用户配置（见 02 §6.3）。"""
         return 0
 
     async def acl(self, path: str) -> dict | None:
