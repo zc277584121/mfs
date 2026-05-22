@@ -314,7 +314,7 @@ class HealthStatus:
 
 ## 5. PROMPT.md 范本
 
-每个 connector 写一段 ASCII，描述自己 root 下的目录布局。`mfs connector inspect` 和 agent skill 都会用到。
+每个 connector 写一段 ASCII，描述自己 root 下的目录布局。**发版时 CI 会把它自动收进 agent skill 的 `references/connectors/<name>.md`**（详见 [08 §6](08-agent-skill.md#6-skill-目录结构)）——贡献者只管写好这份 PROMPT.md，不用手动发布。
 
 ```
 {prefix}                                          # = connector root URI 例如 postgres://prod

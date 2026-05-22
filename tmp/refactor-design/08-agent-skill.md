@@ -22,7 +22,7 @@ Agent 想找信息
 
 四条核心规则：
 
-1. 看到 URI 不要瞎猜——先 `mfs ls <uri>` 或 `mfs connector inspect <root>` 了解 connector 暴露什么对象
+1. 看到 URI 不要瞎猜——先 `mfs ls / tree <uri>` 看暴露什么对象，读 skill 的 connector reference 了解布局，`mfs connector inspect <root>` 看结构化 capabilities
 2. 结果是可继续操作的——search / grep 返回的 `source` URI 直接喂给 cat / head / export
 3. 大对象不要 cat——`mfs cat <uri>` 对大对象会拒绝，要用 head / tail / range / export
 4. 结构化对象不要用 `--peek / --skim / --deep`——这些只对 document / code 形态有效，对 JSONL 报错
@@ -141,7 +141,7 @@ mfs export <source> /tmp/data.jsonl && jq 'select(.id == 12)' /tmp/data.jsonl   
 mfs cat <source> -n <start>:<end>           # 直接读那段
 ```
 
-每种 chunk_kind 填哪些字段是稳定契约，见 [06 §15](06-search-and-retrieval.md#15-json-envelope-searchgrep)。`locator` 的内部 schema per-connector，agent 不要硬编码——遇到陌生 connector 先 `mfs connector inspect <root>` 拿它文档化的 locator schema。
+每种 chunk_kind 填哪些字段是稳定契约，见 [06 §15](06-search-and-retrieval.md#15-json-envelope-searchgrep)。`locator` 的内部 schema per-connector，agent 不要硬编码——读 skill 里该 connector 的 `references/connectors/<name>.md`（或 [06 §3](06-search-and-retrieval.md#3-locator-schema-per-connector) 的表）拿它文档化的 locator schema。
 
 ## 4. 反模式
 
@@ -213,73 +213,81 @@ skills/mfs/
 6. 错误码处理（本文 §5）
 7. 指向 `references/connectors/<name>.md`：agent 看到某 connector URI 就读对应的 reference 了解暴露的对象布局
 
-### `mfs skill build` 自动收纳 connector PROMPT
+### 连接器 PROMPT 由 CI 自动收纳进 references
 
-每个 connector 在自己目录里写 `PROMPT.md`（详见 [07 §5](07-contributing-connector.md#5-promptmd-范本)）。MFS 提供一个构建命令把这些 PROMPT 自动收纳到 skill 的 references 目录：
+每个 connector 在自己目录里写 `PROMPT.md`（详见 [07 §5](07-contributing-connector.md#5-promptmd-范本)）。**发版时 CI** 把这些 PROMPT 收纳进 skill bundle 的 references 目录——**不是用户敲的命令**：
+
+```
+CI 发版流程（对用户不可见）:
+  1. 扫所有内置 ConnectorPlugin
+  2. 每个 connector 的 PROMPT.md → references/connectors/<name>.md
+  3. protocol/errors.md → references/error-codes.md
+  4. SKILL.md frontmatter 盖章版本（见下）+ 更新 connector 索引
+  5. 整个 skills/mfs/ 作为一个包发布到 GitHub
+```
+
+贡献者的体验：**写好 `PROMPT.md` 就行，CI 自动把它发进主 skill 的 references，更新也自动跟**。没有 `mfs skill build` 这种用户命令——用户只通过自己 agent 框架的机制 install / update 这个包（Anthropic Skills / Cursor Rules / Cline 等都能直接消费这种 markdown bundle）。
+
+### 运行时只查结构化能力，不吐 prose
+
+per-connector 的**布局说明**（长 markdown）住在 bundle 的 `references/connectors/<name>.md`，agent 加载 skill 时就有、按相对链接读。**inspect 不再返回这一大段 prose**（那样的 JSON 体验很差）。运行时只查**结构化、小**的信息：
 
 ```bash
-# CLI 内置子命令
-mfs skill build --output ./skills/mfs/
-
-# 实际做的事：
-# 1. 扫所有已注册的 ConnectorPlugin
-# 2. 把每个 connector 的 PROMPT.md → skills/mfs/references/connectors/<name>.md
-# 3. 把 protocol/errors.md → skills/mfs/references/error-codes.md
-# 4. 在 SKILL.md 里更新 connector 索引（哪些 connector 可用）
+mfs connector list --json     # 看有哪些 connector 已注册
+mfs ls <uri> --json           # 看目录下有什么对象 + 每个对象的 capabilities
+mfs stat <uri> --json         # 单个对象的 capabilities（cat / grep / tail / range）
 ```
 
-发布到 agent ecosystem 时，整个 `skills/mfs/` 作为一个包。Anthropic Skills / Cursor Rules / Cline 等都可以直接消费这种格式。
+分工：**"这个 connector 怎么布局"读 bundle 里的 reference；"这个对象能用什么命令"查 `ls/stat` 的结构化 capabilities**。两边内容不相交——一个是 prose 文档（bundle），一个是结构化字段（runtime），不重复、agent 不会纠结看哪个。
 
-### 运行时 query
+### Skill 版本管理：整份装着 + 自检版本 + 温和修复
 
-agent 即使没读 references 也能动态发现：
+skill 跟 MFS 是**两条独立安装轨**——skill 由 agent 框架管（npx skills / Cursor / Cline，各有机制、且跟 MFS 版本无耦合），MFS 由用户自己装。所以 skill 版本和运行中 MFS 版本**会漂移**。
 
-```bash
-mfs connector list --json                       # 看哪些 connector 已注册
-mfs connector inspect <root> --json             # 看具体一个 connector 的 PROMPT + capabilities + 暴露的对象
-mfs stat <uri> --json                           # 看单个对象的 capabilities
+不试图阻止漂移（做不到），而是**让 agent 自己察觉 + 温和修复**：
+
+**① skill frontmatter 盖版本**（CI 发版时写）：
+
+```yaml
+---
+name: mfs
+version: 0.4.3                # 这份 skill 出自哪个 MFS 版本
+mfs_compat: ">=0.4,<0.5"      # 兼容的运行时 MFS 版本范围
+---
 ```
 
-`connector inspect` 返回的 PROMPT 字段就是 connector 的 `PROMPT.md` 内容——跟 skill references 里同一份，运行时拉取作为兜底。
+skill 不走 git、靠框架机制装，所以版本只能写在它自己的 frontmatter 里——这是 agent 运行时唯一读得到的地方。
 
-### Skill 版本管理：不跟 MFS 版本锁定，靠运行时发现自愈
-
-skill 和 MFS 是**两条独立的安装轨**，谁都管不到对方：
+**② SKILL.md 指令 agent 操作前轻检查**（gentle，不打断）：
 
 ```
-skill 安装/更新  →  由 agent 框架管（Anthropic Skills / Cursor Rules / Cline ...，各有各的机制）
-MFS 安装/更新    →  用户自己装（brew / uv / docker）在自己环境里
+执行 MFS 操作前，跑 mfs --version / mfs status 拿运行中 MFS 版本，
+跟本 skill frontmatter 的 mfs_compat 比一下。
+对不上 → 心里有数即可，照常继续（核心命令/玩法大概率没变，多数版本差异无害）。
 ```
 
-如果让 skill 版本死锁 MFS 版本，必然很痛（两条轨各自更新，永远对不齐）。**解法是反过来——把 skill 做薄、让运行时 `inspect` 当权威，版本漂移自愈**：
-
-- **skill 主体（稳定、几乎不随版本变）**：心智模型、命令清单、工作流、反模式、错误码，加一条核心指令——"遇到任何 connector，先 `mfs connector inspect <root>` 拿它当前的布局，别只依赖 references 里记的"
-- **references/connectors/ 里的 PROMPT 快照**：只是**缓存/便利**（省一次 inspect 往返），不是权威。权威永远是运行时 `inspect` 返回的、**当前运行的那份 connector 代码**的 PROMPT + capabilities
-- **后果**：哪怕 agent 手里的 skill 旧了、references 里是 postgres 老布局，agent 一跑 `inspect` 就拿到当前布局，自我纠正 → **版本漂移不破坏正确性，最多是缓存的便利信息略旧**
-
-这样两条轨**不需要同步**，通过运行时发现松耦合：
+**③ 真跑挂时才升级处理**：
 
 ```
-agent 框架管 skill 安装  ──┐
-                          ├── 松耦合点：mfs connector inspect（拉当前真相）
-用户环境管 MFS 安装    ──┘     MFS 永远是权威，skill 只教 agent "去问 MFS"
+某命令报错 / 行为不符 + 之前已知版本对不上
+  → agent 反应过来"很可能版本错位"
+  → 读 SKILL.md / README 的【版本修复建议】段，反过来引导用户：
+     "你的 skill 是 0.4、MFS 是 0.6，更新 skill 用 <命令>、更新 MFS 用 <命令>，同步一下"
 ```
 
-落地约定：
+**④ 修复建议固定写在 SKILL.md / README**：怎么更新 skill（`npx skills update mfs` 之类）、怎么更新 MFS CLI（`uv tool upgrade mfs` / `brew upgrade mfs`）。agent 在版本不符尤其跑挂时看这一眼就知道怎么引导。
 
-- `SKILL.md` 头部嵌一行 `requires mfs >= 0.4` 做**粗粒度**版本校验（agent / 用户 `mfs --version` 一对就知道大版本兼容性）；细节布局不靠 skill 静态匹配，靠运行时 inspect
-- 升级 MFS 后想刷新静态 references，重跑 `mfs skill build` 再按 agent 机制重装一次——但这是**优化不是正确性必需**（运行时 inspect 兜底）
-- MFS 只负责产出标准 skill 包 + 各生态的安装说明；**不接管 agent 框架的 skill 生命周期**（那本来就不该 MFS 管）
+精髓：**先试别拦，只在真跑挂时凭"已知版本不符 + 固定修复建议"引导用户同步**。符合"多数更新主框架不变"的现实，比一上来强提示舒服。
 
-> v0.5+ 配置漂移检测落地后，`inspect` 可以多返回 connector 的 DATA_VERSION / 包版本，让 skill 侧也能显式看出"我对接的是哪个版本"（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）。v0.4 先靠 `requires mfs >= X` + 运行时 inspect 就够。
+> per-connector 单独版本字段先不做（skill 级 `mfs_compat` 已回答"整体对不对得上"这个粗问题）；以后真要更细信号，再在 `references/connectors/<name>.md` 的 frontmatter 加 `version`，是增量。
 
 ## 7. 让 agent 自己发现能力
 
-agent 不要硬编码"什么 connector 支持什么操作"。运行时 query：
+agent 不要硬编码"什么 connector 支持什么操作"。运行时 query 的是**结构化 capabilities**（不是 prose 布局——布局读 skill 的 `references/connectors/<name>.md`）：
 
 ```bash
 mfs connector list --json
-mfs connector inspect <root> --json     # 拿到该 connector 的 PROMPT / capabilities / 暴露的对象
+mfs ls <uri> --json                     # 目录下有什么对象 + 每个对象的 capabilities
 mfs stat <uri> --json                   # 单个对象的 capabilities（cat / grep / tail / range）
 ```
 

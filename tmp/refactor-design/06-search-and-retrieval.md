@@ -757,7 +757,7 @@ Search: partial
 envelope 的设计原则是**外壳固定、内核可变、可变的部分也被文档化**：
 
 - **固定外壳**（每个 connector 都填同样的顶层 key）：`source / lines / locator / content / score / metadata{kind, chunk_kind, connector_type, media_type, fields}`。agent 只认这层，跨 connector 一致
-- **可变内核**：`locator` 的内部结构（postgres `{schema,table,pk}` / slack `{channel,date,thread_ts}`）和 `metadata.fields` 的字段（ticket 的 status/priority、PR 的 merged_at）per-connector。但每个 connector 的 locator schema 是**文档化的稳定契约**（见 [§3](#3-locator-schema-per-connector) + `mfs connector inspect`），不是自由发挥
+- **可变内核**：`locator` 的内部结构（postgres `{schema,table,pk}` / slack `{channel,date,thread_ts}`）和 `metadata.fields` 的字段（ticket 的 status/priority、PR 的 merged_at）per-connector。但每个 connector 的 locator schema 是**文档化的稳定契约**（见 [§3](#3-locator-schema-per-connector) 的表 + skill 里该 connector 的 reference 文档），不是自由发挥
 
 agent 读外壳，遇到 locator 内核就查该 connector 文档化的 schema——**差异是"被文档化的差异"**。
 
