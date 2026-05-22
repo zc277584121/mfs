@@ -189,19 +189,19 @@ class ConnectorPlugin(ABC):
 @dataclass
 class Capabilities:
     # sync
-    manual_sync: bool = True
-    scheduled_sync: bool = True
+    manual_sync: bool = True            # v0.4 都是 True；定时调度不内置，用户自带 cron（见 04 §9）
     watch: bool = False                 # 仅 file connector true
     cursor_kind: str | None = None      # "updated_at" / "snowflake" / "etag" / None
     full_scan: bool = True
 
     # deletion detection 模式（决定 framework 怎么走 deletion reconcile，详见 02 §7.4）
     delete_detection: Literal[
-        'never',              # 源头不能识别 delete（如 slack message）→ 永远跳过 deletion
-        'explicit',           # 只在 yield "deleted" event 时删（最保守，默认）
-        'full_scan_diff',     # 每次 sync 都 full scan，framework 可推断 delete
-        'periodic_full_scan', # 部分 sync 是 full（connector 在 SyncOptions 里告诉 framework 本次是不是 full）
-        'state_change',       # 用 state 变化（closed/locked/archived）替代 delete
+        'never',          # 源头不能识别 delete（如 slack message）→ 永远跳过 deletion
+        'explicit',       # 只在 yield "deleted" event 时删（最保守，默认）
+        'full_scan',      # 本次是全量枚举 → framework 用全集 diff 推断 delete
+                          #   （file 每次都全量；postgres 等增量 connector 在用户跑全量 sync 时才是 full，
+                          #    connector 通过 SyncOptions 告诉 framework "本次是不是 full"）
+        'state_change',   # 用 state 变化（closed/locked/archived）替代 delete
     ] = 'explicit'
 
     # object access（声明 connector 是否重写了对应方法、有更高效的实现）
@@ -884,7 +884,7 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 | 在 connector 里直接写 Milvus | 不行，走 framework pipeline |
 | 在 connector 里直接调 OpenAI embedding | 不行，同上 |
 | 在 connector 里读 `~/.mfs/cache/` | 不行，走 framework storage adapter |
-| 在 connector 里写 schedule cron | 不行，用户在 connector TOML 写 `schedule`，framework scheduler 调 |
+| 在 connector 里写定时调度 | v0.4 不内置 scheduler，周期刷新靠用户系统 cron 调 `mfs add`（见 04 §9）|
 | 暴露不在 PROMPT.md 描述里的 path | 不行，暴露 = 文档化 |
 | 自定义 `namespace_id` 行为 | 不行，由 framework 注入 |
 | 用新的 URI scheme（如 `myco://`） | 可以，注册即可 |
@@ -902,7 +902,7 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 4. 怎么判断对象变化？fingerprint 算什么？
 5. 哪些对象要索引（进 chunk）？text_fields 默认是什么？
 6. 能否下推 grep / search / tail？
-7. **upstream 能不能识别 delete？属于 `delete_detection` 的哪一档**（`never` / `explicit` / `full_scan_diff` / `periodic_full_scan` / `state_change`）？详见 [02 §7.4](../02-architecture.md#74-deletion-策略)
+7. **upstream 能不能识别 delete？属于 `delete_detection` 的哪一档**（`never` / `explicit` / `full_scan` / `state_change`）？详见 [02 §7.4](../02-architecture.md#74-deletion-策略)
 8. 凭据是什么？OAuth scope 要哪些？
 9. 用户必填配置最少是什么？
 

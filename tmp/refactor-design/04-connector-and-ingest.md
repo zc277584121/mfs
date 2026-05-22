@@ -719,7 +719,7 @@ mfs add ./repo --watch --interval 60s
 - 停止单个 watch（保留 connector）：`mfs add ./repo --no-watch`
 - 连 connector 一起删：`mfs remove ./repo`
 - 停整个 daemon（所有 watch 一起停）：`mfs serve stop`
-- 外部 connector 不支持 watch，用 scheduler 周期触发
+- 外部 connector 不支持 watch；要周期刷新用系统 cron / CI 调 `mfs add`（v0.4 不内置 scheduler，见 §9）
 
 > Ctrl+C `mfs add --watch` CLI 进程只杀 CLI 自己，**不影响 daemon 内已经登记的 watcher**——watch 的生命周期跟 daemon 绑定，不跟启动它的那次 CLI 调用绑定。
 
@@ -748,7 +748,7 @@ daemon 启动:
 
 为什么这件事不大：
 
-- **watch 只在本机 profile 有意义**——生产 CS 部署根本不用 watch，用 scheduler（§9）周期触发。所以"daemon 重启 watch 丢"在生产场景不存在
+- **watch 只在本机 profile 有意义**——生产 CS 部署根本不用 watch，用系统 cron 调 `mfs add` 周期刷新（§9）。所以"daemon 重启 watch 丢"在生产场景不存在
 - **就算 watch 真断了一阵也不丢数据**：watch 只是"触发信号"，最终事实来自 scan + manifest 对比（§5.5）。断的这段时间发生的改动，下次 `mfs add`（或 daemon 重启 replay 后第一次扫）会全量对比补上
 - **已索引的成果都在 DB / Milvus，重启不丢**：connector_state（cursor）、file_state、Milvus chunks 都持久化；in-flight 的 `running` job 靠 heartbeat 超时（02 §7.1）重置 pending、幂等重跑
 
@@ -765,8 +765,9 @@ daemon 启动:
   "connector_type": "postgres",
   "uri_scheme": "postgres",
   "sync": {
-    "manual": true, "scheduled": true, "watch": false,
-    "cursor": "updated_at", "full_scan": true, "delete_detection": true
+    "manual": true, "watch": false,
+    "cursor": "updated_at", "full_scan": true,
+    "delete_detection": "full_scan"
   },
   "object": {
     "grep_pushdown": true, "search_pushdown": false,
@@ -785,13 +786,22 @@ framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL
 | 策略 | 适合 connector | 触发方式 |
 |---|---|---|
 | 手动 | 所有 | `mfs add <uri>` |
-| watch | 本地目录 | `mfs add . --watch` |
-| 定时 | slack / github / SaaS / DB / web | daemon scheduler 或外部 cron |
-| 游标 | slack / gmail / 部分 SaaS | provider cursor 或 updated_at |
-| snapshot 对比 | s3 / gdrive / DB fallback | 周期列举对比 |
-| append-only | logs / chat / events | 追加尾部 + 定期校准 |
+| watch | 本地目录 | `mfs add . --watch`（仅本地文件，实时）|
+| 游标 | slack / gmail / 部分 SaaS | provider cursor 或 updated_at（连接器内部增量手段，仍由一次 `mfs add` 触发）|
+| snapshot 对比 | s3 / gdrive / DB fallback | 全量列举对比（由一次全量 `mfs add` 触发）|
+| append-only | logs / chat / events | 追加尾部 + 全量校准 |
 
-daemon 内置简单 scheduler（基于 SQLite + APScheduler 风格），用户可在 connector TOML 写 `schedule = "*/15 * * * *"` cron 表达式。
+**v0.4 不内置定时调度（scheduler）**。除本地文件的 `--watch` 外，所有同步都由用户主动 `mfs add` 触发。游标 / snapshot / append-only 说的是"连接器内部怎么算增量"，不是"什么时候自动跑"——它们都还是等一次 `mfs add` 来触发。
+
+想要外部 connector 周期性刷新，用系统 cron / CI 调 CLI 即可（MFS 不拥有这件事）：
+
+```bash
+*/15 * * * *  mfs add slack://eng        # 自己的 crontab，零 MFS 代码
+```
+
+`mfs status` 显示每个 connector "上次同步多久前"，用户据此决定何时手动刷。
+
+> 内置 scheduler（在 connector TOML 写 `schedule = "*/15 * * * *"` + daemon 自动触发 + 多副本单飞协调）是 v0.5+ 范畴——独立的便利能力，v0.4 用"手动 + 自带 cron"兜底，不引入调度复杂度。
 
 ## 10. 错误恢复与重跑
 

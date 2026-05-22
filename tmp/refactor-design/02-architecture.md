@@ -797,9 +797,10 @@ framework 怎么决定 "Milvus 里哪些 chunk 该删"？核心约束：**"没 y
 
 模式信号来源：
 
-- `SyncOptions.full = True`（用户 `--force-index`）
-- connector 内部周期逻辑声明本次是 full scan（例：postgres "每 N 次增量后跑一次全量 PK diff" 那一次）
+- `SyncOptions.full = True`（用户 `--force-index`，或连接器自己决定本次走全量枚举）
 - `delete_detection = 'never'` 的 connector（如 slack）→ 永远跳过 deletion
+
+> v0.4 不内置定时调度，所以"全量 sync"基本是用户主动触发的（手动 `--force-index` 或自带 cron 调一次全量）。postgres 这类 `full_scan` connector 的删除，就在这种用户触发的全量 sync 时被发现，不自动发现（详见 04 §9）。
 
 #### 7.4.1 为什么不需要阈值 / confirm 这类防护
 
@@ -821,12 +822,12 @@ deletion 是 sync 末尾、枚举成功之后才跑的。抖动时：
 
 | Connector | sync 模式 | `delete_detection` | 实际行为 |
 |---|---|---|---|
-| `file` (本机 / CS) | 每次都是 full scan + manifest diff | `'full_scan_diff'` | 每次 sync 都能推断删除 |
-| `postgres rows` | 增量 cursor + 周期 full PK diff | `'periodic_full_scan'` | 增量跑时跳过；周期 full 跑时推断删除 |
+| `file` (本机 / CS) | 每次都是 full scan + manifest diff | `'full_scan'` | 每次 sync 都是全量 → 每次都能推断删除 |
+| `postgres rows` | 增量 cursor，全量 sync 时做 PK diff | `'full_scan'` | 增量跑时跳过删除；用户跑全量 sync 时推断删除 |
 | `slack messages` | ts cursor 单调推进 | `'never'` | 永远跳过 deletion（消息不会被删的语义）|
 | `github issues` | updated_at cursor | `'state_change'` | closed/locked 走 yield "modified"，不删 |
 | `gdrive` | changes API | `'explicit'` | changes API 报 delete 时 yield "deleted" |
-| `s3` | list + 周期 full list | `'periodic_full_scan'` | 同 postgres rows |
+| `s3` | list，全量 sync 时对比 | `'full_scan'` | 同 postgres rows |
 
 `delete_detection` 是 connector 作者在代码 `Capabilities` 里声明的**能力事实**（不是用户配置），完整枚举见 [07 §3](07-contributing-connector.md#3-connectorplugin-契约)。新 connector 不声明默认 `'explicit'`（最保守，只删上游明确报删的）。
 
@@ -985,7 +986,7 @@ Current job: job_remove_xx (queued)
   waiting for: job_sync_yy (cancelling)
 ```
 
-Scheduler / Watcher 也通过同一个 flag 协调：`connectors.status='removing'` 时 scheduler 跳过这个 connector、watcher 停止该 root，避免 race。
+Watcher 也通过同一个 flag 协调：`connectors.status='removing'` 时 watcher 停止该 root，避免 race。
 
 ## 9. 多租户与 namespace
 
@@ -1147,7 +1148,7 @@ connector_jobs (
   namespace_id          VARCHAR DEFAULT 'default',
   connector_id          VARCHAR REFERENCES connectors(id),
   op_kind               VARCHAR,        -- 'sync' | 'force_sync' | 'remove' | 'update_config'
-  trigger               VARCHAR,        -- 'manual' | 'scheduled' | 'watch'
+  trigger               VARCHAR,        -- 'manual' | 'watch'（'scheduled' 预留给 v0.5+ 内置调度）
   status                VARCHAR,        -- 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'failed'
   started_at            TIMESTAMP,
   finished_at           TIMESTAMP,
