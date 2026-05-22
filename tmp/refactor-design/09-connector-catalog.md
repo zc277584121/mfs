@@ -34,7 +34,7 @@ file connector 在 client / server 共享 fs 时直接读本机；不共享 fs �
 
 ## Web
 
-抓取网页转 markdown 缓存：
+抓取网页转 markdown 缓存（v0.4 默认抓静态 / SSR HTML：aiohttp + markitdown；JS-heavy SPA 留 v0.5+，可选 crawl4ai backend）：
 
 ```text
 web://<alias>/

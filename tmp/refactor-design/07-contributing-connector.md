@@ -562,7 +562,7 @@ class PostgresPlugin(ConnectorPlugin):
 
 ```python
 import aiohttp
-from html2text import HTML2Text
+from markitdown import MarkItDown          # HTML→markdown，与 PDF/DOCX 等共用一个 converter
 from mfs_server.connectors.base import (
     ConnectorPlugin, Capabilities, FileStat, Entry, ObjectChange,
 )
@@ -657,6 +657,7 @@ class WebPlugin(ConnectorPlugin):
 - **不实现 `read_records`**——web page 不是结构化数据，bytes 自然形态
 - **`list` 自维护 path tree**——枚举 state 里 `pages` map 的 path prefix。framework 不提供 path tree helper（每个动态 connector 自己几行实现），如果常见可以 v0.5+ 抽出 `VirtualPathTree` helper
 - **checkpoint 是合法的**——`visited` 集合单调推进，`pages` map 跟 visited 同步增长，下次接续会跳过 visited，BFS 续跑（详见 [04 §5.6.1](04-connector-and-ingest.md#561-哪些-state-能调-checkpoint)）
+- **HTML→markdown 走 markitdown**——跟 PDF/DOCX 等共用一个 converter 框架，版本进 `artifact_fp(converted_md)` 并在 pyproject pin。v0.4 默认抓**静态 / SSR HTML**（够覆盖多数文档站）；JS-heavy SPA 留 v0.5+，届时可选 `crawl4ai` backend（`mfs-server[web-crawl4ai]`，引入 playwright 做 JS 渲染）
 
 ### 6.3 用户体验
 

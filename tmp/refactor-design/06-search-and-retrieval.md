@@ -329,7 +329,7 @@ search/grep will be unavailable for this object until you add:
 `body` chunk（document / code 正文切分）的切块器是 framework 内置的（贡献者碰不到，见 [07 §0](07-contributing-connector.md#0-必须实现-vs-可选重写)）：
 
 - **纯文本 / markdown** → **Chonkie** `RecursiveChunker`：自带 markdown recipe，且 **token-aware**——tokenizer 跟 embedding 用的对齐，切块边界吃满 token 预算，不像字符切分那样跟 embedding 口径错位。
-- **代码** → tree-sitter AST 切分（一个函数 / 一个 class / 一段 region）；也可直接用 Chonkie `CodeChunker`（本身是 tree-sitter 封装、多语言），跟文本共用一套依赖和 tokenizer 口径。代码切分必须兜住边角：
+- **代码** → Chonkie `CodeChunker`（底层 tree-sitter、多语言），跟文本共用一套依赖和 tokenizer 口径，不自己接 tree-sitter。切出来是一个函数 / 一个 class / 一段 region。代码切分必须兜住边角：
   - 单个 AST 节点就超 chunk_size（巨型函数）→ 节点内按子节点 / 行递归下钻，不整块塞
   - 解析失败（语法错误 / 不支持的语言）→ fallback 到 recursive / 按行硬切，不丢文件
   - minified / 单行巨型文件 → AST 退化，按 token 硬切
@@ -498,13 +498,14 @@ model    = "gpt-4o-mini"        # 必须是 vision 模型
 prompt   = "Describe this image..."
 
 [converter]
-default = "pymupdf"             # pymupdf | docx2txt | llamaparse | marker | docling | mineru
-                                # 文档 → markdown 的解析器，按文件类型自动路由
+default = "markitdown"          # 默认：一个库吃 PDF/DOCX/DOC/PPT/XLSX/图片/HTML，轻
+                                # 高质量可选 backend：docling | marker | mineru | llamaparse（重，按需路由）
+                                # 按文件类型 / path 自动路由
 
-# 按 path glob 路由到特定 converter（可选）
+# 按 path glob 路由到特定 converter（可选；markitdown 对复杂 PDF 偏弱时上重型）
 [[converter.routes]]
 match = "**/scanned/*.pdf"
-provider = "llamaparse"         # 扫描件 / 复杂表格 / 公式上 LLM-based 质量更好
+provider = "docling"            # 扫描件 / 复杂表格 / 布局：vision 模型质量显著更好
 
 [[converter.routes]]
 match = "**/papers/*.pdf"
@@ -520,7 +521,7 @@ provider = "marker"             # 学术 PDF
 
 这套是 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain) fingerprint chain 的直接应用——每层产物的 fp 公式都把所属 provider / model / version 揉进去，换工具自动失效对应层。
 
-**converter 路线图**：v0.4 内置 `pymupdf` + `docx2txt`，作为 plugin scheme 预留 `llamaparse / marker / docling / mineru` 等高质量 converter——它们对复杂表格、嵌入公式、扫描件的解析质量显著优于传统库，用户按文件类型路由即可。
+**converter 路线图**：v0.4 默认 `markitdown`（一个库覆盖 PDF/DOCX/DOC/PPT/XLSX/图片/HTML），`docling / marker / mineru / llamaparse` 等高质量 converter 作为可选 backend（`mfs-server[converter-docling]` 等 extra 按需装）——它们对复杂表格、嵌入公式、扫描件显著更好但更重，不进默认安装，用户按文件类型 / path 路由即可。converter 版本进 `artifact_fp(converted_md)`（04 §5.2），换 converter 自动失效重转。
 
 ### 10.1 Transformation cache：跨调用复用 API 结果
 
