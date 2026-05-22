@@ -242,6 +242,37 @@ mfs stat <uri> --json                           # 看单个对象的 capabilitie
 
 `connector inspect` 返回的 PROMPT 字段就是 connector 的 `PROMPT.md` 内容——跟 skill references 里同一份，运行时拉取作为兜底。
 
+### Skill 版本管理：不跟 MFS 版本锁定，靠运行时发现自愈
+
+skill 和 MFS 是**两条独立的安装轨**，谁都管不到对方：
+
+```
+skill 安装/更新  →  由 agent 框架管（Anthropic Skills / Cursor Rules / Cline ...，各有各的机制）
+MFS 安装/更新    →  用户自己装（brew / uv / docker）在自己环境里
+```
+
+如果让 skill 版本死锁 MFS 版本，必然很痛（两条轨各自更新，永远对不齐）。**解法是反过来——把 skill 做薄、让运行时 `inspect` 当权威，版本漂移自愈**：
+
+- **skill 主体（稳定、几乎不随版本变）**：心智模型、命令清单、工作流、反模式、错误码，加一条核心指令——"遇到任何 connector，先 `mfs connector inspect <root>` 拿它当前的布局，别只依赖 references 里记的"
+- **references/connectors/ 里的 PROMPT 快照**：只是**缓存/便利**（省一次 inspect 往返），不是权威。权威永远是运行时 `inspect` 返回的、**当前运行的那份 connector 代码**的 PROMPT + capabilities
+- **后果**：哪怕 agent 手里的 skill 旧了、references 里是 postgres 老布局，agent 一跑 `inspect` 就拿到当前布局，自我纠正 → **版本漂移不破坏正确性，最多是缓存的便利信息略旧**
+
+这样两条轨**不需要同步**，通过运行时发现松耦合：
+
+```
+agent 框架管 skill 安装  ──┐
+                          ├── 松耦合点：mfs connector inspect（拉当前真相）
+用户环境管 MFS 安装    ──┘     MFS 永远是权威，skill 只教 agent "去问 MFS"
+```
+
+落地约定：
+
+- `SKILL.md` 头部嵌一行 `requires mfs >= 0.4` 做**粗粒度**版本校验（agent / 用户 `mfs --version` 一对就知道大版本兼容性）；细节布局不靠 skill 静态匹配，靠运行时 inspect
+- 升级 MFS 后想刷新静态 references，重跑 `mfs skill build` 再按 agent 机制重装一次——但这是**优化不是正确性必需**（运行时 inspect 兜底）
+- MFS 只负责产出标准 skill 包 + 各生态的安装说明；**不接管 agent 框架的 skill 生命周期**（那本来就不该 MFS 管）
+
+> v0.5+ 配置漂移检测落地后，`inspect` 可以多返回 connector 的 DATA_VERSION / 包版本，让 skill 侧也能显式看出"我对接的是哪个版本"（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）。v0.4 先靠 `requires mfs >= X` + 运行时 inspect 就够。
+
 ## 7. 让 agent 自己发现能力
 
 agent 不要硬编码"什么 connector 支持什么操作"。运行时 query：
