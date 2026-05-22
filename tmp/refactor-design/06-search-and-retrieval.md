@@ -324,6 +324,19 @@ search/grep will be unavailable for this object until you add:
 | `record_collection` (issues.jsonl/records.jsonl) | `record_aggregate` 或 `row_text` | 一条 record 拼字段 |
 | `directory` | 可选 `directory_summary` | LLM 给出的目录功能描述 |
 
+### chunker 实现选型
+
+`body` chunk（document / code 正文切分）的切块器是 framework 内置的（贡献者碰不到，见 [07 §0](07-contributing-connector.md#0-必须实现-vs-可选重写)）：
+
+- **纯文本 / markdown** → **Chonkie** `RecursiveChunker`：自带 markdown recipe，且 **token-aware**——tokenizer 跟 embedding 用的对齐，切块边界吃满 token 预算，不像字符切分那样跟 embedding 口径错位。
+- **代码** → tree-sitter AST 切分（一个函数 / 一个 class / 一段 region）；也可直接用 Chonkie `CodeChunker`（本身是 tree-sitter 封装、多语言），跟文本共用一套依赖和 tokenizer 口径。代码切分必须兜住边角：
+  - 单个 AST 节点就超 chunk_size（巨型函数）→ 节点内按子节点 / 行递归下钻，不整块塞
+  - 解析失败（语法错误 / 不支持的语言）→ fallback 到 recursive / 按行硬切，不丢文件
+  - minified / 单行巨型文件 → AST 退化，按 token 硬切
+  - 超小文件 → 整文件一个 chunk
+
+这些 chunker 的版本（含 Chonkie / tree-sitter 库版本）钉进 `chunker_version` 进 fingerprint，库版本在 `pyproject.toml` pin 死，升级走显式 bump（见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)）。
+
 ## 7. Search 流程
 
 ```

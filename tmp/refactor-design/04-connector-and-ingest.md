@@ -259,7 +259,7 @@ framework 把这些声明组装成 DAG，每条边代表"我依赖什么"。各 
 ```
 document (md/code/text)
     upstream → chunk.body → embedding
-                ↑ [chunker_name, chunker_config, tokenizer_version]
+                ↑ [chunker_name, chunker_version, chunker_config, tokenizer_version]
                               ↑ [embedding_model, embedding_version]
 
 document (pdf/docx/gdoc)
@@ -311,7 +311,7 @@ artifact_fp(page_cache)      = sha1( upstream )
 artifact_fp(head_cache)      = sha1( upstream + N )
                                                                     ← artifact_cache.fingerprint
 
-chunk_fp(body)               = sha1( artifact_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
+chunk_fp(body)               = sha1( artifact_fp(converted_md) + chunker_name + chunker_version + chunker_config + tokenizer_version )
 chunk_fp(row_text)           = sha1( upstream + text_fields + template_version )
 chunk_fp(thread_aggregate)   = sha1( upstream + group_by + agg_template_version )
 chunk_fp(vlm_description)    = sha1( artifact_fp(vlm_text) )
@@ -326,6 +326,8 @@ embedding_fp                 = sha1( chunk_fp + embedding_model + embedding_mode
 Connector 不参与这套逻辑，只提供 upstream fingerprint。下游全由 framework 算。
 
 公式里的 `chunker_config` / `vlm_prompt` 等是**序列化字符串**（JSON / TOML），把所有相关参数揉进去——chunk_size 改 1500→1000，序列化字符串就变，hash 就变。换 provider / model 同理：`embedding_model` 含 provider/model/version 三段。
+
+**chunker 的唯一性靠 `chunker_name + chunker_version` 两段**，跟 embedding 的 `model + version` 同理，但要小心一个区别：embedding model 是**外部锚**（provider+model+version 定死输出），而 chunker 是 MFS 自己集成的代码——`chunker_config` 只捕获"配置变了"（chunk_size 等），**捕获不了"切分逻辑的代码实现变了"**。比如升级了 markdown chunker 的边界规则、name/config 都没动，旧 chunk 会悄悄 stale。所以每个 chunker 显式声明 `chunker_version`，**且当它封装第三方库时，库版本要钉进这个 version**（纯文本用 Chonkie、代码用 tree-sitter，详见 [06 §6](06-search-and-retrieval.md#6-各-object_kind-的-chunk-来源)）。第三方库升级会悄悄改切分行为，所以 `pyproject.toml` 必须 pin 死库版本，升级走一次显式 bump `chunker_version` + `mfs add --force-index` 重建，不让它静默漂移。
 
 注意：**配置字符串只进 fp 不进 chunk_id**。chunk_id 是主键，目标是"同一条 record 重 sync 时 UPSERT 覆盖同一行"，所以只用 namespace/connector/object/locator/chunk_kind（这些跟 config 无关）。chunk_fp 才是判断"内容是不是 stale"的指纹，含所有 config。否则换 config 后旧行就成"幽灵行"无法 UPSERT 覆盖。
 
