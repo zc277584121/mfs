@@ -132,7 +132,7 @@ Worker running in background. Run `mfs status` to check progress.
 type = "postgres"                       # 必填，决定走哪个 plugin
 root = "postgres://prod"                # 必填
 label = "Production Postgres"
-credential_ref = "secret:pg-prod-readonly"
+credential_ref = "env:PG_PROD_DSN"         # v0.4 只支持 env: scheme（见 02 §11）
 
 # connector 类型特定配置
 [postgres]
@@ -314,7 +314,7 @@ artifact_fp(head_cache)      = sha1( upstream + N )
 chunk_fp(body)               = sha1( artifact_fp(converted_md) + chunker_name + chunker_config + tokenizer_version )
 chunk_fp(row_text)           = sha1( upstream + text_fields + template_version )
 chunk_fp(thread_aggregate)   = sha1( upstream + group_by + agg_template_version )
-chunk_fp(vlm_chunk)          = sha1( artifact_fp(vlm_text) )
+chunk_fp(vlm_description)    = sha1( artifact_fp(vlm_text) )
 chunk_fp(schema_summary)     = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
 chunk_fp(directory_summary)  = sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
                                                                     ← Milvus 行 chunk_fingerprint

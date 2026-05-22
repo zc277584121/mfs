@@ -592,6 +592,7 @@ JSON：
 | `is_directory` | 对目录 cat |
 | `connector_unhealthy` | connector healthcheck 失败 |
 | `density_unsupported` | 对结构化对象用 `--peek/--skim/--deep` |
+| `range_unsupported` | 对二进制 / image 对象用 `--range` |
 | `chunk_max_exceeded` | 该对象超过 `chunk_max`，部分索引 |
 | `local_server_unavailable` | local profile 但本机 server 进程不可达 |
 | `field_missing` | connector 数据缺 text_fields 配置的字段 |

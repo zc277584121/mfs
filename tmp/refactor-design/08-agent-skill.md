@@ -234,11 +234,10 @@ per-connector 的**布局说明**（长 markdown）住在 bundle 的 `references
 
 ```bash
 mfs connector list --json     # 看有哪些 connector 已注册
-mfs ls <uri> --json           # 看目录下有什么对象 + 每个对象的 capabilities
-mfs stat <uri> --json         # 单个对象的 capabilities（cat / grep / tail / range）
+mfs ls <uri> --json           # 目录 URI 列子项 + 每项 capabilities；单对象 URI 返回该对象自身那行（cat / grep / tail / range）
 ```
 
-分工：**"这个 connector 怎么布局"读 bundle 里的 reference；"这个对象能用什么命令"查 `ls/stat` 的结构化 capabilities**。两边内容不相交——一个是 prose 文档（bundle），一个是结构化字段（runtime），不重复、agent 不会纠结看哪个。
+分工：**"这个 connector 怎么布局"读 bundle 里的 reference；"这个对象能用什么命令"查 `ls --json` 的结构化 capabilities**。两边内容不相交——一个是 prose 文档（bundle），一个是结构化字段（runtime），不重复、agent 不会纠结看哪个。
 
 ### Skill 版本管理：整份装着 + 自检版本 + 温和修复
 
@@ -287,8 +286,7 @@ agent 不要硬编码"什么 connector 支持什么操作"。运行时 query 的
 
 ```bash
 mfs connector list --json
-mfs ls <uri> --json                     # 目录下有什么对象 + 每个对象的 capabilities
-mfs stat <uri> --json                   # 单个对象的 capabilities（cat / grep / tail / range）
+mfs ls <uri> --json                     # 目录 URI 列子项 + 每项 capabilities；单对象 URI 返回该对象自身那行
 ```
 
 `capabilities` 字段告诉 agent 这个对象能用什么命令：
@@ -327,8 +325,6 @@ while true; do
 done
 mfs search "..." postgres://prod
 ```
-
-或者直接 `mfs add <uri> --sync`（前台等同步完成，到 v0.4 实现时确认是否支持）。
 
 ## 9. 给 connector 贡献者的提示
 

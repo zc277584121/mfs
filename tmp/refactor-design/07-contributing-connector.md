@@ -7,8 +7,8 @@
 Connector 暴露两类方法：
 
 ```
-必须实现（6 个 abstract method）
-  stat / list / read              核心 IO
+必须实现（6 个核心方法）
+  stat / list / read              核心 IO（read 与 read_records 二选一；纯字节实现 read，结构化实现 read_records）
   fingerprint / sync              变化检测
   object_kind_of                  路径 → object 类型映射
 
@@ -21,7 +21,7 @@ Connector 暴露两类方法：
   acl           默认 None；多租户 ACL 场景重写
 ```
 
-只实现 6 个 abstract method 就能跑起来（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
+只实现这 6 个核心方法就能跑起来（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
 
 framework 不暴露更深的扩展点（自定义 chunker 内部、自定义 artifact cache 格式、直接写 Milvus 等）——这些层级 framework 接管，否则 framework 难维护，贡献者负担也重。
 

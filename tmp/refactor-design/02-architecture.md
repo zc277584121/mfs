@@ -61,12 +61,12 @@ MFS 的术语按受众分三组，避免一次塞太多。
 |---|---|
 | **Connector** | 一个已注册的数据源实例（`postgres://prod` / `./repo`） |
 | **Object** | connector 暴露的一条虚拟文件（URI + media_type） |
-| └─ **Cache** | object 派生：字节缓存，可选，让 cat/head/tail 不打回 connector |
+| └─ **Artifact cache** | object 派生：字节缓存，可选，让 cat/head/tail 不打回 connector |
 | └─ **Chunks** | object 派生：Milvus 行，被 search/grep 召回 |
 | **Profile** | client 端的 endpoint 配置（连哪个 server + token） |
 | **Job** | 用户一次操作的记录：`mfs add` / `mfs remove` 各产生一个 job |
 
-关系：一个 Connector 暴露多个 Object；每个 Object 可能有 Cache 和 Chunks。Profile 决定 client 连哪个 server。用户每次操作创建一个 Job。
+关系：一个 Connector 暴露多个 Object；每个 Object 可能有 Artifact cache 和 Chunks。Profile 决定 client 连哪个 server。用户每次操作创建一个 Job。
 
 ### 后台开发者额外用（2 个）
 
@@ -1150,7 +1150,7 @@ objects (
 );
 
 -- artifact cache：per-object 派生产物（按 object_uri 寻址，给 cat/head/chunker 用）
--- 与之对应的 transformation cache 是 v0.5+ 的按 content_hash 寻址的计算缓存，见 [06 §10.1]
+-- 与之对应的 transformation cache 是按 content_hash 寻址的计算缓存，见 [§10.4]
 artifact_cache (
   namespace_id    VARCHAR DEFAULT 'default',
   object_uri      VARCHAR,
