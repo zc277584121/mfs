@@ -299,7 +299,7 @@ watch -n 30 'mfs add slack://eng && mfs head -n 50 slack://eng/...'
 
 ## 10. Artifact cache 层细节
 
-> 名词约定：MFS 内部有两层 cache，**职责完全独立**——这里讲的 **artifact cache** 是按 object_uri 寻址的派生产物缓存（converted markdown / VLM 描述 / page cache 等），给 `cat / head / chunker` 用。另一层 **transformation cache** 是按 content_hash 寻址的计算缓存，给 embedder / vlm / summary client 跳过重复 API 调用用，物理上独立 SQLite 文件，详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。
+> 名词约定：MFS 内部有两层 cache，**职责完全独立**——这里讲的 **artifact cache** 是按 object_uri 寻址的派生产物缓存（converted markdown / VLM 描述 / page cache 等），给 `cat / head / chunker` 用。另一层 **transformation cache** 是按 content_hash 寻址的计算缓存，给 embedder / vlm / summary client 跳过重复 API 调用用，物理上独立 SQLite 文件，详见 [02 §10.4](02-architecture.md#104-cache-层)。
 
 ### 10.1 `artifact_cache` 表 schema
 

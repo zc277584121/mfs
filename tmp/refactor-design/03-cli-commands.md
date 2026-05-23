@@ -185,7 +185,7 @@ mfs add --all --force-index              # 换全局 embedding 模型时，重�
 
 `--force-index` 估算受影响 chunks / tokens 后 confirm（`--yes` 跳过），强制重 chunk + 重 embed（embed 走 transformation cache，内容没变的命中复用）。
 
-> 自动检测配置漂移 + 分级提示（`mfs status / add / search` 三处）是 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)。
+> 自动检测配置漂移 + 分级提示（`mfs status / add / search` 三处）是 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache)。
 
 ### URI 写法
 

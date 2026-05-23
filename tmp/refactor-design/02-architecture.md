@@ -597,7 +597,7 @@ class BatchingEmbeddingClient:
 
 这层是吞吐的关键——一次 API 调用做几十到几百个 chunks 远比逐个调省钱省时间。Milvus 不需要 client batcher（worker 显式 batch 写入）。
 
-**第三层：transformation cache 包装**（详见 [§10.4](#104-transformation-cache计算缓存)）
+**第三层：transformation cache 包装**（详见 [§10.4](#104-cache-层)）
 
 ```python
 class CachingEmbeddingClient:
@@ -689,13 +689,13 @@ object_task.status = 'succeeded'
 
 外部 API 大数据量场景（Slack / Gmail 等）可以调 `self.state.checkpoint()` 主动 commit 当前 state，避免崩溃后整批重跑被 rate limit 打爆。详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint-api)。
 
-**④ reconcile 只覆盖 upstream 变化；框架配置变化 v0.4 手动重建**
+**④ 变化检测只一层；中间复用靠 cache；框架配置变化 v0.4 手动重建**
 
-reconcile（规则①~③ 走的 fingerprint chain 比对）只对 **connector yield 出来的 object** 跑——即只处理 **upstream 变化**。
+变化检测只对 **connector yield 出来的 object** 跑——即只处理 **upstream 变化**（connector 自己判断，§5.1）。中间产物（convert / chunk / embed）的复用不靠多层 fingerprint 比对，而靠 content-addressable cache（[04 §5.2](04-connector-and-ingest.md#52-重建与-cache) / [§10.4](#104-cache-层)）。
 
-换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，connector 看 upstream 没动、啥都不 yield，下游产物却 stale。**v0.4 对这类变化不自动检测**，由用户手动 `mfs add --force-index`（单 connector）或 `mfs add --all --force-index`（全局，换 embedding 模型时）重建——用户改了配置自己知道。
+换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，connector 看 upstream 没动、啥都不 yield，下游产物却 stale。**v0.4 对这类变化不自动检测**，由用户手动 `mfs add --force-index`（单 connector）或 `mfs add --all --force-index`（全局）重建——重跑时 cache 大量命中，只为真变的部分花钱。
 
-> **简单 breadcrumb**：建索引 / `--force-index` 跑完时，metadata DB 记一条"用的什么全局配置"，v0.4 不拿它检测、只留作 v0.5+ 的起点。自动检测配置漂移（sweep 全量扫 + config-hash gate + 分级提示 + 维度变蓝绿重建 + 全局 fan-out + connector DATA_VERSION 失效）是一块独立的重能力，整体放 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)。
+> 自动检测配置漂移（扫描 + 分级提示 + 维度变蓝绿重建 + 全局 fan-out）是一块独立的重能力，整体放 v0.5+，详见 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache)。
 
 framework 不暴露 `commit()` 给 connector（只暴露 `checkpoint()`），commit 时机由 framework 控制。
 
@@ -839,7 +839,7 @@ deletion 是 sync 末尾、枚举成功之后才跑的。抖动时：
 
 唯一能骗过这套的是 connector 拉一半出错、自己 catch 了假装拉完——这是 connector bug，由契约（§7.4.3）禁止，不靠 framework 兜。
 
-万一真有 connector bug 漏报导致误删，[§10.4 transformation cache](#104-transformation-cache计算缓存) 让恢复变便宜：下次正确 sync 重新 yield → re-chunk + cache 命中 → 零 API 钱 + 秒级恢复。cache 是这里的**兜底，不是删除前的前置闸门**。
+万一真有 connector bug 漏报导致误删，[§10.4 transformation cache](#104-cache-层) 让恢复变便宜：下次正确 sync 重新 yield → re-chunk + cache 命中 → 零 API 钱 + 秒级恢复。cache 是这里的**兜底，不是删除前的前置闸门**。
 
 #### 7.4.2 几种 connector 的 deletion 行为
 
@@ -1243,7 +1243,7 @@ v0.4 上传协议是单次 PUT（同一个请求里发字节 + 改状态，详�
 
 - `connector_state` 是任意 schema 的 K/V，适合 cursor / etag / token 这类小状态
 - `file_state` 是结构化表，每 path 一行，支持按 status 索引和 commit 协议直接 UPSERT
-- 只有 file connector 用 file_state，其他 connector （postgres / slack / github 等）不需要——它们 retry 时靠 cursor + chunk_id 幂等 + fingerprint chain 就够了，不存在"客户端传字节给服务端"这个中间环节
+- 只有 file connector 用 file_state，其他 connector （postgres / slack / github 等）不需要——它们 retry 时靠 cursor + chunk_id 幂等就够了，不存在"客户端传字节给服务端"这个中间环节
 
 所有顶层表都以 `namespace_id` 作为物理分区主键。v0.5+ 多租户上线只加 mapping 表，底层 schema 不动。
 
@@ -1254,7 +1254,7 @@ v0.4 上传协议是单次 PUT（同一个请求里发字节 + 改状态，详�
 - **artifact cache 文件**：每个有 artifact cache 的 object 的派生产物（每个 object 通常只对应一个 artifact_kind）
 - **upload staging**：client 上传的 zip bundle + 解压后的文件树（仅 §4.2 upload flow 用）
 
-> **transformation cache**（按 content_hash 寻址的计算缓存）跟这里的 artifact cache 是不同的两层，物理上也分开（独立 SQLite 文件），详见 [§10.4](#104-transformation-cache计算缓存)。
+> **transformation cache**（按 content_hash 寻址的计算缓存）跟这里的 artifact cache 是不同的两层，物理上也分开（独立 SQLite 文件），详见 [§10.4](#104-cache-层)。
 
 artifact_kind 跟 object 类型的对应：
 
@@ -1388,28 +1388,29 @@ uri = "~/.mfs/milvus.db"               # 默认 Lite
 
 v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#94-milvus-隔离collection_strategy)）都从 v0.4 实现——单 namespace 下都是一张表，行为等价；v0.5+ 多 namespace 落地后 `per_namespace` 自动裂成多张。布局策略部署时定，后期改要迁移，所以提前给配置让部署表达隔离意图。`per_connector` 不做（理由见 §9.4）。
 
-### 10.4 Transformation cache（计算缓存）
+### 10.4 Cache 层
 
-跟 §10.2 的 **artifact cache** 是不同层的两套机制，**职责完全独立、物理上也分文件**。两层都叫 cache 但解决不同问题：
+对外宣传上 MFS 就**一个 cache 概念**——自动避免重复拉取、重复计算，不重复花钱。它替代了过去那套 fingerprint chain：上游变了就重跑 pipeline（04 §5.2），中间贵操作过 cache，cache key 里含 `工具 + 配置 + 版本`，所以"换工具 / 配置要不要重做"由 key 自然回答，不需要框架显式维护多层失效。
 
-| 维度 | artifact cache（§10.2）| transformation cache（本节）|
-|---|---|---|
-| key | `(namespace_id, object_uri, artifact_kind)` | `sha1(input + kind + provider + model + version + config)` |
-| 谁用 | `cat / head / chunker` 读派生产物 | `embedder / vlm / summary client` 跳过 API 调用 |
-| 物理存储 | metadata DB `artifact_cache` 表 + object store `artifacts/` 目录 | 独立 SQLite `~/.mfs/transformation_cache.db` |
-| 命中场景 | 同对象重复访问 | 跨对象 / 跨连接器 / 跨 namespace 的内容重复 |
-| 丢失代价 | 重跑 converter / vlm / summary（要花 API 钱）| Milvus 行还在的话基本没影响 |
-| 设计目的 | I/O 服务（按对象寻址快速读）| 纯函数 memoization（按内容寻址跳过计算）|
+内部物理上分两块（介质和访问模式不同，但用户不感知）：
 
-v0.4 覆盖三类 transformation：
+| 内部块 | key | 谁用 | 物理存储 | 丢失代价 |
+|---|---|---|---|---|
+| **派生产物 cache**（§10.2 的 artifact cache）| `(namespace_id, object_uri, artifact_kind)` | `cat / head / chunker` 读派生产物 | object store `artifacts/` 目录 + metadata DB 索引 | 重转 / 重算（花 API 钱）|
+| **计算 memo cache**（本节）| `sha1(input + kind + provider + model + version + config)` | `convert / embed / vlm / summary client` 跳过 API 调用 | 独立 SQLite `~/.mfs/transformation_cache.db` | Milvus / 产物还在的话基本没影响 |
+
+派生产物 cache 按 **object_uri** 寻址（给 cat/chunker 快速读"这个对象的 md / 描述"）；计算 memo cache 按 **内容** 寻址（跨对象 / 跨连接器 / 跨 namespace 复用 API 结果）。前者是 I/O 服务，后者是纯函数 memoization，互补。
+
+**计算 memo 覆盖四类贵操作**（v0.4）：
 
 | Kind | 输入 | 输出 | 单次成本 | 期望命中率 |
 |---|---|---|---|---|
+| **convert** | 原文件 bytes | markdown | ★★ 烧钱（LLM-based converter 尤其）| 中（换 chunker / `--force-index` 重建时，原文件没变就命中）|
 | **embedding** | chunk text | dense vector | ★★★ 真烧钱 | 高（boilerplate / 跨文件重复段落多）|
 | **vlm** | image bytes | description text | ★★★ 真烧钱 | 中（同图复用少，attachment 重复多）|
 | **summary** | long text | summary text | ★★ 烧钱 | 中 |
 
-不覆盖 **converter**（PDF→md 等）——它的产物已经按 object_uri 进 artifact cache，跨 connector 同 PDF 的场景少，引入需要 BLOB 大文件特殊处理，v0.5+ 再做。
+**converter 进 cache 是 v0.4 的决定**（早先设计放 v0.5+，现已提前）：收敛掉 fingerprint chain 后，配置变化靠 `--force-index` 重跑整条 pipeline——convert 不进 cache 的话，重建会重复花转换钱。key = `sha1(原文件 bytes + converter + version)`，原文件没变就命中、零转换成本。converted_md 的字节存哪（object store 还是 SQLite）实现时择一，对外都是"cache 命中"。
 
 #### 10.4.1 Schema
 
@@ -1419,7 +1420,7 @@ v0.4 覆盖三类 transformation：
 -- ~/.mfs/transformation_cache.db
 transformation_cache (
   cache_key       VARCHAR(64) PRIMARY KEY,    -- sha1(input + kind + provider + model + version + config)
-  kind            VARCHAR(16),                -- 'embedding' | 'vlm' | 'summary'
+  kind            VARCHAR(16),                -- 'convert' | 'embedding' | 'vlm' | 'summary'
   input_hash      VARCHAR(40),                -- sha1(input)，调试用
   provider        VARCHAR(32),                -- 'openai' / 'voyage' / 'google' / ...
   model           VARCHAR(64),
@@ -1548,30 +1549,7 @@ async def eviction_loop():
 
 超额几百 MB 没事，10 分钟跑一次清理足够。
 
-#### 10.4.5 跟 fingerprint chain 的关系
-
-**互补不冲突**——两者解决不同粒度的"我做过吗"：
-
-```
-fingerprint chain (04 §5.2)        transformation cache (本节)
-──────────────────────             ─────────────────────────
-per-object 决定                     per-input 决定
-"chunk_fp/embedding_fp 变了吗？"    "embed(text, model) 做过吗？"
-变了 → 真处理                       做过 → 零 API
-没变 → 跳过整个对象                 没做过 → 调 API + 写 cache
-```
-
-- 同对象重复 sync 命中率高的是 fingerprint chain（整对象短路）
-- 跨对象 / 模型回滚 / Milvus 重建 命中率高的是 transformation cache（per-call 复用）
-
-举例：换 embedding model `text-embedding-3-small → text-embedding-3-large`：
-
-1. fingerprint chain：所有 `embedding_fp` 失效 → 触发 re-embed
-2. re-embed 跑到时进 `CachingEmbeddingClient`
-3. cache 里 `(text, small)` 都在但 `(text, large)` 全 miss → 真打 API
-4. API 跑完写回 cache → 下次换回 small 时反而能命中
-
-#### 10.4.6 跟 deletion 策略的协同
+#### 10.4.5 跟 deletion 策略的协同
 
 transformation cache 在 deletion 里只扮演**兜底恢复**的角色，不是删除前的前置检查：
 
@@ -1585,7 +1563,7 @@ transformation cache 在 deletion 里只扮演**兜底恢复**的角色，不是
 
 deletion 本身的判断很简单（详见 [§7.4](#74-deletion-策略)）：incremental sync 不删；full scan sync 用全集 diff 推断删除；explicit "deleted" event 任何模式直接删。**没有 pre-flight cache 检查、没有 50% 阈值、没有 confirm 命令**——抖动靠 retry/circuit-breaker + connector 枚举契约挡住，到不了 deletion；真有 connector bug 漏报误删，cache 让恢复变便宜就够了。
 
-#### 10.4.7 配置
+#### 10.4.6 配置
 
 ```toml
 # server.toml
@@ -1609,7 +1587,7 @@ lookup_batch_size = 1000              # 单次 SQL IN-clause 上限
 
 5 GB max 适合个人 / 中等团队。CS 部署可调到几十 GB，反正 SQLite + LRU eviction 撑得住。
 
-#### 10.4.8 Observability
+#### 10.4.7 Observability
 
 ```bash
 mfs status --transformation-cache --json

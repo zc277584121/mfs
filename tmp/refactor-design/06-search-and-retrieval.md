@@ -22,8 +22,6 @@ fields = [
     Field("sparse_vec",     SPARSE_FLOAT_VECTOR),             # Milvus 内建 BM25
     Field("chunk_kind",     VARCHAR(32),   index="scalar"),
     Field("metadata",       JSON),                            # connector-specific filter 字段
-    Field("chunk_fingerprint",     VARCHAR(64)),
-    Field("embedding_fingerprint", VARCHAR(64)),
     Field("indexed_at",     INT64),
 ]
 
@@ -87,8 +85,6 @@ Workspace / User 等组织概念不进 Milvus schema——它们通过 server �
 | `sparse_vec` | Milvus 内置 BM25 sparse 向量 |
 | `chunk_kind` | 8 种之一（见 §2） |
 | `metadata` | filter / 展示用的 JSON：`{status, priority, author, updated_at, ...}` |
-| `chunk_fingerprint` | stale check：上游 + chunk config |
-| `embedding_fingerprint` | stale check：chunk + embedding model |
 | `indexed_at` | unix ms |
 
 ## 2. chunk_kind 枚举（framework 固定）
@@ -335,7 +331,7 @@ search/grep will be unavailable for this object until you add:
   - minified / 单行巨型文件 → AST 退化，按 token 硬切
   - 超小文件 → 整文件一个 chunk
 
-这些 chunker 的版本（含 Chonkie / tree-sitter 库版本）钉进 `chunker_version` 进 fingerprint，库版本在 `pyproject.toml` pin 死，升级走显式 bump（见 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain)）。
+chunker 用第三方库（Chonkie），库版本在 `pyproject.toml` pin 死、保证可复现。chunker **不进 cache、不算指纹**——它便宜、重跑就行，升级影响通过"切出的 text 变了 → embed 的 cache key 变了"自然传导（见 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache)）。
 
 ## 7. Search 流程
 
@@ -455,7 +451,7 @@ Agent 可以同时拿到 Linear issue、GitHub PR、Slack thread 三类不同 co
 
 ## 10. Embedding / Summary / VLM / Converter providers
 
-四类外部加工工具走同一种插件化模型——都是 fingerprint chain 里"产出 artifact 或 chunk"的可换组件。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
+四类外部加工工具走同一种插件化模型——都是 pipeline 里"产出 artifact 或 chunk"的可换组件，结果都过 cache（02 §10.4）。framework 全局配置放 server 端 `~/.mfs/server.toml`（本地 daemon）或 `/etc/mfs/server.toml`（远端部署）：
 
 > **已知限制：v0.4 这四类配置全局单一，不能 per-connector**。整个 MFS 实例一个 embedding 模型、一个 converter、一个 VLM、一个 summary LLM，所有 connector 共用。
 >
@@ -512,14 +508,14 @@ match = "**/papers/*.pdf"
 provider = "marker"             # 学术 PDF
 ```
 
-切换 embedding model 让所有 chunk 的 `embedding_fingerprint` 失效，触发 DELETE + re-INSERT（chunk 文本不变，只 embed 重算；Milvus 不支持列级 update 所以是整行替换）。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
+切换 embedding model 后用 `--force-index` 重建：embed 的 cache key 含 model+version，旧模型全 miss → 重新 embed；chunk 文本不变所以 convert 命中、不重转。Milvus 不支持列级 update，所以是 DELETE by object_uri + 整行 re-INSERT。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
 
 切换 summary / vlm / converter 模型只影响对应层 artifact / chunk 的 fp：
 
 - 换 summary / vlm → 只影响 `summary` / `directory_summary` / `schema_summary` / `vlm_description` 这几种 chunk_kind 的行，body chunk 不动
 - 换 converter → `artifact_fp(converted_md)` 失效（公式含 `converter_name + converter_version`），重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
 
-这套是 [04 §5.2](04-connector-and-ingest.md#52-fingerprint-chain) fingerprint chain 的直接应用——每层产物的 fp 公式都把所属 provider / model / version 揉进去，换工具自动失效对应层。
+这套是 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache) cache 模型的直接应用——每个操作的 cache key 都把所属 provider / model / version 揉进去，换工具 → key 变 → 自动重算对应层。
 
 **converter 路线图**：v0.4 默认 `markitdown`（一个库覆盖 PDF/DOCX/DOC/PPT/XLSX/图片/HTML），`docling / marker / mineru / llamaparse` 等高质量 converter 作为可选 backend（`mfs-server[converter-docling]` 等 extra 按需装）——它们对复杂表格、嵌入公式、扫描件显著更好但更重，不进默认安装，用户按文件类型 / path 路由即可。converter 版本进 `artifact_fp(converted_md)`（04 §5.2），换 converter 自动失效重转。
 
@@ -545,7 +541,7 @@ worker → CachingEmbeddingClient.batch_embed(texts)
 - Milvus collection drop 重建 → cache 还在，零 API 重 embed
 - embedding model 回滚 v2 → v1 → cache 里 v1 vector 还在
 
-完整 schema / client 包装层 / 异步 writer / LRU eviction / observability 详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。
+完整 schema / client 包装层 / 异步 writer / LRU eviction / observability 详见 [02 §10.4](02-architecture.md#104-cache-层)。
 
 **Converter（PDF→md / DOCX→md）v0.4 不进 transformation cache**——它的产物已经按 object_uri 进了 [artifact cache](#10.2)，跨 connector 同 PDF 的场景少，BLOB 大文件入 SQLite cache 收益不抵复杂度。v0.5+ 看实际情况再决定要不要补。
 
@@ -554,7 +550,7 @@ worker → CachingEmbeddingClient.batch_embed(texts)
 | 名字 | 寻址 | 谁用 | 文档 |
 |---|---|---|---|
 | **artifact cache** | `object_uri + artifact_kind` | `cat / head / chunker` 读派生产物 | [02 §10.2](02-architecture.md#102-object-store) / [05 §10](05-browse-and-read.md#10-artifact-cache-层细节) |
-| **transformation cache** | `sha1(input) + provider + model + version + config` | embedder / vlm / summary 跳过重复 API | [02 §10.4](02-architecture.md#104-transformation-cache计算缓存) |
+| **transformation cache** | `sha1(input) + provider + model + version + config` | embedder / vlm / summary 跳过重复 API | [02 §10.4](02-architecture.md#104-cache-层) |
 
 两层物理上分文件、职责完全独立，不会互相干扰。
 

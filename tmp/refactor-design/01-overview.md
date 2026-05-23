@@ -22,7 +22,7 @@ Chunk          ─ Milvus 一行：能被 search/grep 召回的最小单元
 
 整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 artifact cache（PDF→md / 图片→VLM 描述 等派生产物）和 chunks。
 
-（还有一层 **transformation cache** 是纯内部计算缓存，用户感知不到，详见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)。）
+（还有一层 **transformation cache** 是纯内部计算缓存，用户感知不到，详见 [02 §10.4](02-architecture.md#104-cache-层)。）
 
 **本地文件也是一种 connector**：scheme 是 `file`，用户写普通 path 即可。`postgres connector` / `slack connector` / `file connector` 在概念上一视同仁——同样的 list / stat / read / fingerprint 契约，同样的 chunk pipeline，同样的搜索能力。
 
@@ -75,11 +75,9 @@ mfs add <target>
    ├─② connector.sync()   流式 yield ObjectChange
    │                       （added / modified / deleted / renamed）
    │
-   ├─③ Reconcile · fingerprint chain 逐层比对（仅对 yield 出来的 object）
-   │       upstream fp 变?  ──► 整套重做
-   │       artifact fp 变?  ──► 重转 artifact + 下游
-   │       chunk fp 变?     ──► 重切 chunk + 重 embed
-   │       embedding fp 变? ──► 只重 embed（chunk 文本不动）
+   ├─③ 上游变了就重跑（仅对 yield 出来的 object）
+   │       中间贵操作过 cache：convert / embed / vlm / summary
+   │       命中复用（零 API）、miss 才花钱；cache key 含 工具+配置+版本
    │       （框架配置变化 = 换 embedding 模型/chunker → v0.4 用户手动
    │         mfs add --force-index；自动检测留 v0.5+）
    │
@@ -87,7 +85,7 @@ mfs add <target>
    │       chunker 按 object_kind 切
    │            │
    │            ▼
-   │       transformation cache 命中?
+   │       cache 命中?
    │            ├─ hit  ──► 复用 vector（零 API 调用）
    │            └─ miss ──► 调 embedding/VLM/summary ──► 异步写回 cache
    │            │
@@ -102,7 +100,7 @@ mfs add <target>
    └─⑥ commit connector state + 更新 job 状态
 ```
 
-每一步背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，fingerprint chain 见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)，transformation cache 见 [02 §10.4](02-architecture.md#104-transformation-cache计算缓存)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
+每一步背后的细节散在后面各篇：connector 契约见 [04 §5.1](04-connector-and-ingest.md#51-connector-契约两条最小-api)，变化检测 + cache 见 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache)，cache 层见 [02 §10.4](02-architecture.md#104-cache-层)，deletion 见 [02 §7.4](02-architecture.md#74-deletion-策略)。
 
 ### 四套存储
 
@@ -172,14 +170,13 @@ MFS 第一受众是 **agent**，不是人。所以主接口是 **shell-native CL
 
 这两道防线让一个看似昂贵的操作（重传、重 embed、误删后恢复）变得廉价——这也是为什么 deletion 策略敢做得简单（详见 §6）。
 
-### 6. 变化检测：上游报变化，框架补配置失效
+### 6. 变化检测一层 + cache 兜成本
 
-变化分两层，谁最了解谁负责：
+变化检测就**一层**：上游变没变，**connector 最懂自己的源**自己探测（file 用 stat-first lazy hashing：先看 size+mtime，变了才算 sha1；DB 用 `updated_at` cursor；web 用 ETag……），通过 `ObjectChange` 流式上报 added / modified / deleted / renamed。connector 只 yield 变化的部分，没 yield 的就跳过。
 
-- **upstream 层变化**——外部数据本身变了。**connector 最懂自己的源**，自己探测（file 用 stat-first lazy hashing：先看 size+mtime，变了才算 sha1；DB 用 `updated_at` cursor；web 用 ETag……），通过 `ObjectChange` 流式上报 added / modified / deleted / renamed
-- **framework 层失效**——换 embedding 模型、升级 chunker、改 text_fields。connector 看上游完全没变、啥都不 yield，但下游产物其实 stale。**v0.4 不自动检测这类变化**，由用户手动 `mfs add --force-index` 重建（用户改了配置自己知道）；自动检测漂移 + 分级提示是 v0.5+（详见 [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain)）
+上游变了就**重跑这个 object 的 pipeline**，中间贵操作（convert / embed / vlm / summary）过 **content-addressable cache** 兜成本——cache key 含 `工具 + 配置 + 版本`，所以"换 chunker / 换模型要不要重算"由 key 自然回答，不需要框架维护多层 fingerprint 失效（详见 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache)）。
 
-增量同步的精髓就是**connector 只 yield 变化的部分**，framework 用 fingerprint chain 逐层比对决定哪一层产物要重做（artifact / chunk / embedding 分层失效，能复用就复用）。
+**框架配置变化**（换 embedding 模型 / 升级 chunker / 改 text_fields）connector 看上游没变、啥都不 yield，**v0.4 不自动检测**，用户手动 `mfs add --force-index` 重建（重跑时 cache 大量命中、只为真变部分花钱）；自动检测漂移留 v0.5+。
 
 删除是其中最微妙的一块：增量同步**推不出删除**（"没 yield" 只代表"没变"，不代表"删了"），只有全量扫描的 diff 或上游明确的 delete 信号才能确定删除。详见 [02 §7.4](02-architecture.md#74-deletion-策略)。
 
@@ -212,7 +209,7 @@ CLI 动词 (ls/cat/grep/...)
             → Storage（三套后端）
 ```
 
-**framework 包办（贡献者碰不到）**：chunk 切分、embedding、summary、VLM、artifact cache、Milvus schema、检索、HTTP API、任务队列、fingerprint chain、deletion 逻辑、transformation cache。
+**framework 包办（贡献者碰不到）**：chunk 切分、embedding、summary、VLM、Milvus schema、检索、HTTP API、任务队列、变化检测、cache 层、deletion 逻辑。
 
 **贡献者只写一个 connector plugin**（`connectors/<name>/`，约 500–1500 行 Python）：连上游 + 认证、决定虚拟 URI 布局、实现 `stat / list / read`、变化检测（`fingerprint / sync`）、`object_kind` 映射；可选重写 grep / search 下推。
 
@@ -275,8 +272,8 @@ mfs job list/inspect/cancel
 | 分页用 `--range A:B`，不需要 cursor token | [05 §4](05-browse-and-read.md#4-分页与大对象) |
 | Milvus 一张 collection，partition_key 按 connector_uri | [06 §1](06-search-and-retrieval.md#1-milvus-collection-schema) |
 | 检索字段配置：text_fields / metadata_fields / locator_fields + chunk_strategy | [06 §4](06-search-and-retrieval.md#4-字段配置) |
-| Fingerprint chain：upstream → artifact → chunk → embedding，分层失效 | [04 §5.2](04-connector-and-ingest.md#52-framework-内部per-artifact-fingerprint-chain) |
-| 两层 cache：artifact cache（per object_uri）+ transformation cache（per content_hash + model），跨对象复用 embedding/VLM/summary 调用 | [02 §10.4](02-architecture.md#104-transformation-cache计算缓存) |
+| 变化检测一层（上游变没变）+ cache 兜中间成本（key 含工具+配置+版本） | [04 §5.2](04-connector-and-ingest.md#52-重建与-cache) |
+| 两层 cache：artifact cache（per object_uri）+ transformation cache（per content_hash + model），跨对象复用 embedding/VLM/summary 调用 | [02 §10.4](02-architecture.md#104-cache-层) |
 | Deletion：incremental 不删 / full scan 全集 diff 推断；抖动靠 retry + 枚举契约挡，不设阈值 | [02 §7.4](02-architecture.md#74-deletion-策略) |
 | HTTP 只走 control plane；client 上传只在 remote profile + 本地路径时发生 | [02 §4](02-architecture.md#4-控制面-vs-数据面) |
 | 社区贡献新 connector ~500-1500 行 Python，集中在 `connectors/<name>/` | [07](07-contributing-connector.md) |
@@ -290,7 +287,7 @@ mfs job list/inspect/cancel
 | 01 | [01-overview.md](01-overview.md) | 定位、抽象、系统图、**设计哲学与原则**、决策索引 | 所有人 |
 | 02 | [02-architecture.md](02-architecture.md) | client/server、profile、存储、队列、一致性、并发、多租户 | 所有人，运维和贡献者重点看 |
 | 03 | [03-cli-commands.md](03-cli-commands.md) | 16 个公开命令、行为契约、JSON envelope、错误码 | 用户、agent 集成方 |
-| 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、ingest 流程、fingerprint chain、checkpoint | 用户、贡献者 |
+| 04 | [04-connector-and-ingest.md](04-connector-and-ingest.md) | connector 注册、ingest 流程、变化检测 + cache、checkpoint | 用户、贡献者 |
 | 05 | [05-browse-and-read.md](05-browse-and-read.md) | ls/tree/cat/head/tail/grep 的后台行为、artifact cache、大对象 | 用户、agent skill 作者 |
 | 06 | [06-search-and-retrieval.md](06-search-and-retrieval.md) | Milvus schema、chunk_kind、locator、字段配置、preset | 用户（高级配置）、贡献者 |
 | 07 | [07-contributing-connector.md](07-contributing-connector.md) | 插件接口、骨架、对象命名规范 | 贡献者 |

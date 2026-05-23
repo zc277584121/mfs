@@ -57,8 +57,8 @@ mfs add <target>
   ③ connector.sync() 流式 yield ObjectChange
        added / modified / deleted
   │
-  ④ 对每个 ObjectChange（yield 出来的）跑 reconcile 4 步比对（见 §5.2.3）
-       fp 不等的层入队，相等的早退
+  ④ 对每个 ObjectChange（yield 出来的）：upstream 变了就重跑该 object 的 pipeline
+       中间贵操作（convert/embed/vlm/summary）过 cache，命中复用、miss 才花钱（见 §5.2）
        （框架配置变化 = 换 embedding 模型/chunker → v0.4 用户手动 --force-index，
          不在这里自动检测；详见 §5.2 末尾）
   │
@@ -71,7 +71,7 @@ mfs add <target>
          message_stream → thread aggregator
          record_collection → per-record chunker
          image → VLM description
-       embed/vlm/summary 都走 CachingXxxClient → transformation cache (02 §10.4)
+       convert/embed/vlm/summary 都走 CachingXxxClient → cache 层 (02 §10.4)
        命中 → 零 API；miss → 真 API + 异步写回 cache
   │
   ⑥ Deletion reconcile（详见 [02 §7.4](02-architecture.md#74-deletion-策略)）
@@ -192,10 +192,7 @@ framework 全局配置（chunk size、embedding model 等）放 server 端 `serv
 
 `mfs add <uri>` 再跑时，怎么知道哪些 object 要重做、哪些可以跳过？这一节讲完整机制。
 
-变化检测分两个层面：
-
-- **upstream 层**——外部数据本身变了。由 connector 自己探测，最了解外部系统。
-- **framework 层**——chunker / embedder / converter 等内部配置变了，外部没动但下游产物失效。由 framework 主动扫描。
+变化检测只有**一层**：上游变没变，由 connector 自己探测（最懂自己的源），通过 `sync()` 只 yield 变化的 object。中间产物（convert / chunk / embed）该不该重做，**不靠框架的多层比对**——上游变了就重跑这个 object，中间贵操作用 cache 兜成本（§5.2）。框架配置变化（换模型 / chunker）v0.4 靠用户 `--force-index`，不自动检测。
 
 ### 5.1 Connector 契约：两条最小 API
 
@@ -206,8 +203,9 @@ class ConnectorPlugin:
         存哪、schema 长什么样，全在 connector 内部，framework 不 introspect。"""
 
     async def fingerprint(self, path: str) -> str | None:
-        """返回 path 的当前 upstream fingerprint。framework 用这个跟自己
-        存的对比，决定 artifact / chunk / embedding 失效。"""
+        """返回 path 的当前上游变化标记（mtime+size / etag / version 之类，单值）。
+        framework 存起来、下次比对判断这个 object 变没变——只这一层，
+        没有多层 fingerprint chain。中间产物的复用靠 cache（§5.2）。"""
 
 
 @dataclass
@@ -239,173 +237,67 @@ async def sync(self):
 
 framework 不看 `self.state` 里存的是什么——postgres 存 `updated_at`、slack 存 ts、s3 存 page token、github 存 `commit_sha`，schema 各不相同。**file connector 是特例**：它的 path manifest 走专属的 `file_state` 表而不是 `self.state` K/V（详见 §5.5），但其他状态（如 `platform_id`）仍然存 `self.state`。
 
-### 5.2 Fingerprint chain
+### 5.2 重建与 cache
 
-framework 拿到 upstream fingerprint 后，自己组合 chunker / embedding model 等版本信息，算出每层产物的 fingerprint，决定哪层失效。
-
-#### 产物模型：per-object_kind DAG
-
-每个 object_kind（document / image / table_rows / message_stream / ...）在 `processors/<kind>/` 里 declare 自己的产物列表（`ArtifactSpec`）：
-
-```python
-@dataclass
-class ArtifactSpec:
-    kind:          str           # "artifact.converted_md" / "chunk.body" / "embedding"
-    depends_on:    list[str]     # 上游产物 kind（"upstream" 是特殊源）
-    config_inputs: list[str]     # 影响 fp 的 framework 配置 key
-    storage:       Literal["artifact_cache_table", "milvus_field", "milvus_row"]
-```
-
-framework 把这些声明组装成 DAG，每条边代表"我依赖什么"。各 object_kind 的链路：
+没有多层 fingerprint、没有 reconcile DAG。变化检测就**一层**——上游变没变（connector 在 §5.1 的 `sync()` 里自己判断、只 yield 变化的 object）。变了就重跑这个 object 的整条 pipeline，中间每个**贵操作**过 cache 兜成本：
 
 ```
-document (md/code/text)
-    upstream → chunk.body → embedding
-                ↑ [chunker_name, chunker_version, chunker_config, tokenizer_version]
-                              ↑ [embedding_model, embedding_version]
+upstream 变没变？ ← connector 用便宜手段判断（file: mtime+size / DB: cursor / web: etag，见 §5.4）
+   没变 → connector 不 yield → 整个 object 跳过
+   变了 → yield ObjectChange → 重跑 pipeline ↓
 
-document (pdf/docx/gdoc)
-    upstream → artifact.converted_md → chunk.body → embedding
-                ↑ [converter_name, converter_version]
-
-image
-    upstream → artifact.vlm_text → chunk.vlm_description → embedding
-                ↑ [vlm_model, vlm_prompt, vlm_provider]
-
-table_rows (postgres rows.jsonl)
-    upstream(per row) → chunk.row_text(per row) → embedding
-                         ↑ [text_fields, template_version]
-
-message_stream (slack messages.jsonl)
-    upstream(per channel-day) → chunk.thread_aggregate(per thread) → embedding
-                                 ↑ [group_by, session_idle_min, agg_template_version]
-
-table_schema (postgres schema.json)
-    upstream → chunk.schema_summary → embedding
-                ↑ [schema_summary_model, schema_summary_prompt]
-
-directory
-    child_object_uris → chunk.directory_summary → embedding
-                         ↑ [dir_summary_model, dir_summary_prompt]
+   convert (PDF/DOCX→md) → cache[ sha1(bytes + converter + version) ]
+   chunk                 → 便宜，直接重跑，不进 cache
+   embed                 → cache[ sha1(text + model + version) ]
+   vlm / summary         → cache[ sha1(input + model + version) ]
+       命中 → 复用（零成本）；miss → 真算 + 写回 cache
+   写 Milvus（DELETE by object_uri + INSERT）
 ```
 
-不同 object_kind 步数不同：纯 markdown 没有 converter 层，图片没有 chunker 层（VLM 直接出 1 个 chunk）。
+**为什么不需要 fingerprint chain**：cache key 里含 `工具 + 配置 + 版本`，所以"换工具 / 换配置 / 换模型要不要重做"这个判断，由每个操作自己的 cache key 自然回答——
 
-#### fp 计算
+- 换 embedding 模型 → embed 的 key 变 → miss → 自动重算
+- 换 converter → convert 的 key 变 → miss → 重转
+- 换 chunker → 重切（便宜）→ 产生新 text → embed 的 key 跟着 text 变
 
-framework 集中实现一个通用函数：
+这正是过去那套"分层 fingerprint 失效"想要的效果，但不用框架显式维护多层 DAG + reconcile——**content-addressable cache 的 key 天然就是分层失效**。统一 cache 层（convert / embed / vlm / summary 都按内容寻址）的完整设计见 [02 §10.4](02-architecture.md#104-cache-层).
 
-```python
-def compute_artifact_fp(spec: ArtifactSpec, upstream_fps: dict, config: dict) -> str:
-    parts = [upstream_fps[k] for k in spec.depends_on]
-    parts += [str(config[k]) for k in spec.config_inputs]
-    return sha1("\x00".join(parts).encode()).hexdigest()
-```
+**chunker 不进 cache**：它是本地确定性计算、毫秒级，重跑比"查表 + 比对"还省事，所以没有"chunker 版本指纹"一说——它升级了，影响通过"切出来的 text 变了 → embed 的 cache key 变了"自然传导。仍建议在 `pyproject.toml` pin 死 Chonkie 版本（可复现），但那是依赖管理，不是数据指纹。
 
-各层公式（按 storage 字段对应到存哪里）：
+**chunk_id 仍是幂等主键**：`chunk_id = sha1(namespace + connector + object_uri + locator + chunk_kind)`，跟内容 / 配置无关。重跑一个 object = `DELETE WHERE object_uri = Y` + 重新 INSERT 切出来的所有 chunk，幂等、无脏行——不需要 chunk 级别的 fingerprint 字段来判断 stale。
 
-```
-upstream_fp                  = connector.fingerprint(path)          ← objects.fingerprint
+#### 框架配置变化：v0.4 手动 --force-index
 
-artifact_fp(converted_md)    = sha1( upstream + converter_name + converter_version )
-artifact_fp(vlm_text)        = sha1( upstream + vlm_model + vlm_prompt + vlm_provider )
-artifact_fp(page_cache)      = sha1( upstream )
-artifact_fp(head_cache)      = sha1( upstream + N )
-                                                                    ← artifact_cache.fingerprint
-
-chunk_fp(body)               = sha1( artifact_fp(converted_md) + chunker_name + chunker_version + chunker_config + tokenizer_version )
-chunk_fp(row_text)           = sha1( upstream + text_fields + template_version )
-chunk_fp(thread_aggregate)   = sha1( upstream + group_by + agg_template_version )
-chunk_fp(vlm_description)    = sha1( artifact_fp(vlm_text) )
-chunk_fp(schema_summary)     = sha1( upstream_schema + schema_summary_model + schema_summary_prompt )
-chunk_fp(directory_summary)  = sha1( child_object_uris + dir_summary_model + dir_summary_prompt )
-                                                                    ← Milvus 行 chunk_fingerprint
-
-embedding_fp                 = sha1( chunk_fp + embedding_model + embedding_model_version )
-                                                                    ← Milvus 行 embedding_fingerprint
-```
-
-Connector 不参与这套逻辑，只提供 upstream fingerprint。下游全由 framework 算。
-
-公式里的 `chunker_config` / `vlm_prompt` 等是**序列化字符串**（JSON / TOML），把所有相关参数揉进去——chunk_size 改 1500→1000，序列化字符串就变，hash 就变。换 provider / model 同理：`embedding_model` 含 provider/model/version 三段。
-
-**chunker 的唯一性靠 `chunker_name + chunker_version` 两段**，跟 embedding 的 `model + version` 同理，但要小心一个区别：embedding model 是**外部锚**（provider+model+version 定死输出），而 chunker 是 MFS 自己集成的代码——`chunker_config` 只捕获"配置变了"（chunk_size 等），**捕获不了"切分逻辑的代码实现变了"**。比如升级了 markdown chunker 的边界规则、name/config 都没动，旧 chunk 会悄悄 stale。所以每个 chunker 显式声明 `chunker_version`，**且当它封装第三方库时，库版本要钉进这个 version**（纯文本用 Chonkie RecursiveChunker、代码用 Chonkie CodeChunker，详见 [06 §6](06-search-and-retrieval.md#6-各-object_kind-的-chunk-来源)）。第三方库升级会悄悄改切分行为，所以 `pyproject.toml` 必须 pin 死库版本，升级走一次显式 bump `chunker_version` + `mfs add --force-index` 重建，不让它静默漂移。
-
-注意：**配置字符串只进 fp 不进 chunk_id**。chunk_id 是主键，目标是"同一条 record 重 sync 时 UPSERT 覆盖同一行"，所以只用 namespace/connector/object/locator/chunk_kind（这些跟 config 无关）。chunk_fp 才是判断"内容是不是 stale"的指纹，含所有 config。否则换 config 后旧行就成"幽灵行"无法 UPSERT 覆盖。
-
-#### Reconcile 4 步
-
-每次 sync_job 对每个 object 跑这套比对（per-object，early-exit）：
-
-```
-Step 1: upstream 层比对
-  new_fp = connector.fingerprint(path)
-  old_fp = objects.fingerprint
-  if new != old: enqueue full rebuild → return
-
-Step 2: artifact cache 层比对（仅对适用的 artifact_kind）
-  for artifact_kind in processor.applicable_artifacts(object_kind):
-    new_fp = compute_artifact_fp(...)
-    if new != artifact_cache.fingerprint:
-      enqueue artifact_rebuild → 触发下游 chunk + embed
-      continue
-
-Step 3: chunk 层比对
-  for chunk_row in milvus.query(object_uri=Y):
-    if new_fp != chunk_row.chunk_fingerprint:
-      enqueue chunk_rebuild → 触发下游 embed
-      continue
-
-Step 4: embedding 层比对
-    if new_fp != chunk_row.embedding_fingerprint:
-      enqueue embed_only（chunk 文本不动，只重 embed）
-```
-
-Early-exit：上游 fp 不等就整套重做，跳过下游检查（下游一定也 stale）。
-
-#### 框架配置变化：v0.4 用户手动重建，自动检测留 v0.5+
-
-reconcile（上面 4 步）只对 **connector yield 出来的 object** 跑——也就是只处理 **upstream 变化**。
-
-但还有一类变化 connector 看不见：换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，upstream 完全没动、connector 啥都不 yield，但下游产物其实 stale。
-
-**v0.4 对这类变化不做自动检测**——用户改了配置自己知道，手动重建：
+换 embedding 模型 / 升级 chunker / 改 text_fields 这类**框架配置变化**，上游没动、connector 啥都不 yield → 默认不会重建。**v0.4 不自动检测**，用户改了配置自己 `--force-index`：
 
 ```bash
 mfs add <connector> --force-index      # 重建单个 connector
-mfs add --all --force-index            # 重建全部（换全局 embedding 模型时用）
+mfs add --all --force-index            # 换全局 embedding 模型时，重建全部
 ```
 
-`--force-index` 跳过 fp 比对、把所有 object 当 modified 强制重 chunk + 重 embed（embed 走 transformation cache，内容没变的命中复用、省钱）。
+`--force-index` = 把所有 object 当 modified、重跑整条 pipeline。重跑时 cache 大量命中：换 chunker → 没变的段落 embed 命中；upstream 文件改一行 → 没改段落 embed 命中、convert 也命中（原文件 bytes 没变）。所以**重建廉价**，只为真变的部分花 API 钱。
 
-> **简单 breadcrumb（仅记录、不检测）**：建索引 / `--force-index` 跑完时，framework 在 metadata DB 记一条"这次用的什么全局配置"（embedding model/version、chunker version、converter version）。v0.4 **不拿它做任何检测或提示**，纯粹留作 v0.5+ 自动检测的起点。
+> 自动检测配置漂移（扫描 + 分级提示 + 维度变化蓝绿重建 + 全局 fan-out）是一块独立的重能力，留 v0.5+。v0.4 原则简单：**配置是用户改的，用户自己 `--force-index`**。
 
-**为什么 v0.4 不做自动检测**：自动检测要一整套机制——sweep 全量扫 + config-hash gate 防止每次 sync 白扫 + index_state 比对 + 分级提示（embedding 破坏 search 必须重建 / chunker 只是 stale 可选）+ 维度变了要蓝绿重建 collection + 全局 fan-out 到所有 connector。这是一块**相对独立、且偏重**的能力，跟主链路（注册 / sync / 检索）解耦，放 v0.5+ 单独做更干净。v0.4 的原则简单：**用户手动改了配置，用户自己 `--force-index`**。
+### 5.3 Milvus 上的重建
 
-> v0.5+ 计划：基于上面那条 breadcrumb，在 `mfs status / add / search` 三处检测配置漂移并按严重度提示，用户确认后台重建（含维度变化的蓝绿迁移）。connector 数据版本（DATA_VERSION）的自动失效也一并放 v0.5+。
->
-> 实现上 v0.5+ 的"per-connector 检测"和"全局 fan-out"**不是两套逻辑，是同一个 reconcile 引擎的两个触发器**：reconcile（扫一个 connector 的 object、比 fp、入队重建）只有一份；per-connector 触发器在该 connector sync 时检查它自己的 config fp，全局触发器在 server 检测到全局配置变化时把同一个 reconcile 对所有 connector 各调一遍。两个触发器对应配置的两个 scope（connector TOML vs server.toml 全局），但不重复实现重建逻辑。
+Milvus 不支持只更新一列，所以任何重建都是 **DELETE by object_uri + INSERT 新行**。`--force-index`（或 upstream 变化）触发重跑 pipeline，cache 决定每步要不要真算：
 
-### 5.3 Milvus 上的失效行为
+| 触发 | convert | chunk | embed | vlm/summary | 净成本 |
+|---|---|---|---|---|---|
+| upstream 变 | cache 查 | 重跑 | cache 查 | cache 查 | 只为真变内容花钱 |
+| 换 converter | **miss 重转** | 重跑 | text 变才 miss | — | 转换 + 受影响 embed |
+| 换 chunker | 命中 | 重跑 | text 变才 miss | — | 受影响 embed |
+| 换 embedding 模型 | 命中 | 重跑 | **全 miss** | 命中 | 全量 re-embed |
+| 换 vlm / summary 模型 | 命中 | 重跑 | 该类 chunk miss | **miss** | 仅 vlm/summary 类 |
 
-Milvus 不支持只更新一列。任何 fingerprint 变化最终都是 **DELETE 该行 + INSERT 新行**。区别只在"上游有多少步可复用"：
-
-| 变化 | upstream read | converter | chunker | embedder | summary/vlm | Milvus 操作 |
-|---|---|---|---|---|---|---|
-| upstream 变 | ✓ | ✓ | ✓ | ✓ | ✓ | DELETE + INSERT |
-| converter 升级 | 跳过 | ✓ | ✓ | ✓ | 受影响才重算 | DELETE + INSERT |
-| chunker config 变 | 跳过 | 跳过 | ✓ | ✓ | 跳过 | DELETE + INSERT |
-| summary model 变 | 跳过 | 跳过 | 跳过 | 跳过 | ✓（仅 summary） | DELETE + INSERT（仅 summary 行） |
-| vlm model 变 | 跳过 | 跳过 | 跳过 | 跳过 | ✓（仅 vlm） | DELETE + INSERT（仅 vlm 行） |
-| embedding model 变 | 跳过 | 跳过 | 跳过 | ✓ | 跳过 | DELETE + INSERT |
-
-批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快得多。
+chunk 那列永远"重跑"——chunker 便宜、不进 cache。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快得多。
 
 ### 5.4 Connector 实现策略参考
 
 下面两张表是各类 connector 常见实现策略，**仅供贡献者参考**——framework 不规定怎么算变化、用什么 cursor、存什么 state。
 
-**Fingerprint 算法**：
+**上游变化检测算法**（connector 怎么判断一个 object 变没变，单值，不是多层 chain）：
 
 | Connector | 粒度 | 算法 |
 |---|---|---|
@@ -671,23 +563,22 @@ CS 模式下 client 端跑同样算法时，`file_state[p]` 的字段是从 `/v1
 
 #### 5.7.3 Framework 处理 `renamed`
 
-renamed event 进 framework 后，**chunk 内容、所有 fingerprint 都不变**——只有 chunk_id 主键变（因为 `chunk_id = sha1(... + object_uri + ...)`）。处理流程：
+renamed event 进 framework 后，**chunk 内容、向量都不变**——只有 chunk_id 主键变（因为 `chunk_id = sha1(... + object_uri + ...)`）。处理流程：
 
 ```
 对 old_uri 在 Milvus 里的所有 chunks:
-  ① 读出 dense_vec / sparse_vec / content / locator / chunk_kind /
-       chunk_fingerprint / embedding_fingerprint / metadata
+  ① 读出 dense_vec / sparse_vec / content / locator / chunk_kind / metadata
   ② 算新 chunk_id = sha1(namespace + connector + new_uri + locator + chunk_kind)
-  ③ INSERT 新行（向量 + content + 所有 fp 字段直接复用，不调 embedder）
+  ③ INSERT 新行（向量 + content 直接复用，不调 embedder）
   ④ DELETE 旧行（按旧 chunk_id 或按 object_uri 批量删）
 
-artifact_cache 表: UPDATE object_uri = new_uri WHERE object_uri = old_uri
-objects 表:        UPDATE object_uri = new_uri, parent_path = ... WHERE object_uri = old_uri
-object_store:      物理 mv artifact cache 目录
+cache 表:     按 object_uri 寻址的派生产物（converted_md 等）UPDATE object_uri = new_uri WHERE object_uri = old_uri
+objects 表:   UPDATE object_uri = new_uri, parent_path = ... WHERE object_uri = old_uri
+object_store: 物理 mv 派生产物目录
   ~/.mfs/cache/artifacts/<ns>/<sha1(old_uri)>/  →  ~/.mfs/cache/artifacts/<ns>/<sha1(new_uri)>/
 ```
 
-`chunk_fp` / `embedding_fp` 公式里都不含 `object_uri`（详见 [§5.2](#52-fingerprint-chain)），所以 rename 后 fp 真的不变，零外部 API 调用。
+chunk 文本和向量都不依赖 `object_uri`，所以 rename 只改主键、复用向量，零外部 API 调用。
 
 #### 5.7.4 边界情况
 

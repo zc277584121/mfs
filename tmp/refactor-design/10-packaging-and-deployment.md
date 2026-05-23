@@ -222,7 +222,7 @@ helm install mfs ./charts/mfs \
 - CLI 跟 server 通过 HTTP 通信，没有 import 关系 —— CLI 选 Rust 不影响 server。
 - Rust 加速模块通过 PyO3 暴露给 Python，maturin 编译成 wheel；Python 代码 `from mfs_server_rs import scan_dir` 直接调，跟普通 Python 函数一样。
 - 多语言 SDK 都从 `protocol/openapi.yaml` 生成；Python SDK 跟 CLI 独立（CLI 是 Rust binary，SDK 是给 Python 程序集成用）。
-- 文本 chunking 用 **Chonkie** `RecursiveChunker`（`processors/document/`），代码用 **Chonkie** `CodeChunker`（底层 tree-sitter，`processors/code/`）。第三方库版本在 `pyproject.toml` pin 死、纳入 `chunker_version` fingerprint（见 04 §5.2 / 06 §6），升级走显式 bump + 重建，避免切分行为静默漂移。
+- 文本 chunking 用 **Chonkie** `RecursiveChunker`（`processors/document/`），代码用 **Chonkie** `CodeChunker`（底层 tree-sitter，`processors/code/`）。chunker 库版本在 `pyproject.toml` pin 死保证可复现（chunker 不进 cache、不算指纹）；convert / embed / vlm / summary 的结果进 cache，模型 / 库版本是各自 cache key 的一部分（见 04 §5.2 / 06 §6）。
 
 ## 6. 发版工作流
 
