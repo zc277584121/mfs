@@ -288,8 +288,12 @@ sequenceDiagram
 逐步文字版：
 
 ```
-① client scan: os.walk + stat，拿 (path, size, mtime_ns, inode)
+① client scan: 遍历 + stat，拿 (path, size, mtime_ns, inode)
    纯 stat 操作，不算 sha1。1M 文件几秒钟。
+   ⚠ 枚举必须完整：遇到子目录权限不足 / IO 错误等不能静默跳过——
+     否则漏掉的 path 会在 ② 被 server 当成 deletion_candidates（盘上还在却被判删）。
+     扫描出错就 abort 整个 mfs add（报错让用户处理），绝不交一份残缺 manifest。
+     这是 §7.4.3 "全量枚举要么完整、要么 raise" 契约在 client 端 scan 的对应要求。
 
 ② POST /v1/files/manifest
    body: {
@@ -535,7 +539,7 @@ pick_next_job(in_flight_jobs):
 
 效果：`mfs add .` 跑到 30% 时核心文件已经索引完，agent 立刻可以搜到关键内容；剩下没跑完的多半是 tests / generated。Postgres / Slack / GitHub 这些 connector 一般保持默认即可——它们产出 ObjectChange 的顺序本身就有意义。
 
-幂等性不依赖顺序：`chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)` 跟处理顺序无关。priority 只影响体感和调度便利性，不影响正确性。
+幂等性不依赖顺序：`chunk_id = sha1(namespace_id + connector_uri + object_uri + chunk_kind + locator + lines)` 跟处理顺序无关。priority 只影响体感和调度便利性，不影响正确性。
 
 > **v0.4 这张表是 file connector 代码内置的，用户改不了**——connector TOML 的 `[[objects]]` 段和 `mfs add` flag 都没有 priority 入口。理由正是上一句：priority 只影响体感顺序、不影响正确性，内置启发式够用，不值得为它开一套用户配置面。用户自定义优先级（如 `[[objects]].priority` glob 覆盖）留 v0.5+ 真有人提再加，是纯增量、不动 schema。
 
@@ -554,7 +558,7 @@ flowchart LR
     out --> mv["batch 写 Milvus"]
 ```
 
-worker 只调最外层 `CachingEmbeddingClient`，里面三层各管各的：cache 命中直接出向量，miss 才进 micro-batcher 攒 batch 调 API，结果再异步回写 cache。embedding / VLM / summary 各有一套同构的三层。
+worker 只调最外层 `CachingEmbeddingClient`，里面三层各管各的：cache 命中直接出向量，miss 才进 micro-batcher 攒 batch 调 API，结果再异步回写 cache。embedding / VLM / summary / converter 各有一套同构的三层。
 
 **第一层：worker 拉 task、按 chunk 上限分组（粒度 framework 内部定，不暴露给用户）**
 
@@ -612,7 +616,7 @@ class CachingEmbeddingClient:
         # 5) 拼回原顺序返回
 ```
 
-CachingVlmClient / CachingSummaryClient 同模式。`[transformation_cache] enabled = false` 时这层退化成透明 passthrough。
+CachingVlmClient / CachingSummaryClient / CachingConverterClient 同模式。`[transformation_cache] enabled = false` 时这层退化成透明 passthrough。
 
 **两层 batch_size 协调**：
 
@@ -668,11 +672,13 @@ worker 不做"按历史平均预测 batch"的自适应（影响小、不值得�
 **① Chunk-level 幂等**
 
 ```
-chunk_id = sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)
+chunk_id = sha1(namespace_id + connector_uri + object_uri + chunk_kind + locator + lines)
 写 chunk = DELETE WHERE chunk_id = X + INSERT
 ```
 
 任何 worker / 重试 / 并发，对同 chunk_id 的写都等效。`namespace_id` 必须进 hash——否则两个 namespace 注册同名外部数据源（如都叫 `prod`）会让 chunk_id 撞车。
+
+`locator` 和 `lines` 一起保证 chunk_id 在 **同一 object 内唯一**：结构化对象（DB row / thread / issue）靠 `locator`（pk / thread_ts / number）区分；`body` / document / code 这类 `locator` 为 null 的对象靠 `lines`（chunk 的 `[start, end]` 行区间，见 [06 §3](06-search-and-retrieval.md#3-locator-schema-per-connector)）区分——否则同一文件切出的多个 `body` chunk 会落到同一个 chunk_id、互相覆盖，最终一个文件只剩一个 chunk。`summary` / `vlm_description` / `directory_summary` / `schema_summary` 这类每个 object 至多一条，locator/lines 都为 null 也不会撞。
 
 **② Per-object 原子**
 
@@ -1192,7 +1198,7 @@ object_tasks (
   id                    VARCHAR PRIMARY KEY,
   connector_job_id      VARCHAR REFERENCES connector_jobs(id),
   object_uri            VARCHAR,
-  change_kind           VARCHAR,        -- 'added' | 'modified' | 'deleted'
+  change_kind           VARCHAR,        -- 'added' | 'modified' | 'deleted' | 'renamed'
   status                VARCHAR,
   priority              INTEGER DEFAULT 0,
   attempts              INTEGER DEFAULT 0,
@@ -1213,8 +1219,11 @@ connector_state (
 );
 
 watch_grants (
-  path            VARCHAR PRIMARY KEY,
-  granted_at      TIMESTAMP
+  namespace_id    VARCHAR DEFAULT 'default',
+  connector_id    VARCHAR REFERENCES connectors(id),
+  path            VARCHAR,
+  granted_at      TIMESTAMP,
+  PRIMARY KEY (namespace_id, path)
 );
 
 -- file connector 专属状态表（替代旧 upload_manifests + connector_state 里的 manifest blob）
@@ -1498,7 +1507,7 @@ class CachingEmbeddingClient:
         return sha1(f"{sha1(text)}|embedding|{self.provider}|{self.model}|{self.version}".encode()).hexdigest()
 ```
 
-`CachingVlmClient` / `CachingSummaryClient` 同模式。worker 只跟 `CachingXxxClient` 打交道，不感知 cache 是否启用——`[transformation_cache] enabled = false` 时这一层退化成透明 passthrough。
+`CachingVlmClient` / `CachingSummaryClient` / `CachingConverterClient` 同模式。worker 只跟 `CachingXxxClient` 打交道，不感知 cache 是否启用——`[transformation_cache] enabled = false` 时这一层退化成透明 passthrough。
 
 #### 10.4.3 异步 batch writer
 

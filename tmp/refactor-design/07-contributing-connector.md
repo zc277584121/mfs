@@ -110,24 +110,31 @@ class ConnectorPlugin(ABC):
         如果只实现了 read_records，framework 自动按 jsonl 格式（每行一条 dict）
         把 records 序列化成 bytes 兜底，connector 不用再写一遍。"""
         # 默认实现：调 read_records 后 json.dumps + b"\n"
+        # 注意 read_records 的契约：未实现时返回 None（基类的普通 def）；
+        # 实现了就是 async generator，调用返回 async iterator。所以这里 is None 能区分两者。
         records = self.read_records(path, range)
         if records is None:
             raise NotImplementedError("either read or read_records must be implemented")
         async for r in records:
             yield (json.dumps(r, default=str) + "\n").encode()
 
-    async def read_records(
+    # 基类是普通 def 返回 None（不是 async def——否则调用永远返回 coroutine、is None 判不出）。
+    # 结构化 connector override 成 async generator（async def + yield），见下方 Postgres 例子。
+    def read_records(
         self, path: str, range: Range | None = None
     ) -> AsyncIterator[dict] | None:
-        """结构化数据 yield record dict 流，chunker 直接按 chunk_strategy
-        （per_row / per_group）消费。纯字节 connector 不实现，返回 None。"""
+        """结构化数据时 override 成 async generator，yield record dict 流，
+        chunker 直接按 chunk_strategy（per_row / per_group）消费。
+        纯字节 connector 不实现，保留基类返回 None。"""
         return None
 
     # ─────── 必须实现：变化检测 ───────────────────────
     @abstractmethod
     async def fingerprint(self, path: str) -> str | None:
-        """返回该 path 的当前 upstream fingerprint。None 表示总是 fresh。
-        framework 用这个跟自己存的对比，决定 artifact / chunk / embedding 哪层失效。"""
+        """返回该 path 的当前 upstream 变化标记（mtime+size / etag / version 之类，单值）。
+        None 表示总是 fresh。framework 存起来、下次比对判断这个 object 变没变——
+        只这一层，没有多层 fingerprint chain。变了就重跑整条 pipeline，
+        中间产物（convert/embed/vlm/summary）的复用靠 content-addressable cache（04 §5.2）。"""
 
     @abstractmethod
     async def sync(self, opts: SyncOptions) -> AsyncIterator[ObjectChange]:
@@ -657,7 +664,7 @@ class WebPlugin(ConnectorPlugin):
 - **不实现 `read_records`**——web page 不是结构化数据，bytes 自然形态
 - **`list` 自维护 path tree**——枚举 state 里 `pages` map 的 path prefix。framework 不提供 path tree helper（每个动态 connector 自己几行实现），如果常见可以 v0.5+ 抽出 `VirtualPathTree` helper
 - **checkpoint 是合法的**——`visited` 集合单调推进，`pages` map 跟 visited 同步增长，下次接续会跳过 visited，BFS 续跑（详见 [04 §5.6.1](04-connector-and-ingest.md#561-哪些-state-能调-checkpoint)）
-- **HTML→markdown 走 markitdown**——跟 PDF/DOCX 等共用一个 converter 框架，版本进 `artifact_fp(converted_md)` 并在 pyproject pin。v0.4 默认抓**静态 / SSR HTML**（够覆盖多数文档站）；JS-heavy SPA 留 v0.5+，届时可选 `crawl4ai` backend（`mfs-server[web-crawl4ai]`，引入 playwright 做 JS 渲染）
+- **HTML→markdown 走 markitdown**——跟 PDF/DOCX 等共用一个 converter 框架，convert 结果进 transformation cache（key 含 `converter + version`，见 02 §10.4），库版本在 pyproject pin。v0.4 默认抓**静态 / SSR HTML**（够覆盖多数文档站）；JS-heavy SPA 留 v0.5+，届时可选 `crawl4ai` backend（`mfs-server[web-crawl4ai]`，引入 playwright 做 JS 渲染）
 
 ### 6.3 用户体验
 

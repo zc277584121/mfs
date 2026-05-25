@@ -100,7 +100,7 @@ Connector validated: postgres://prod
 Discovered: 38 tables / ~12.4M rows
 Estimated (local chunker + tokenizer only — no embedding API calls):
   chunks:    ~14M    (chunker dry-run on a sample of up to 1000 records)
-  tokens:    ~2.4M   (apply your provider's per-token rate to estimate $)
+  tokens:    ~2.5B   (apply your provider's per-token rate to estimate $)
 
 Continue? [y/N]
 ```
@@ -264,7 +264,7 @@ upstream 变没变？ ← connector 用便宜手段判断（file: mtime+size / D
 
 **chunker 不进 cache**：它是本地确定性计算、毫秒级，重跑比"查表 + 比对"还省事，所以没有"chunker 版本指纹"一说——它升级了，影响通过"切出来的 text 变了 → embed 的 cache key 变了"自然传导。仍建议在 `pyproject.toml` pin 死 Chonkie 版本（可复现），但那是依赖管理，不是数据指纹。
 
-**chunk_id 仍是幂等主键**：`chunk_id = sha1(namespace + connector + object_uri + locator + chunk_kind)`，跟内容 / 配置无关。重跑一个 object = `DELETE WHERE object_uri = Y` + 重新 INSERT 切出来的所有 chunk，幂等、无脏行——不需要 chunk 级别的 fingerprint 字段来判断 stale。
+**chunk_id 仍是幂等主键**：`chunk_id = sha1(namespace + connector + object_uri + chunk_kind + locator + lines)`，跟内容 / 配置无关（`locator`/`lines` 区分同一 object 内的多个 chunk，见 [02 §7](02-architecture.md#7-一致性)）。重跑一个 object = `DELETE WHERE object_uri = Y` + 重新 INSERT 切出来的所有 chunk，幂等、无脏行——不需要 chunk 级别的 fingerprint 字段来判断 stale。
 
 #### 框架配置变化：v0.4 手动 --force-index
 
@@ -352,8 +352,12 @@ chunk 那列永远"重跑"——chunker 便宜、不进 cache。批量 DELETE-by
 file connector 的 sync 流程：
 
 ```
-1. scan：os.walk(root) 应用 ignore rules（.gitignore + .mfsignore + 默认 binary 规则）
+1. scan：遍历 root 应用 ignore rules（.gitignore + .mfsignore + 默认 binary 规则）
    得到当前 paths 集合 current_paths
+   ⚠ 枚举必须完整：file 每次都是 full scan，deleted = file_state - current_paths。
+     若扫描中途因权限 / IO 错误漏掉一批 path 还正常返回，这批会被误判成"删除"。
+     所以扫描遇错要 raise（abort 本次 add），不静默跳过——这是 §7.4.3 枚举契约
+     在 file connector（本机 scan + CS 模式 client scan，见 02 §4.2 ①）上的体现
 
 2. 对每个 path 跟 file_state 对比 (stat-first lazy hashing):
    - file_state 里有 + (size, mtime_ns) 完全一致 → 跳过
@@ -567,8 +571,9 @@ renamed event 进 framework 后，**chunk 内容、向量都不变**——只有
 
 ```
 对 old_uri 在 Milvus 里的所有 chunks:
-  ① 读出 dense_vec / sparse_vec / content / locator / chunk_kind / metadata
-  ② 算新 chunk_id = sha1(namespace + connector + new_uri + locator + chunk_kind)
+  ① 读出 dense_vec / sparse_vec / content / locator / lines / chunk_kind / metadata
+  ② 算新 chunk_id = sha1(namespace + connector + new_uri + chunk_kind + locator + lines)
+     （locator / lines 沿用旧 chunk，只有 object_uri 从 old_uri 换成 new_uri）
   ③ INSERT 新行（向量 + content 直接复用，不调 embedder）
   ④ DELETE 旧行（按旧 chunk_id 或按 object_uri 批量删）
 
@@ -630,7 +635,7 @@ mfs add ./repo --watch --interval 60s
 - daemon 内启 watcher（`watchfiles` 或 OS-native）
 - watch 事件只作触发信号，最终事实仍来自 scan + manifest 对比
 - 查看正在 watch：`mfs status --watch`
-- 停止单个 watch（保留 connector）：`mfs add ./repo --no-watch`
+- 停止单个 watch（保留 connector）：`mfs add ./repo --no-watch`（同时删除该 path 的 `watch_grant`，否则 daemon 重启 replay 会把 watcher 又加回来，见 §7.1）
 - 连 connector 一起删：`mfs remove ./repo`
 - 停整个 daemon（所有 watch 一起停）：`mfs serve stop`
 - 外部 connector 不支持 watch；要周期刷新用系统 cron / CI 调 `mfs add`（v0.4 不内置 scheduler，见 §9）
@@ -754,7 +759,7 @@ framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL
 | `mfs add --watch` | 同 |
 | `mfs add --force` | 改名 `--force-index`；remote profile 下另有 `--force-upload` |
 | Milvus chunk schema 字段 `account_id` | 改名 `namespace_id`，Milvus 不支持字段重命名，必须 drop collection 重建 |
-| Milvus chunk_id 公式 `sha1(source + start + end + content_hash + model)` | 改 `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`，跟上一行的 rebuild 一并完成 |
+| Milvus chunk_id 公式 `sha1(source + start + end + content_hash + model)` | 改 `sha1(namespace_id + connector_uri + object_uri + chunk_kind + locator + lines)`（`start/end` 以 `lines` 形式保留，去掉 content_hash + model），跟上一行的 rebuild 一并完成 |
 | 没有外部数据源概念 | 加 `mfs add <uri> --config X` 注册外部 connector |
 | 没有本机 server | 用 `mfs serve start` 启动；`MFS_AUTOSTART=1` 时首次 `mfs add` 也会触发 |
 

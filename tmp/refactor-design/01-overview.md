@@ -14,15 +14,15 @@ MFS 是 **Multi-source File-like Search**：让 agent 用一套 shell-native CLI
 ## 四个核心抽象
 
 ```
-Connector      ─ 一个注册的数据连接器       postgres://prod / ./repo / slack://eng
-Object         ─ connector 暴露的一条虚拟文件（path + media_type）
-Artifact cache ─ 一个 object 的派生缓存字节（可选，让 cat/head/tail 不打回 connector）
-Chunk          ─ Milvus 一行：能被 search/grep 召回的最小单元
+Connector ─ 一个注册的数据连接器       postgres://prod / ./repo / slack://eng
+Object    ─ connector 暴露的一条虚拟文件（path + media_type）
+Cache     ─ object 相关的缓存（对外一个概念，自动省重复拉取/计算/花钱）
+Chunk     ─ Milvus 一行：能被 search/grep 召回的最小单元
 ```
 
-整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 artifact cache（PDF→md / 图片→VLM 描述 等派生产物）和 chunks。
+整个系统对外只有这四个概念。每个 connector 决定自己 root 下面暴露哪些 object，每个 object 按需生成 cache（PDF→md / 图片→VLM 描述 等派生产物）和 chunks。
 
-（还有一层 **transformation cache** 是纯内部计算缓存，用户感知不到，详见 [02 §10.4](02-architecture.md#104-cache-层)。）
+> **Cache** 对外是一个概念，内部物理上分两块、用户感知不到：**artifact cache**（per object，让 cat/head/tail 不打回 connector）+ **transformation cache**（per content，跨对象复用 convert/embed/vlm/summary 的 API 结果）。细分见 [02 §10.4](02-architecture.md#104-cache-层)。
 
 **本地文件也是一种 connector**：scheme 是 `file`，用户写普通 path 即可。`postgres connector` / `slack connector` / `file connector` 在概念上一视同仁——同样的 list / stat / read / fingerprint 契约，同样的 chunk pipeline，同样的搜索能力。
 
@@ -185,7 +185,7 @@ MFS 第一受众是 **agent**，不是人。所以主接口是 **shell-native CL
 MFS 把"幂等"当成贯穿全局的硬约束，每一个操作都能安全地重复执行：
 
 - `mfs add` 再跑 = 再同步一次（注册 + 同步同一个入口，幂等）
-- `chunk_id = sha1(namespace + connector + object_uri + locator + chunk_kind)` 内容寻址——写 chunk = DELETE + INSERT，任何 worker / 重试 / 并发对同一 chunk_id 的写都等效
+- `chunk_id = sha1(namespace + connector + object_uri + chunk_kind + locator + lines)` 内容寻址（`locator`/`lines` 区分同一 object 内的多个 chunk）——写 chunk = DELETE + INSERT，任何 worker / 重试 / 并发对同一 chunk_id 的写都等效
 - `mfs remove` 幂等（目标状态就是"消失"，重复 remove 仍然成功）
 - per-object 原子 + state 末尾提交：中途崩溃 → state 不 commit → 下次从上个成功点重跑
 

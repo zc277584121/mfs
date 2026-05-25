@@ -9,33 +9,56 @@ collection 布局由 server.toml 的 `collection_strategy` 决定（`shared` 默
 字段定义（两种策略共用）：
 
 ```python
-partition_key = "connector_uri"        # 两种策略都一样
+from pymilvus import MilvusClient, DataType, Function, FunctionType
 
-fields = [
-    Field("chunk_id",       VARCHAR(128),  primary=True),
-    Field("namespace_id",   VARCHAR(64),   index="scalar", default="default"),
-    Field("connector_uri",  VARCHAR(256),  partition_key=True),
-    Field("object_uri",     VARCHAR(1024), index="scalar"),
-    Field("locator",        JSON),
-    Field("content",        VARCHAR(65535)),                  # 召回展示 + BM25 输入
-    Field("dense_vec",      FLOAT_VECTOR(N)),                 # N 来自 embedding model
-    Field("sparse_vec",     SPARSE_FLOAT_VECTOR),             # Milvus 内建 BM25
-    Field("chunk_kind",     VARCHAR(32),   index="scalar"),
-    Field("metadata",       JSON),                            # connector-specific filter 字段
-    Field("indexed_at",     INT64),
-]
+client = MilvusClient(uri=cfg.milvus_uri, token=cfg.milvus_token)
 
-index_params = {
-    "dense_vec":  {"type": "HNSW",  "metric_type": "COSINE", "params": {"M":16,"efConstruction":200}},
-    "sparse_vec": {"type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25"},
-}
+# ── schema：两种 collection_strategy 共用同一份字段定义 ──
+schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+schema.add_field("chunk_id",      DataType.VARCHAR, max_length=128, is_primary=True)
+schema.add_field("namespace_id",  DataType.VARCHAR, max_length=64)            # shared 下做 scalar filter；v0.4 恒 "default"
+schema.add_field("connector_uri", DataType.VARCHAR, max_length=256, is_partition_key=True)
+schema.add_field("object_uri",    DataType.VARCHAR, max_length=1024)
+schema.add_field("locator",       DataType.JSON, nullable=True)              # 结构化对象的单元 key（row pk / thread_ts / number），无则 null
+schema.add_field("lines",         DataType.JSON, nullable=True)              # body/code/document 的 [start, end]，无则 null；进 chunk_id 区分同文件多 chunk
+schema.add_field("content",       DataType.VARCHAR, max_length=65535, enable_analyzer=True)  # 召回展示 + BM25 输入（开 analyzer 供下面 BM25 function 用）
+schema.add_field("dense_vec",     DataType.FLOAT_VECTOR, dim=N)              # N 来自 embedding model
+schema.add_field("sparse_vec",    DataType.SPARSE_FLOAT_VECTOR)             # 由下面的 BM25 Function 从 content 自动生成
+schema.add_field("chunk_kind",    DataType.VARCHAR, max_length=32)
+schema.add_field("metadata",      DataType.JSON, nullable=True)             # connector-specific filter 字段
+schema.add_field("indexed_at",    DataType.INT64)
 
-# 唯一的分叉点：写/查哪张 collection
+# content → sparse_vec 的 BM25 走 Milvus 内建 Function：写入只给 content，sparse_vec 自动算
+schema.add_function(Function(
+    name="content_bm25",
+    function_type=FunctionType.BM25,
+    input_field_names=["content"],
+    output_field_names=["sparse_vec"],
+))
+
+# ── index ──
+index_params = MilvusClient.prepare_index_params()
+index_params.add_index(field_name="dense_vec",  index_type="HNSW",
+                       metric_type="COSINE", params={"M": 16, "efConstruction": 200})
+index_params.add_index(field_name="sparse_vec", index_type="SPARSE_INVERTED_INDEX",
+                       metric_type="BM25")
+for f in ("namespace_id", "object_uri", "chunk_kind"):     # 高频 filter 字段建标量倒排索引
+    index_params.add_index(field_name=f, index_type="INVERTED")
+
+# ── 唯一的分叉点：写/查哪张 collection ──
 def resolve_collection(namespace_id: str, strategy: str) -> str:
     if strategy == "per_namespace":
         return f"mfs_chunks__{namespace_id}"   # 每 namespace 一张
     return "mfs_chunks"                        # shared：全局一张
+
+client.create_collection(
+    collection_name=resolve_collection(namespace_id, cfg.collection_strategy),
+    schema=schema,
+    index_params=index_params,
+)
 ```
+
+`connector_uri` 用 `is_partition_key=True` 声明，写入/查询由 Milvus 按它自动哈希分桶（桶数 `num_partitions` 默认 64）；`sparse_vec` 由 BM25 `Function` 从 `content` 自动派生——worker 写入只提供 `content` + `dense_vec`，不手动塞 sparse 向量。
 
 ### 两种策略的差异（只有这两点）
 
@@ -75,11 +98,12 @@ Workspace / User 等组织概念不进 Milvus schema——它们通过 server �
 
 | 字段 | 含义 |
 |---|---|
-| `chunk_id` | `sha1(namespace_id + connector_uri + object_uri + locator + chunk_kind)`，幂等写入。namespace_id 必须进 hash——否则两个 namespace 注册同名外部数据源会让 chunk_id 撞车 |
+| `chunk_id` | `sha1(namespace_id + connector_uri + object_uri + chunk_kind + locator + lines)`，幂等写入。namespace_id 必须进 hash——否则两个 namespace 注册同名外部数据源会让 chunk_id 撞车。`locator` / `lines` 区分同一 object 内的多个 chunk：结构化对象（row / thread / issue）用 `locator`，`body` / code / document 这类 `locator` 为 null 的对象用 `lines`（`[start, end]` 行区间）——否则同一文件的多个 `body` chunk 会撞键互相覆盖（详见 [02 §7](02-architecture.md#7-一致性)）|
 | `namespace_id` | 物理分区主键；v0.4 恒为 `"default"`，多租户启用后由 server 注入 |
 | `connector_uri` | 包含该 chunk 的 connector root，如 `postgres://prod` |
 | `object_uri` | chunk 来自哪个 object，如 `postgres://prod/public/tickets/rows.jsonl` |
-| `locator` | object 内单元定位，per-connector schema（见 §3） |
+| `locator` | object 内单元定位，per-connector schema（见 §3）；`body`/code/document 这类按行切的对象为 null |
+| `lines` | `[start, end]` 行区间；`body`/code/document chunk 用它定位 + 进 chunk_id 区分同文件多个 chunk；结构化对象（row/thread）为 null |
 | `content` | chunk 文本：dense embed 输入 + BM25 输入 + 召回展示 |
 | `dense_vec` | embedding 向量 |
 | `sparse_vec` | Milvus 内置 BM25 sparse 向量 |
@@ -108,13 +132,13 @@ search 默认全 kind 召回，用 `mfs search ... --kind body,summary` 限定�
 
 ## 3. locator schema per connector
 
-每个 connector 的 `locator` JSON schema 是稳定契约，agent 按这个 parse：
+每个 connector 的 `locator` JSON schema 是稳定契约，agent 按这个 parse。`locator` 为 null 的对象用独立的 `lines` 字段（`[start, end]`）定位 + 进 chunk_id（见 §1）：
 
 | Connector | locator schema |
 |---|---|
-| `file` | `null`（chunk 元数据自带 `lines: [start, end]`） |
+| `file` | `null`（用 `lines` 字段 `[start, end]`） |
 | `github code` | `null`（同 file） |
-| `web` | `null`（页面级；元数据自带 lines） |
+| `web` | `null`（页面级；用 `lines`） |
 | `github issues / pulls` | `{"number": int}` |
 | `gdrive` | `{"file_id": str, "revision_id": str}` |
 | `s3 / r2 / gcs` | `null`（同 file） |
@@ -510,18 +534,18 @@ provider = "marker"             # 学术 PDF
 
 切换 embedding model 后用 `--force-index` 重建：embed 的 cache key 含 model+version，旧模型全 miss → 重新 embed；chunk 文本不变所以 convert 命中、不重转。Milvus 不支持列级 update，所以是 DELETE by object_uri + 整行 re-INSERT。批量 DELETE-by-filter + 批量 INSERT 比逐条 upsert 快很多。
 
-切换 summary / vlm / converter 模型只影响对应层 artifact / chunk 的 fp：
+切换 summary / vlm / converter 模型时，对应层的 transformation cache key（含 provider + model + version）跟着变 → 旧结果 miss → 自动重算，body chunk 不受影响：
 
 - 换 summary / vlm → 只影响 `summary` / `directory_summary` / `schema_summary` / `vlm_description` 这几种 chunk_kind 的行，body chunk 不动
-- 换 converter → `artifact_fp(converted_md)` 失效（公式含 `converter_name + converter_version`），重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
+- 换 converter → convert 的 cache key 变（含 `converter + version`）→ miss → 重新转 markdown + 重新 chunk + 重 embed；用户的源文件不需要重传
 
-这套是 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache) cache 模型的直接应用——每个操作的 cache key 都把所属 provider / model / version 揉进去，换工具 → key 变 → 自动重算对应层。
+这套是 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache) cache 模型的直接应用——每个操作的 cache key 都把所属 provider / model / version 揉进去，换工具 → key 变 → 自动重算对应层，不靠多层 fingerprint chain。
 
-**converter 路线图**：v0.4 默认 `markitdown`（一个库覆盖 PDF/DOCX/DOC/PPT/XLSX/图片/HTML），`docling / marker / mineru / llamaparse` 等高质量 converter 作为可选 backend（`mfs-server[converter-docling]` 等 extra 按需装）——它们对复杂表格、嵌入公式、扫描件显著更好但更重，不进默认安装，用户按文件类型 / path 路由即可。converter 版本进 `artifact_fp(converted_md)`（04 §5.2），换 converter 自动失效重转。
+**converter 路线图**：v0.4 默认 `markitdown`（一个库覆盖 PDF/DOCX/DOC/PPT/XLSX/图片/HTML），`docling / marker / mineru / llamaparse` 等高质量 converter 作为可选 backend（`mfs-server[converter-docling]` 等 extra 按需装）——它们对复杂表格、嵌入公式、扫描件显著更好但更重，不进默认安装，用户按文件类型 / path 路由即可。convert 结果进 transformation cache（key 含 `converter + version`，见 [02 §10.4](02-architecture.md#104-cache-层)），换 converter 自动失效重转。
 
 ### 10.1 Transformation cache：跨调用复用 API 结果
 
-embedding / vlm / summary 都是 **纯函数 + 贵**——同一段输入经过同一模型必然产出同一结果。framework 在这三类 client 外面包一层 **content-addressable transformation cache**，跨对象 / 跨连接器 / 跨 namespace 复用 API 结果。
+convert / embedding / vlm / summary 都是 **纯函数 + 贵**——同一段输入经过同一模型/工具必然产出同一结果。framework 在这四类 client 外面包一层 **content-addressable transformation cache**，跨对象 / 跨连接器 / 跨 namespace 复用结果。
 
 ```
 worker → CachingEmbeddingClient.batch_embed(texts)
@@ -543,14 +567,14 @@ worker → CachingEmbeddingClient.batch_embed(texts)
 
 完整 schema / client 包装层 / 异步 writer / LRU eviction / observability 详见 [02 §10.4](02-architecture.md#104-cache-层)。
 
-**Converter（PDF→md / DOCX→md）v0.4 不进 transformation cache**——它的产物已经按 object_uri 进了 [artifact cache](#10.2)，跨 connector 同 PDF 的场景少，BLOB 大文件入 SQLite cache 收益不抵复杂度。v0.5+ 看实际情况再决定要不要补。
+**Converter（PDF→md / DOCX→md）v0.4 也进 transformation cache**（key = `sha1(原文件 bytes + converter + version)`）——收敛掉 fingerprint chain 后，配置变化靠 `--force-index` 重跑整条 pipeline，convert 进 cache 才能让重建时"原文件没变就命中、零转换成本"。它跟 artifact cache 的分工：artifact cache 按 object_uri 存"这个对象的 converted_md"给 `cat`/chunker 快速读；transformation cache 按内容存"这段 bytes 用这个 converter 转出来的结果"，跨对象/跨重建复用。converted_md 的字节物理上存哪（object store 还是 cache）实现时择一，对外都是"命中"。
 
 **两层 cache 关系速查**：
 
 | 名字 | 寻址 | 谁用 | 文档 |
 |---|---|---|---|
 | **artifact cache** | `object_uri + artifact_kind` | `cat / head / chunker` 读派生产物 | [02 §10.2](02-architecture.md#102-object-store) / [05 §10](05-browse-and-read.md#10-artifact-cache-层细节) |
-| **transformation cache** | `sha1(input) + provider + model + version + config` | embedder / vlm / summary 跳过重复 API | [02 §10.4](02-architecture.md#104-cache-层) |
+| **transformation cache** | `sha1(input) + kind + provider + model + version + config` | convert / embedder / vlm / summary 跳过重复 API | [02 §10.4](02-architecture.md#104-cache-层) |
 
 两层物理上分文件、职责完全独立，不会互相干扰。
 
@@ -620,7 +644,7 @@ Probing connector and sampling records (local tokenizer only, no embedding API).
 Estimated (±50% accuracy):
   scan:      12.4M rows across 38 tables
   chunks:    ~14M    (chunker dry-run on sample)
-  tokens:    ~2.4M   (apply your provider's per-token rate to estimate $)
+  tokens:    ~2.5B   (apply your provider's per-token rate to estimate $)
 
 Continue? [y/N]
   Or limit scope:
@@ -636,6 +660,8 @@ Continue? [y/N]
 4. 用户决定继续 / 限定范围 / 取消
 
 **估算阶段零计费**：用户看到 prompt 时还没花一分钱。**只给物理量，不给钱、时间、storage**：embedding provider 价格不同（OpenAI / Voyage / Cohere / 自部署 / 企业协议），时间受 worker 并发 / rate limit / 网络浮动 10x，storage 强依赖 embedding dim。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。实际进度上线后看 `mfs status`。
+
+> 估算给的是**全集**总量；单个 object 仍受 `chunk_max`（§11.1，默认 1M/object）约束。若估算显示某个对象会超 `chunk_max`，prompt 里会标出来——继续跑时该对象会 `chunk_max_exceeded` 部分索引（不是整个 add 失败），用户要么提前加 `filter_expr` / `windowed`，要么显式抬高 `chunk_max`。所以"总 chunks 估算"和"逐对象 chunk_max"是两件事，别用前者推断每个对象都会被完整索引。
 
 ## 12. 删除与一致性
 
@@ -708,7 +734,7 @@ indexable = false        # 用户表 grep 找用户名足够，不需要语义�
 
 ### 13.4 跟 search availability 的关系
 
-下面 §14（原 §13）`mfs status` 输出里的 `unavailable` 状态正是"无任何 chunks"的标识——包括"未配 text_fields"和"全部 indexable=false"两种成因。
+下面 §14 `mfs status` 输出里的 `unavailable` 状态正是"无任何 chunks"的标识——包括"未配 text_fields"和"全部 indexable=false"两种成因。
 
 ## 14. 搜索可用性 (search availability)
 

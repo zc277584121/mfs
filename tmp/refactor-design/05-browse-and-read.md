@@ -312,6 +312,7 @@ artifact_cache (
   fingerprint      TEXT,            -- 同上游 fingerprint，用于 stale check
   size_bytes       INTEGER,
   built_at         TIMESTAMP,
+  last_accessed    TIMESTAMP,        -- LRU 淘汰依据（§10.4）
   PRIMARY KEY (namespace_id, object_uri, artifact_kind)
 )
 ```
