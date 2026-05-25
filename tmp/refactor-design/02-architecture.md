@@ -619,7 +619,7 @@ CachingVlmClient / CachingSummaryClient 同模式。`[transformation_cache] enab
 | 配置 | 典型值 | 含义 |
 |---|---|---|
 | `embedding.batch_size` | 100 | micro-batcher 单次 API 调用上限 |
-| `transformation_cache.lookup_batch_size` | 1000 | cache lookup 单次 SQL IN-clause 上限 |
+| `transformation_cache.lookup_batch_size` | 1000 | cache lookup 单次 SQL IN-clause 上限（定义见 §10.4.6）|
 
 cache lookup 比 API 调用便宜得多，能一次查更多。worker 攒到 500 chunks → 一次 SQL 查完 → 没命中的可能还有 200 个 → 拆成 2 个 API batch。两层数量级解耦。
 
