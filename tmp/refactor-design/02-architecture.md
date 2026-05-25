@@ -1434,6 +1434,18 @@ v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#9
 
 artifact cache 按 **object_uri** 寻址（给 cat/chunker 快速读"这个对象的 md / 描述"）；transformation cache 按 **内容** 寻址（跨对象 / 跨连接器 / 跨 namespace 复用 API 结果）。前者是 I/O 服务，后者是纯函数 memoization，互补。
 
+**哪步写哪层**（以"图片→描述→embed"和"PDF/HTML→md→embed"两条线为例）：
+
+| pipeline 步骤 | transformation cache | artifact cache | Milvus |
+|---|---|---|---|
+| convert（PDF/HTML→md）| ✓ memoize 转换 | ✓ `converted_md`（给 cat / chunker）| — |
+| vlm（图片→描述）| ✓ memoize VLM | ✓ `vlm_text`（给 cat --meta）| — |
+| summary（长文→摘要）| ✓ memoize summary | — | summary chunk |
+| chunk（md→分块）| —（便宜，不缓存）| — | — |
+| embedding（text→向量）| ✓ memoize embedding | **✗ 不存向量** | ✓ `dense_vec` |
+
+规律：**转换类**（md / 描述）两层都写——transformation cache 按内容跨对象省 API 钱、artifact cache 按 object_uri 给读命令快取；**embedding 产出的向量只进 transformation cache + Milvus，不进 artifact cache**。所谓"重复"只在转换产物那段文本——逻辑上两层各一条（用途不同：按内容 vs 按对象），物理字节实现时可择一存（见 [06 §10.1](06-search-and-retrieval.md#101-transformation-cache跨调用复用-api-结果)）。
+
 **transformation cache 覆盖四类贵操作**（v0.4）：
 
 | Kind | 输入 | 输出 | 单次成本 | 期望命中率 |
