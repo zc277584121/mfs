@@ -156,7 +156,7 @@ search 默认全 kind 召回，用 `mfs search ... --kind body,summary` 限定�
 | `zendesk` | `{"object": str, "id": int}`  ── e.g. `{"object":"tickets","id":123}` |
 | `salesforce / hubspot` | `{"object": str, "id": str}` |
 
-要打开单条对象用 `source` + `locator` 组合，agent 用 `mfs grep '"id":12' <source>` 或 `mfs export <source> ./tmp.jsonl && jq 'select(.id == 12)'`。
+要打开单条对象用 `mfs cat <source> --locator '<json>'`（按 locator 精确取回完整记录，见 [03 §6](03-cli-commands.md#6-ls--tree--cat)），或 `mfs export <source> ./tmp.jsonl && jq 'select(.id == 12)'`。
 
 ## 4. 字段配置
 
@@ -818,8 +818,8 @@ agent 用的优先级：**locator 非空就优先用 locator**（精确单元）
 
 | chunk_kind | lines | locator | 重开方式 |
 |---|---|---|---|
-| `body`（document/code）| ✓ | null | `cat -n start:end` |
-| `row_text`（DB row / record）| null | ✓ pk | grep / export+jq by pk |
+| `body`（document/code）| ✓ | null | `cat --range start:end` |
+| `row_text`（DB row / record）| null | ✓ pk | `cat --locator` by pk |
 | `thread_aggregate`（slack/discord/gmail）| 可有（在 messages.jsonl 的行）| ✓ thread_ts | **优先 locator**，lines 仅辅助 |
 | `record_aggregate`（issue+comments）| 可有 | ✓ number | **优先 locator** |
 | `vlm_description`（图片）| null | null（用 source 本身）| `cat <source> --meta` |

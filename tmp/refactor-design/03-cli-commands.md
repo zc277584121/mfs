@@ -315,10 +315,13 @@ mfs cat ./README.md                                              # 完整读文�
 mfs cat ./README.md --range 40:90                                # 行范围
 mfs cat postgres://prod/public/tickets/schema.json               # JSON
 mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100  # 区间
+mfs cat postgres://prod/public/tickets/rows.jsonl --locator '{"pk":{"id":12}}'  # 按 locator 取单条
 mfs cat ./docs/diagram.png --meta                                # 看 VLM description
 ```
 
 完整 cat 大对象会被拒绝，提示用 head/tail/range/export。详见 [05 §4](05-browse-and-read.md#4-分页与大对象)。
+
+`--locator '<json>'` 用 search/grep 结果里的 `locator` 精确取回**单条完整记录**——可下推的 connector 走精确查询（postgres `WHERE pk=...`），否则 framework 流式扫 records 匹配。比 `grep '"id":12'` 可靠：不受 `text_fields` 覆盖范围和 BM25 近似的限制。给的 locator 找不到对应记录时报 `locator_not_found`。`--locator` 与 `--range` 互斥。
 
 ## 7. 密度视图 `--peek / --skim / --deep`
 
@@ -613,6 +616,7 @@ JSON：
 | `op_conflict` | 通用并发拒绝（如 sync 中又来 update_config） |
 | `export_too_large` | export 估算 size 超过 `export.max_size`；建议改 `--range` 分批 |
 | `unknown_config_key` | `mfs config set` 收到未识别的 key |
+| `locator_not_found` | `cat --locator` 给的 locator 在该 object 找不到对应记录 |
 
 ## 13. Pipe 行为
 

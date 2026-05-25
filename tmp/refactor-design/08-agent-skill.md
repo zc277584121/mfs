@@ -131,8 +131,8 @@ agent 关心的字段：
 1. **`locator` 非空 → 优先用它**精确定位单元（DB row / issue / ticket / thread）：
 
 ```bash
-mfs grep '"id":12' <source>                 # 方式 A：grep 找单条
-mfs export <source> /tmp/data.jsonl && jq 'select(.id == 12)' /tmp/data.jsonl   # 方式 B：导出后过滤
+mfs cat <source> --locator '{"pk":{"id":12}}'      # 推荐：按 locator 精确取回单条完整记录
+mfs export <source> /tmp/data.jsonl && jq 'select(.id == 12)' /tmp/data.jsonl   # 备选：导出后过滤
 ```
 
 2. **只有 `lines` 非空（locator 为 null）→ 用行区间**（纯文本 / document / code）：
