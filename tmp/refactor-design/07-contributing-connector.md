@@ -79,8 +79,12 @@ class ConnectorPlugin(ABC):
 
     # ─────── 生命周期 ──────────────────────────────
     def __init__(self, config: BaseModel, credential: Any, *, ctx: ConnectorContext):
-        """ctx 由 framework 注入，包含:
-        - state:           KV store，connector 自己定义 schema
+        """framework 对【每个已注册 connector】各实例化一个 plugin（一连接一实例），
+        把该 connector 的 config / credential / ctx 注进来。所以 self.pool /
+        self.session 这类运行时对象是 per-instance、不跨 connector 共享；
+        ctx 里:
+        - state:           持久化 KV store（落 connector_state 表，按 connector_id 隔离），
+                           connector 自己定义 schema——详见下方 StateStore
         - connector_id / namespace_id
         - object_config_for(path) → ObjectConfig（从 [[objects]] TOML 段解析）
         """
@@ -261,7 +265,11 @@ class SyncOptions:
     full:  bool = False                 # 用户 --force-index → True
     since: Optional[str] = None         # 用户 --since <date>，覆盖 state 里的 cursor
 
-# self.state：framework 注入的命名空间 KV store
+# self.state：framework 注入的、【持久化 + 按 connector 隔离】的命名空间 KV store
+# 不是内存对象——背后是 metadata DB 的 connector_state 表（PK = connector_id + key），
+# 进程/daemon 重启后还在；每个已注册 connector 各起一个 plugin 实例、各自一份 state，
+# 所以同类型连多个数据源（postgres://prod 与 postgres://staging）的 state 互不干扰。
+# 只放小状态（cursor / etag / token）；大的 path/object 全量映射别塞这里（见 §11）。
 class StateStore(Protocol):
     async def get(self, key: str) -> Any | None: ...
     async def set(self, key: str, value: Any) -> None: ...
@@ -609,10 +617,10 @@ class WebPlugin(ConnectorPlugin):
 
     # ─── 纯字节 read，不实现 read_records ───
     async def read(self, path, range=None):
+        # 现拉现转，不在 connector 里缓存正文——framework 会把这次输出写进
+        # converted_md artifact cache（见 05 §5），再 cat 同一页直接命中、不重抓。
         pages = await self.state.get("pages") or {}
-        md = pages[path].get("content_md")
-        if not md:
-            md = await self._fetch_and_convert(pages[path]["url"])
+        md = await self._fetch_and_convert(pages[path]["url"])
         yield md.encode()
 
     async def fingerprint(self, path):
@@ -641,8 +649,9 @@ class WebPlugin(ConnectorPlugin):
             if resp.status == 200:
                 path = self._url_to_path(url)        # URL canonicalization，详见 §10.7
                 md = self._html_to_md(resp.body)
-                pages[path] = {"url": url, "etag": resp.etag,
-                               "size": len(md), "content_md": md}
+                # state 里只存小指纹（url + etag + size），不存正文 md——
+                # 正文是派生产物，归 converted_md artifact cache（框架在 read/index 时写）。
+                pages[path] = {"url": url, "etag": resp.etag, "size": len(md)}
                 yield ObjectChange(path, "modified")
                 queue.extend(self._extract_links(resp.body, url))
             crawled += 1
@@ -662,9 +671,10 @@ class WebPlugin(ConnectorPlugin):
 注意：
 
 - **不实现 `read_records`**——web page 不是结构化数据，bytes 自然形态
-- **`list` 自维护 path tree**——枚举 state 里 `pages` map 的 path prefix。framework 不提供 path tree helper（每个动态 connector 自己几行实现），如果常见可以 v0.5+ 抽出 `VirtualPathTree` helper
+- **`self.state` 里只放小指纹，不放正文**——`pages` map 是 `{path: {url, etag, size}}`，正文 markdown 归 `converted_md` artifact cache（[05 §10.2](05-browse-and-read.md#10-artifact-cache-层细节)），framework 在 read/index 时写。connector_state 是给 cursor / etag 这种小状态的，别把派生字节塞进来（[§11](#11-边界规则)）
+- **`list` 自维护 path tree**——枚举 state 里 `pages` map 的 path prefix。framework 不提供 path tree helper（每个动态 connector 自己几行实现），如果常见可以 v0.5+ 抽出 `VirtualPathTree` helper。v0.4 这张 map 受 `max_pages`（默认 1000）约束、规模可控；超大爬虫语料的更优存储（让 framework 的 `objects` 表反向开放只读、connector 不再自己存）留 v0.5+
 - **checkpoint 是合法的**——`visited` 集合单调推进，`pages` map 跟 visited 同步增长，下次接续会跳过 visited，BFS 续跑（详见 [04 §5.6.1](04-connector-and-ingest.md#561-哪些-state-能调-checkpoint)）
-- **HTML→markdown 走 markitdown**——跟 PDF/DOCX 等共用一个 converter 框架，convert 结果进 transformation cache（key 含 `converter + version`，见 02 §10.4），库版本在 pyproject pin。v0.4 默认抓**静态 / SSR HTML**（够覆盖多数文档站）；JS-heavy SPA 留 v0.5+，届时可选 `crawl4ai` backend（`mfs-server[web-crawl4ai]`，引入 playwright 做 JS 渲染）
+- **HTML→markdown 走 markitdown**——是 fetch backend 的一部分（`static` backend = aiohttp 抓 HTML + markitdown 转 md），由 connector 内联做（跟 PDF/DOCX 那种"connector 吐原文件字节、框架 converter 转"不同——web 的转换跟 backend 绑定）。转出来的 md 进 `converted_md` artifact cache，重抓靠 etag 304 跳过。库版本在 pyproject pin。v0.4 默认抓**静态 / SSR HTML**（够覆盖多数文档站）；JS-heavy SPA 留 v0.5+，届时可选 `crawl4ai` backend（`mfs-server[web-crawl4ai]`，自带 JS 渲染 + markdown 抽取）
 
 ### 6.3 用户体验
 
