@@ -556,12 +556,12 @@ flowchart LR
 
 worker 只调最外层 `CachingEmbeddingClient`，里面三层各管各的：cache 命中直接出向量，miss 才进 micro-batcher 攒 batch 调 API，结果再异步回写 cache。embedding / VLM / summary 各有一套同构的三层。
 
-**第一层：worker 一次拉 N 个 task，并行处理**
+**第一层：worker 拉 task、按 chunk 上限分组（粒度 framework 内部定，不暴露给用户）**
 
 ```python
 async def worker_loop():
     while True:
-        tasks = await db.claim_batch(limit=BATCH_SIZE)
+        tasks = await db.claim_batch(limit=TASK_CLAIM_SIZE)   # 内部默认，省 DB round-trip
         if not tasks:
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
             continue
@@ -570,16 +570,18 @@ async def worker_loop():
         chunk_lists = await asyncio.gather(*[chunk_object(t) for t in tasks])
         all_chunks = [c for lst in chunk_lists for c in lst]
 
-        # CachingEmbeddingClient：先查 transformation cache，miss 走 BatchingEmbeddingClient
-        # 一次调用就能拿到全部 vector（命中的 + API 跑出来的）
-        vecs = await embedding_client.batch_embed([c.content for c in all_chunks])
-        for c, v in zip(all_chunks, vecs):
-            c.dense_vec = v
+        # 按 chunk 硬上限分组：防超大 task（一个 object 出几万 chunk）一次性灌爆内存 / embedding
+        for group in batched(all_chunks, MAX_CHUNKS_PER_BATCH):
+            # CachingEmbeddingClient：先查 transformation cache，miss 走 BatchingEmbeddingClient
+            vecs = await embedding_client.batch_embed([c.content for c in group])
+            for c, v in zip(group, vecs):
+                c.dense_vec = v
+            await milvus.batch_upsert(group)            # 内部再按 insert_batch_size 分 RPC
 
-        # 一次 RPC 写几百到几千行
-        await milvus.batch_upsert(all_chunks)
         await db.mark_succeeded([t.id for t in tasks])
 ```
+
+`TASK_CLAIM_SIZE` / `MAX_CHUNKS_PER_BATCH` 都是 **framework 内部默认值，不暴露为用户配置**——worker 拉多拉少影响小（瓶颈在 embedding API rate limit，且第二层 micro-batcher 按自己的 `batch_size` 攒 API 批、不绑定 worker 拉取粒度），没必要让用户操心。真正给用户的旋钮是 `chunk_max`（控单 object 索引规模 / 成本，见 [06 §11](06-search-and-retrieval.md#11-大对象索引控制)）和可选的 `embedding.batch_size`（贴 provider rate limit）。
 
 `chunk_object(t)` 按 object_kind 分派到对应 processor（document → markdown chunker / pdf → converter → markdown chunker / image → VLM / table_rows → row text 拼接 / ...）。CPU 重的部分（AST 切分、JSONL 流处理、大目录 scan）走 server-rs 的 Rust PyO3 模块，调用时释放 GIL，所以 `asyncio.gather` 在多核上是真并行。
 
@@ -631,9 +633,11 @@ cache lookup 比 API 调用便宜得多，能一次查更多。worker 攒到 500
 #   Postgres → 默认 4
 # 显式写数字会覆盖自适应（SQLite 下写 >1 会启动时报警并降到 1）。
 concurrency = "auto"
-batch_size = 50
 poll_interval_ms = 200
 heartbeat_interval_s = 30
+# worker 一次拉几个 task、一批处理多少 chunk 是 framework 内部默认（影响小、
+# 瓶颈在 embedding API），不暴露为用户配置；超大 task 由内部 chunk 硬上限防爆，
+# 单 object 规模由 chunk_max 控（见 06 §11）。
 
 [embedding]
 batch_size = 100
@@ -655,7 +659,7 @@ batch_max_wait_ms = 200
 insert_batch_size = 1000
 ```
 
-worker 自适应：每跑完一批记一下"平均 chunks-per-task"，下一轮按"目标 chunks 总数 / 平均 chunks-per-task"调 `batch_size`，并加一道"单批 chunks 硬上限"防止抓到一个产 10 万 chunks 的大 task 卡住整批。这样既不让小 task（如 image 出 1 chunk）每批只攒到几个，也不让大 task（如 `rows.jsonl` 出几万 chunks）独占资源。
+worker 不做"按历史平均预测 batch"的自适应（影响小、不值得）。它就一道**固定的 chunk 硬上限**（`MAX_CHUNKS_PER_BATCH`）：claim 一批 task、chunk 出来后按这个上限分组 embed + 写 Milvus。大 task（`rows.jsonl` 出几万 chunk）被切成多组、不灌爆内存；小 task（image 出 1 chunk）多攒几个 task 凑一组——大小通吃，无需动态预测，也无需用户配。
 
 ## 7. 一致性
 
