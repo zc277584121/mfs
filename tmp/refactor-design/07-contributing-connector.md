@@ -362,10 +362,13 @@ class ObjectConfig:
     chunk_strategy:  str            # per_row / per_group / per_field_chunked / windowed / sampled
     indexable:       bool = True
     chunk_max:       int = 1_000_000
-    index_filter:     Optional[str] = None
+    index_filter:    Optional[str] = None
     text_template:   Optional[str] = None
     group_by:        Optional[str] = None
     session_idle_min: Optional[int] = None
+    chunk_window:    Optional[str] = None        # chunk_strategy=windowed，如 "30d"
+    sample_rate:     Optional[float] = None      # chunk_strategy=sampled，如 0.01
+    max_text_chars:  Optional[int] = None        # 单 chunk 上限，超过自动转 per_field_chunked
 
 @dataclass
 class GrepMatch:

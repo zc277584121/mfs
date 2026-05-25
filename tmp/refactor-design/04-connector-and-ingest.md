@@ -700,7 +700,7 @@ daemon 启动:
 }
 ```
 
-framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL ILIKE，否则走线性扫；`paged_cat=true` 才允许 `cat --range`。
+framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL ILIKE，否则走 BM25（对象已索引）/ 线性扫（未索引）；`paged_cat=true` 才允许 `cat --range`。
 
 ## 9. Sync 策略矩阵
 

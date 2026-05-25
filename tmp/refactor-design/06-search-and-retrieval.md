@@ -250,7 +250,7 @@ index_filter = "len(description) > 50"
 
 ### chunk_max
 
-硬上限。超过时停止 chunk 生成并报 `chunk_max_exceeded`，让用户看到选择：要么加 `index_filter`，要么开 windowed 策略。
+硬上限。达到上限就停止生成更多 chunk——**已生成的 chunk 保留并索引（部分索引，不是整个对象不索引）**，同时报 `chunk_max_exceeded` 让用户看到选择：要么加 `index_filter`，要么开 windowed 策略。该对象 `search_status` 标 `partial`，search 仍可用但召回不全。
 
 ## 5. 内置 preset
 
@@ -608,7 +608,7 @@ text_fields = ["event_type", "payload_summary"]
 chunk_max = 100000                # 这个对象单独压低
 ```
 
-超过停止 + 报错：
+达到上限停止生成（已生成的 chunk 保留 = 部分索引，`search_status=partial`）+ 报错：
 
 ```text
 chunk_max_exceeded: public.events
@@ -765,7 +765,7 @@ Sync:   last 2026-05-15T07:00, status=fresh
 Index:
   tables/public/tickets/rows.jsonl   12453 chunks (fresh)
   tables/public/accounts/rows.jsonl  890 chunks (fresh)
-  tables/public/events/rows.jsonl    not indexed (chunk_max_exceeded)
+  tables/public/events/rows.jsonl    partial (chunk_max_exceeded)
   tables/public/audit_log/rows.jsonl not indexed (indexable=false)
 Search: partial
 ```

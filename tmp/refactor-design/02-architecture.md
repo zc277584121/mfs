@@ -699,7 +699,7 @@ object_task.status = 'succeeded'
 
 中途崩溃 → state 不 commit → 下次 sync 从上次成功的 state 重启。`connector.sync()` 必须 idempotent。
 
-外部 API 大数据量场景（Slack / Gmail 等）可以调 `self.state.checkpoint()` 主动 commit 当前 state，避免崩溃后整批重跑被 rate limit 打爆。详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint-api)。
+外部 API 大数据量场景（Slack / Gmail 等）可以调 `self.state.checkpoint()` 主动 commit 当前 state，避免崩溃后整批重跑被 rate limit 打爆。详见 [04 §5.6](04-connector-and-ingest.md#56-mid-job-checkpoint)。
 
 **④ 变化检测只一层；中间复用靠 cache；框架配置变化 v0.4 手动重建**
 
@@ -982,6 +982,8 @@ CREATE UNIQUE INDEX ux_connector_jobs_one_queued
         Object store: 删 artifact cache + staging files/
         Metadata DB:  删 artifact_cache / objects / connector_state /
                           file_state / object_tasks / connector_jobs
+                          （connector_jobs 删除时 WHERE id != <当前 remove_job>——
+                            remove_job 自己要留到 ⑦ 标 succeeded，之后由 retention 归档）
    ⑥ connectors 表行 DELETE
    ⑦ remove_job 标 'succeeded'
 ```
@@ -1177,6 +1179,11 @@ objects (
   indexable       BOOLEAN,
   capabilities    TEXT,
   last_seen       TIMESTAMP,
+  -- 索引状态（ls --json / status 直接读；与会归档的 object_tasks 解耦，是 object 级长期状态源）
+  search_status   VARCHAR,                          -- 'not_indexed' | 'building' | 'indexed' | 'partial' | 'stale'
+  chunk_count     INTEGER,                          -- 该 object 当前在 Milvus 的 chunk 数
+  index_error     TEXT,                             -- 最近一次索引失败原因（chunk_max_exceeded / field_missing 等），成功为 null
+  indexed_at      TIMESTAMP,                        -- 最近一次成功索引完成时间
   PRIMARY KEY (connector_id, object_uri),
   INDEX (connector_id, parent_path)
 );

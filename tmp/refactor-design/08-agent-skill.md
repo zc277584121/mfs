@@ -60,7 +60,7 @@ mfs grep '"id":12' postgres://prod/public/tickets/rows.jsonl
 mfs tree --peek -L 2 ./src              # 了解结构
 mfs search "session expiration" ./src   # 语义找候选
 mfs grep "ERR_TOKEN" ./src              # 关键词找精确位置
-mfs cat ./src/auth/token.py -n 150:180  # 读上下文
+mfs cat ./src/auth/token.py --range 150:180  # 读上下文
 ```
 
 ### 工作流 C：跨多个 connector 找一个决策的来龙去脉
@@ -138,7 +138,7 @@ mfs export <source> /tmp/data.jsonl && jq 'select(.id == 12)' /tmp/data.jsonl   
 2. **只有 `lines` 非空（locator 为 null）→ 用行区间**（纯文本 / document / code）：
 
 ```bash
-mfs cat <source> -n <start>:<end>           # 直接读那段
+mfs cat <source> --range <start>:<end>      # 直接读那段
 ```
 
 每种 chunk_kind 填哪些字段是稳定契约，见 [06 §15](06-search-and-retrieval.md#15-json-envelope-searchgrep)。`locator` 的内部 schema per-connector，agent 不要硬编码——读 skill 里该 connector 的 `references/connectors/<name>.md`（或 [06 §3](06-search-and-retrieval.md#3-locator-schema-per-connector) 的表）拿它文档化的 locator schema。
@@ -309,9 +309,10 @@ agent 看到 `cat="denied_unless_range"` 就不要直接 cat，走 head 或 rang
 | search_status | agent 该走 |
 |---|---|
 | `indexed` | `mfs search`（语义混合，最佳） |
+| `partial` | 部分索引（chunk_max 超限 / windowed / sampled）→ `search` 可用但召回不全，关键查询再补一发 `grep` |
 | `stale` | 仍可 `search`（结果可能旧），或 `mfs add` 刷新后再搜 |
 | `building` | 还在建——`mfs status` 等就绪，或先用 grep 兜底 |
-| `not_indexed` | 没语义索引（indexable=false / chunk_max 超限 / 还没建）→ 用 grep |
+| `not_indexed` | 没语义索引（indexable=false / 还没建）→ 用 grep |
 
 对 `not_indexed` 对象 grep 不依赖 Milvus（没 chunks，走连接器下推或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)），索引没就绪也能兜底。
 

@@ -223,7 +223,7 @@ CLI 动词 (ls/cat/grep/...)
 
 - **优先级排序让核心先可用**：file connector 按启发式给 task 排序（README / 配置 / `src/` 先，`tests/` / `build/` 后，详见 [02 §6.3](02-architecture.md#63-优先级)）。`mfs add .` 跑到 ~30% 时核心文件已索引完，agent 立刻能搜到关键内容
 - **索引状态对 agent 可见**：`mfs status <uri>` 列出每个 object 建好没（chunks 数、fresh / building / not_indexed + 原因），connector 级给 search 可用性（available / partial / building / unavailable，详见 [06 §14](06-search-and-retrieval.md#14-搜索可用性-search-availability)）。agent 据此知道哪些能 search、哪些还在建
-- **没建好也不空等**：search 不是唯一路径——`grep` 不依赖 Milvus 索引（connector pushdown 或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)），索引还没就绪时 agent 可降级到 grep / 精确匹配兜底，建好后再用语义 search
+- **没建好也不空等**：search 不是唯一路径——未索引对象的 `grep` 不依赖语义索引就绪（走 connector pushdown 或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)；已索引对象的 grep 则走 BM25），索引还没就绪时 agent 可降级到 grep 兜底，建好后再用语义 search
 
 合起来：agent "刚 add 完就能开始干活"，能力随索引推进逐步增强，而不是卡在全有/全无的开关上。这条跟 [#7 幂等](#7-一切操作幂等恢复模型因此极简) 互补——幂等保证"重跑安全"，渐进可用保证"中途就有用"。
 
@@ -256,7 +256,7 @@ mfs cat <uri> --range A:B             按行/记录区间
 mfs export <uri> <file>               完整导出到本地
 
 mfs search "..." <path>               语义混合搜索
-mfs grep "..." <path>                 精确搜索（connector 可下推）
+mfs grep "..." <path>                 关键词/全文搜索（connector 可下推）
 
 mfs status [<uri>]                    看 server / connector / freshness / job
 mfs connector list/inspect/probe/update/remove

@@ -9,7 +9,7 @@ mfs
 │   ├── status [<uri>]       daemon / connector / freshness / job
 │   ├── 浏览       ls · tree
 │   ├── 读取       cat · head · tail · export
-│   ├── 搜索       search（语义混合）· grep（精确，可下推）
+│   ├── 搜索       search（语义混合）· grep（关键词/全文，可下推）
 │   └── remove <uri>         注销 + 清理（destructive）
 │
 └── 名词管理（子命令子树）
@@ -31,7 +31,7 @@ mfs
 | `mfs add <uri>` | 注册并同步本地路径或外部 connector。幂等：再跑等于"再同步" |
 | `mfs status [<uri>]` | 看 daemon / profile / connector / freshness / job |
 | `mfs search <query> <path>` | 语义 + 关键词混合搜索 |
-| `mfs grep <pattern> <path>` | 精确搜索，能下推 connector 时下推 |
+| `mfs grep <pattern> <path>` | 关键词/全文搜索，能下推时下推（精确性随路径而变，见 [05 §6](05-browse-and-read.md#6-grep-的派发)）|
 | `mfs ls <uri>` | 列子节点 |
 | `mfs tree <uri>` | 树状浏览 |
 | `mfs cat <uri>` | 读取对象；大对象拒绝并提示 head/tail/range/export |
@@ -312,7 +312,7 @@ mfs tree slack://eng -L 3
 
 ```bash
 mfs cat ./README.md                                              # 完整读文件
-mfs cat ./README.md -n 40:90                                     # 行范围
+mfs cat ./README.md --range 40:90                                # 行范围
 mfs cat postgres://prod/public/tickets/schema.json               # JSON
 mfs cat postgres://prod/public/tickets/rows.jsonl --range 0:100  # 区间
 mfs cat ./docs/diagram.png --meta                                # 看 VLM description
@@ -517,8 +517,9 @@ Server 端配置（`server.toml`：metadata backend、object store、Milvus URI�
   "content": "Login broken after SSO migration",
   "score": 0.842,
   "locator": {
-    "kind": "row",
-    "primary_key": {"id": 12}
+    "schema": "public",
+    "table": "tickets",
+    "pk": {"id": 12}
   },
   "metadata": {
     "kind": "search",

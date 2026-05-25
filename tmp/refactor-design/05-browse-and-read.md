@@ -89,7 +89,7 @@ file  LICENSE         text/plain           11 KB
 ]
 ```
 
-`capabilities` 告诉 agent 这个对象能用哪些命令；`search_status`（`indexed` / `building` / `stale` / `not_indexed`）告诉 agent 语义索引就绪没——`indexed` 走 `search`，否则降级 `grep`（详见 [08 §7](08-agent-skill.md#7-让-agent-自己发现能力)）。两个字段一起让 agent 不用试错。
+`capabilities` 告诉 agent 这个对象能用哪些命令；`search_status`（`indexed` / `partial` / `building` / `stale` / `not_indexed`）告诉 agent 语义索引就绪没——`indexed` 走 `search`，否则降级 `grep`（详见 [08 §7](08-agent-skill.md#7-让-agent-自己发现能力)）。两个字段一起让 agent 不用试错。
 
 ## 3. tree 的无界处理
 
@@ -415,5 +415,5 @@ mfs grep "ERR_TOKEN_EXPIRED" ./repo
 # src/auth/token.py
 # 167  raise TokenExpiredError("ERR_TOKEN_EXPIRED")
 
-mfs cat ./repo/src/auth/token.py -n 150:180
+mfs cat ./repo/src/auth/token.py --range 150:180
 ```
