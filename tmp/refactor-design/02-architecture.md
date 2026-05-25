@@ -1272,10 +1272,10 @@ artifact_kind 跟 object 类型的对应：
 | object 类型 | artifact_kind | 例子 |
 |---|---|---|
 | PDF / DOCX 等可转 markdown | `converted_md` | `manual.pdf` 的 markdown |
-| DB rows / API records 集合 | `page_cache.jsonl` | DB 物化页 |
-| DB rows 的 head 预拉取 | `head_cache.jsonl` | 前 100 行预拉取，加速 head 命中 |
+| DB rows / API records 集合 | `page_cache` | DB 物化页（存储文件名 `page_cache.jsonl`）|
+| DB rows 的 head 预拉取 | `head_cache` | 前 100 行预拉取，加速 head 命中（`head_cache.jsonl`）|
 | 图片 | `vlm_text` | 图片 VLM description |
-| DB schema dump | `schema_dump.json` | postgres schema.json 的物化 |
+| DB schema dump | `schema_dump` | postgres schema.json 的物化（`schema_dump.json`）|
 | markdown / code / 纯文本真实文件 | **无 artifact cache** | 直接 read |
 
 目录布局（**按 namespace_id 切**）：
