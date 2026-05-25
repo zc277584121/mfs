@@ -175,7 +175,7 @@ group_by          = "thread_ts"      # chunk_strategy="per_group" 时
 session_idle_min  = 10               # group_by="session" 时
 text_template     = "..."            # 覆盖默认拼接模板（jinja-style）
 max_text_chars    = 8000             # 单 chunk 上限，超出自动转 per_field_chunked
-filter_expr       = "state == 'open'" # 只索引部分记录
+index_filter       = "state == 'open'" # 只索引部分记录
 chunk_max         = 100000           # 索引行数硬上限
 indexable         = true             # 设 false 完全不进 Milvus
 ```
@@ -234,21 +234,23 @@ comments:
 
 前三个决定"一个 chunk 是什么形态"；`windowed` / `sampled` 是在 `per_row` 基础上叠加"只索引哪部分行"的**行子集选择**（仍按行切，配 `chunk_window` / `sample_rate`），用于大对象降量，详见 [§11](#11-大对象索引控制)。`per_field_chunked` 也是 fallback：text 超过 `max_text_chars` 时自动从 `per_row` 升级。
 
-### filter_expr
+### index_filter
 
 只索引部分记录，避免 chunk 爆炸。是一个**受限表达式**，由 framework 解析成 AST 后在白名单内求值——**不是 `eval` Python**（Python sandbox 几乎做不牢，远端 server 上执行不可信配置太危险）：
 
 ```toml
-filter_expr = "state == 'open' and priority in ['high', 'critical']"
-filter_expr = "updated_at > '2025-01-01'"
-filter_expr = "len(description) > 50"
+index_filter = "state == 'open' and priority in ['high', 'critical']"
+index_filter = "updated_at > '2025-01-01'"
+index_filter = "len(description) > 50"
 ```
 
-白名单只放：字段引用、字面量（str / num / bool / list）、比较 `== != < > <= >=`、布尔 `and / or / not`、成员 `in`，以及少量安全内建（`len`）。属性访问 / 任意函数调用 / 下标 / 推导式一律在**解析期**拒绝（报 `invalid_filter_expr`），不进求值。
+白名单只放：字段引用、字面量（str / num / bool / list）、比较 `== != < > <= >=`、布尔 `and / or / not`、成员 `in`，以及少量安全内建（`len`）。属性访问 / 任意函数调用 / 下标 / 推导式一律在**解析期**拒绝（报 `invalid_index_filter`），不进求值。
+
+> **别跟 `mfs search --filter`（[§7](#filter)）混**：`index_filter` 是 **ingest 时**筛"哪些 record 进 Milvus"，由 MFS 在 server 端对**原始 record** 求值；`--filter` 是 **query 时**筛"已索引 chunk 哪些命中返回"，翻译成 **Milvus 原生 expr** 作用在 `metadata` 字段上。两者时机、作用对象、执行引擎都不同，语法也不通用（如 `len()` 只有 `index_filter` 能用，Milvus expr 不支持）。
 
 ### chunk_max
 
-硬上限。超过时停止 chunk 生成并报 `chunk_max_exceeded`，让用户看到选择：要么加 `filter_expr`，要么开 windowed 策略。
+硬上限。超过时停止 chunk 生成并报 `chunk_max_exceeded`，让用户看到选择：要么加 `index_filter`，要么开 windowed 策略。
 
 ## 5. 内置 preset
 
@@ -611,11 +613,11 @@ chunk_max = 100000                # 这个对象单独压低
 ```text
 chunk_max_exceeded: public.events
 This object would produce ~12.4M chunks, exceeding chunk_max=1000000 (framework default).
-Add filter_expr or chunk_strategy to limit, or explicitly raise chunk_max:
+Add index_filter or chunk_strategy to limit, or explicitly raise chunk_max:
 
   [[objects]]
   match = "public.events"
-  filter_expr = "updated_at > '2026-04-01'"
+  index_filter = "updated_at > '2026-04-01'"
   # or
   chunk_strategy = "windowed"
   chunk_window = "30d"
@@ -669,7 +671,7 @@ Continue? [y/N]
 
 **估算阶段零计费**：用户看到 prompt 时还没花一分钱。**只给物理量，不给钱、时间、storage**：embedding provider 价格不同（OpenAI / Voyage / Cohere / 自部署 / 企业协议），时间受 worker 并发 / rate limit / 网络浮动 10x，storage 强依赖 embedding dim。token 数靠抽样 tokenizer 算出来是可靠的"工作量"指标，用户拿着自己 provider 的 rate 算钱。实际进度上线后看 `mfs status`。
 
-> 估算给的是**全集**总量；单个 object 仍受 `chunk_max`（§11.1，默认 1M/object）约束。若估算显示某个对象会超 `chunk_max`，prompt 里会标出来——继续跑时该对象会 `chunk_max_exceeded` 部分索引（不是整个 add 失败），用户要么提前加 `filter_expr` / `windowed`，要么显式抬高 `chunk_max`。所以"总 chunks 估算"和"逐对象 chunk_max"是两件事，别用前者推断每个对象都会被完整索引。
+> 估算给的是**全集**总量；单个 object 仍受 `chunk_max`（§11.1，默认 1M/object）约束。若估算显示某个对象会超 `chunk_max`，prompt 里会标出来——继续跑时该对象会 `chunk_max_exceeded` 部分索引（不是整个 add 失败），用户要么提前加 `index_filter` / `windowed`，要么显式抬高 `chunk_max`。所以"总 chunks 估算"和"逐对象 chunk_max"是两件事，别用前者推断每个对象都会被完整索引。
 
 ## 12. 删除与一致性
 
@@ -736,7 +738,7 @@ indexable = false        # 用户表 grep 找用户名足够，不需要语义�
 | 用户 / 用户名 / 邮箱列表 | `indexable=false`，靠 grep |
 | 二进制 / 媒体（不开 VLM 时） | 默认就不进，无需配 |
 | 数据敏感不想嵌入向量 | `indexable=false` |
-| 表太大、chunk_max 兜不住 | `indexable=false` 或加 `filter_expr` 缩范围 |
+| 表太大、chunk_max 兜不住 | `indexable=false` 或加 `index_filter` 缩范围 |
 
 `mfs ls --json` 的 `capabilities.indexable` 字段会暴露给 agent 看，避免 agent 试 search 无果。
 

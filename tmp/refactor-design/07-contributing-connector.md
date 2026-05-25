@@ -362,7 +362,7 @@ class ObjectConfig:
     chunk_strategy:  str            # per_row / per_group / per_field_chunked / windowed / sampled
     indexable:       bool = True
     chunk_max:       int = 1_000_000
-    filter_expr:     Optional[str] = None
+    index_filter:     Optional[str] = None
     text_template:   Optional[str] = None
     group_by:        Optional[str] = None
     session_idle_min: Optional[int] = None

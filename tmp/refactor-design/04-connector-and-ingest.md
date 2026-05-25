@@ -418,7 +418,7 @@ scan（上面 step 1）按三层 ignore 规则过滤，**被忽略的文件连 o
 
 例：敏感目录不想让 agent 看到 → `.mfsignore` 排除；体量大但偶尔要 grep 的 audit 文件 → 留着但 `indexable = false`。
 
-`.mfsignore` 仅 file connector 有意义（其他 connector 的"排除"靠 connector TOML 的 `[[objects]]` match + `indexable=false` / `filter_expr`）。
+`.mfsignore` 仅 file connector 有意义（其他 connector 的"排除"靠 connector TOML 的 `[[objects]]` match + `indexable=false` / `index_filter`）。
 
 ### 5.6 Mid-job checkpoint
 

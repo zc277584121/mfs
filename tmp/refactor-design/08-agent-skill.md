@@ -171,7 +171,7 @@ agent 拿到 `--json` 输出里的 error 时，按 `code` 字段决定怎么 rec
 | `since_unsupported` | connector 不支持 `--since` | 去掉 `--since`，直接 `mfs add` |
 | `range_unsupported` | 二进制对象不支持 `--range` | 用 `head -c` 字节或 `export` |
 | `tail_unsupported` | 对象 `capabilities.tail=false`（无稳定排序的集合等） | 改用 `head` / `cat --range` |
-| `chunk_max_exceeded` | 对象太大，部分索引 | search 仍然可用但召回不全；建议用户加 `filter_expr` |
+| `chunk_max_exceeded` | 对象太大，部分索引 | search 仍然可用但召回不全；建议用户加 `index_filter` |
 | `upload_rejected` | 用户加了 `--no-upload` 拒绝上传 | 去掉 flag 或切换 local profile |
 | `upload_bundle_too_large` | 单次 bundle 太大 | 加 ignore 规则缩小范围，或拆分目录 |
 | `field_missing` | text_fields 配的字段不存在 | 用户层配置问题；提示用户改 connector TOML |
