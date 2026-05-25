@@ -434,6 +434,9 @@ mfs-server run --bind 0.0.0.0:8765 --config /etc/mfs/server.toml
 # 拆分（生产）
 mfs-server api    --bind 0.0.0.0:8765 --config /etc/mfs/server.toml
 mfs-server worker --concurrency 8     --config /etc/mfs/server.toml
+
+# 重载配置（不重启进程；不支持热改的项会提示要重启）
+mfs-server reload --config /etc/mfs/server.toml
 ```
 
 ### 5.2 个人本机
@@ -441,6 +444,7 @@ mfs-server worker --concurrency 8     --config /etc/mfs/server.toml
 ```bash
 mfs serve start             # 等价 mfs-server run --bind 127.0.0.1:<port>
 mfs serve stop
+mfs serve restart           # 重启进程（改了 ~/.mfs/server.toml 后生效）
 mfs serve status            # pid / port / version / uptime / health
 mfs serve logs              # ~/.mfs/server.log
 ```

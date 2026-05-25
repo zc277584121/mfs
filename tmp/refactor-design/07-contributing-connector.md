@@ -258,7 +258,7 @@ class ConnectorPlugin(ABC):
         return 0
 ```
 
-> **术语**：方法签名里的 `path: str` 是 **connector root 内的相对路径**（如 `/public/tickets/rows.jsonl`），不是完整 URI。framework 调用前已经剥掉 URI 的 scheme + alias 前缀。用户面看到的 `<uri>`（如 `postgres://prod/public/tickets/rows.jsonl`）和 connector 方法收到的 `path` 是两个层级，详见 [02-architecture.md §1 术语速览](02-architecture.md#术语速览)。
+> **术语**：方法签名里的 `path: str` 是 **connector root 内的相对路径**（如 `/public/tickets/rows.jsonl`），不是完整 URI。framework 调用前已经剥掉 URI 的 scheme + alias 前缀。用户面看到的 `<uri>`（如 `postgres://prod/public/tickets/rows.jsonl`）和 connector 方法收到的 `path` 是两个层级，详见 [02-architecture.md §2 术语](02-architecture.md#2-术语)。
 
 `Capabilities`：
 

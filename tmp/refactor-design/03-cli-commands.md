@@ -46,7 +46,7 @@ mfs
 | --- | --- |
 | `mfs connector` | `add / probe / list / inspect / update / remove` |
 | `mfs profile` | `add / use / list / status` |
-| `mfs serve` | `start / stop / status / logs` |
+| `mfs serve` | `start / stop / restart / status / logs` |
 | `mfs job` | `list / inspect / cancel` |
 | `mfs config` | `show / set` |
 
@@ -121,6 +121,8 @@ mfs connector probe postgres://prod --config x.toml
 | `--all` | **范围 flag**，配合 `--force-index` 用：把 force-index 应用到所有已注册 connector（不带 `--all` 时只作用于 URI 指定的那一个）。换全局 embedding 模型后一次重建全部用它。底层 = 对每个 connector enqueue 一个 force_sync job，复用同一套重建逻辑（详见 [02 §6.2](02-architecture.md#62-worker-怎么拉-task)）。**confirm 一次聚合**：把所有 connector 的受影响 chunks / tokens 加总，只弹一次 y/N（`--yes` 跳过），不逐个问。**遇到正有 in-flight sync 的 connector 跳过并报告**：按 [§8.2](02-architecture.md#82-三条规则) sync 中来 force_sync 会被拒，所以这些 connector 留其 sync 跑完、force-index 只作用于其余，命令末尾列出被跳过的让用户重跑 |
 | `--force-upload` | 仅 upload flow（remote profile + 本地路径）有效；跳过 manifest diff，所有 path 都按 stale 处理，全量重新上传字节。imply `--force-index`。仅当怀疑 server staging 字节本身坏了时用 |
 | `--since <date>` | 仅时间游标 connector（postgres updated_at / slack ts / github / gmail）有效；其他报 `since_unsupported` |
+
+> 部分 connector 另有**自己特定的 scope flag**（如 postgres 的 `--tables-only <list>` / `--schema-only`：只索引指定表 / 只拉 schema 不拉行），由各 connector 声明、`mfs connector inspect` 可见。它们不通用，所以不在上面的核心 flag 表里。
 
 不提供 `--force` 短写法——避免歧义（到底重传不重传？）。shared fs 场景下 `--force-upload` 报错 `upload_not_applicable`。
 
@@ -447,6 +449,7 @@ client / server 是否共享 fs 由 CLI 自动判断（machine-id 比对），�
 ```bash
 mfs serve start
 mfs serve stop
+mfs serve restart       # 重启本机 server 进程（改了 ~/.mfs/server.toml 后用）
 mfs serve status
 mfs serve logs
 ```

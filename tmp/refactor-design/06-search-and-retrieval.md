@@ -82,7 +82,9 @@ partition_key 带来的加速：
 |---|---|
 | `mfs search "..." postgres://prod` | filter 带 `connector_uri == X` → 只扫该 connector 命中的物理桶 |
 | `mfs search "..." --all` | 多桶并行扫，scatter-gather |
-| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 按 partition_key 路由，只扫该桶 |
+| `mfs connector remove postgres://prod` | `DELETE WHERE connector_uri = X` 按 partition_key 路由，只扫命中桶 |
+
+> 精确说：`num_partitions` 默认 64 桶，connector 上千时多个 connector_uri 会哈希进同一个桶。所以"只扫命中桶"是把扫描量缩到约 1/64，桶内仍混着其他 connector 的行，靠 `connector_uri == X` scalar filter 精确过滤——不是一 connector 一桶。正确性由 scalar filter 兜，性能由分桶 + 该字段的 INVERTED 索引兜。
 
 后改 partition key 需要数据迁移，所以一开始定下来。
 

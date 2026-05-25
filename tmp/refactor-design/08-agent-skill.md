@@ -313,7 +313,9 @@ agent 看到 `cat="denied_unless_range"` 就不要直接 cat，走 head 或 rang
 | `building` | 还在建——`mfs status` 等就绪，或先用 grep 兜底 |
 | `not_indexed` | 没语义索引（indexable=false / chunk_max 超限 / 还没建）→ 用 grep |
 
-降级到 grep 时不依赖 Milvus（连接器下推或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)），所以索引没就绪也能精确匹配兜底。
+对 `not_indexed` 对象 grep 不依赖 Milvus（没 chunks，走连接器下推或线性扫，详见 [05 §6](05-browse-and-read.md#6-grep-的派发)），索引没就绪也能兜底。
+
+> **grep 的精确性随派发路径而变，agent 别假设它总是字面精确**：connector 下推（SQL `ILIKE` / provider search）和线性扫是字面精确的；而**已索引对象**的 grep 默认走 Milvus BM25（token 级、非 regex、不保证字面命中），返回的是 chunk 片段。要字面精确穷尽，用支持下推的源，或 `mfs export` + 本地 `grep` / `rg`。
 
 > grep 具体用哪个——`mfs grep`、系统 `grep`、`ripgrep`，还是 agent 框架自带的搜索 tool——**不强制**，用 agent 默认提供的那个即可。MFS 不要求特定实现，`mfs grep` 只是其中一条路径。
 
