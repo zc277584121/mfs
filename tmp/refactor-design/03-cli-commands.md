@@ -266,13 +266,13 @@ slack://eng/channels/incidents/2026-05-10/messages.jsonl
 118  {"ts":"1715320060.456","user":"U2","text":"api timeout is rising"}
 ```
 
-派发规则（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）。**默认 `mfs grep` 是字面精确匹配（unix 习惯），不碰 Milvus**——按下面优先级走"下推/扫描"：
+`mfs grep` 是**关键词 / 全文搜索**——能精确就精确，否则走已经建好的 BM25 索引（CS / 异构多 connector 下统一可用）。按优先级派发（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）：
 
-- connector 声明 `grep_pushdown=true` → 下推为 SQL `ILIKE` / Slack search API / S3 Select
-- 否则有 artifact cache → 线性扫 artifact 字节
-- 否则 `connector.read()` 流式线性扫（framework 的 Rust grep 模块，限速截断）
+- connector 支持下推（`grep_pushdown=true`）→ 下推为 SQL `ILIKE` / Slack search API / S3 Select：**精确 + 完整 + 便宜**
+- 否则对象已索引 → Milvus `sparse_vec` BM25：**统一、便宜、CS 友好**；关键词级、非 regex 精确，返回 chunk 片段（带 `locator` / `lines`）
+- 否则（未索引 + 共享 fs 本地 / 小对象）→ `connector.read()` 线性扫：仅在便宜时的兜底，超 `max_grep_bytes` 截断
 
-只有显式 `mfs grep --mode index` 才改走 Milvus sparse_vec BM25 召回（要求对象已建 chunk）——但 BM25 是统计相关、**不保证精确字面命中**，跟默认 grep 语义不同，是可选加速路径而非默认兜底。
+为什么默认不"线性扫原始字节"：CS 模式下 server 手上常没有原始字节（远端 connector 在 API 后、file 字节在 staging），异构 `--all` 也没法对 SQL 表 / Slack / PDF 统一"扫文件"；而 BM25 索引是建 dense 时顺带就有的、在 server/云侧、统一可用。**要保证精确穷尽**：用支持下推的源，或 `mfs export` 出来本地 `grep` / `rg`（MFS 不重造穷尽字节扫，见 [08 §7](08-agent-skill.md#7-让-agent-自己发现能力)）。
 
 ## 6. ls / tree / cat
 

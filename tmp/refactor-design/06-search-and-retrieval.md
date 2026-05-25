@@ -434,21 +434,19 @@ mfs search "session" ./src --top-k 5 --collapse object
 
 ## 8. Grep 流程
 
-详细派发见 [05 §6](05-browse-and-read.md#6-grep-的派发)。这一节补充 Milvus 召回路径。
-
-对已建 chunk 索引的 object，`grep --mode index` 可走 Milvus sparse_vec（BM25）路径：
+详细派发见 [05 §6](05-browse-and-read.md#6-grep-的派发)。这一节补充 Milvus 召回路径——它是 `mfs grep` 在**对象已索引、又没有 pushdown** 时的默认主路径（不是 `--mode` 开关触发的可选项）：
 
 ```
 Milvus sparse search:
   filter: namespace_id IN current_namespaces AND connector_uri = Y AND object_uri = Z
   query : sparse vector from pattern
-  返回带 chunk content 的 hits → 按行号在 chunk 内定位
+  返回带 chunk content 的 hits → chunk 片段 + locator / lines
 ```
 
-- 优势：跨大文件查关键词不用线性扫
-- 缺点：召回的是 chunk 文本，BM25 是统计相关不是 regex，不能保证精确字面匹配
+- 优势：跨大文件 / 远端 connector / 异构 `--all` 查关键词不用线性扫，CS 下统一可用；BM25 索引是建 dense 时顺带就有的，零额外成本
+- 取舍：召回的是 chunk 文本，BM25 是 token 统计相关、不是 regex，不保证精确字面匹配，返回粒度是 chunk 片段而非行级。要精确穷尽用 pushdown 源或 `mfs export` + 本地 grep（见 [05 §6](05-browse-and-read.md#6-grep-的派发)）
 
-grep 默认是字面精确匹配（符合 unix 习惯），`--mode index` 才走 Milvus BM25。
+能 pushdown 的 connector（postgres / slack / s3）优先走 pushdown 拿精确结果；BM25 是兜住其余已索引对象的统一路径。
 
 ## 9. 跨 connector search 示例
 

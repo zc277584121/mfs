@@ -758,6 +758,8 @@ framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL
 | `mfs status` | 同名，语义扩展 |
 | `mfs add --watch` | 同 |
 | `mfs add --force` | 改名 `--force-index`；remote profile 下另有 `--force-upload` |
+| `mfs search --mode semantic / keyword` | 改名 `--mode dense / sparse`（对齐 schema 的 `dense_vec` / `sparse_vec`；`hybrid` 不变、仍是默认）|
+| `mfs grep` = BM25 prefilter + 本地 regex 回扫（单机 + 共享 fs 假设）| 派发改为 pushdown → BM25 → 线性扫兜底；默认主路径是 pushdown/BM25（CS / 异构统一），不再默认回源线性全扫（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）|
 | Milvus chunk schema 字段 `account_id` | 改名 `namespace_id`，Milvus 不支持字段重命名，必须 drop collection 重建 |
 | Milvus chunk_id 公式 `sha1(source + start + end + content_hash + model)` | 改 `sha1(namespace_id + connector_uri + object_uri + chunk_kind + locator + lines)`（`start/end` 以 `lines` 形式保留，去掉 content_hash + model），跟上一行的 rebuild 一并完成 |
 | 没有外部数据源概念 | 加 `mfs add <uri> --config X` 注册外部 connector |

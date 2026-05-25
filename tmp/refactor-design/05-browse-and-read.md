@@ -201,27 +201,27 @@ artifact cache 不是必须——有些对象（小文件、纯文本）不值�
 
 ## 6. grep 的派发
 
+`mfs grep` 是**关键词 / 全文搜索**：能下推精确匹配的优先下推，否则走已建好的 BM25 索引——这套对 CS / 异构多 connector 是统一的。派发优先级：
+
 ```
 mfs grep "ERR_TIMEOUT" <path>
   │
   ├─ 1. 解析 path → 拿到 object 元信息 + capabilities
   │
-  ├─ 2a. capabilities.grep == "pushdown"：
+  ├─ 2a. capabilities.grep == "pushdown"：（精确 + 完整 + 便宜）
   │       connector.grep(pattern, path) → 流式 yield matches（重写了下推实现）
   │       例：postgres → SQL ILIKE；slack → search.messages；s3 → S3 Select
   │
-  ├─ 2b. object 在 Milvus 里（chunks 已建索引）且 --mode index：
-  │       Milvus sparse_vec BM25 召回 → 返回带行号的 chunk
+  ├─ 2b. 对象已索引（Milvus 里有 chunks）：（默认主路径，统一 / CS 友好）
+  │       Milvus sparse_vec BM25 召回 → 返回 chunk 片段（带 locator / lines）
+  │       关键词级、非 regex 精确（BM25 是 token 统计相关）
   │
-  ├─ 2c. object 在 artifact cache 里：
-  │       线性扫 artifact 字节
-  │
-  └─ 2d. 否则：
-        connector.read() 流式扫描 + 限速
+  └─ 2c. 否则（未索引 + 共享 fs 本地 / 小对象）：（便宜时才走的兜底）
+        connector.read() 流式线性扫 + 限速
         超过 `max_grep_bytes` 时截断并提示
 ```
 
-输出按 path/URI 分组（unix grep 风格）：
+输出按 path/URI 分组（unix grep 风格）；下推 / artifact 线性扫这类能定位到行的路径给行号，BM25 路径给 chunk 片段 + `locator`/`lines`：
 
 ```text
 $ mfs grep "ERR_TIMEOUT" s3://logs/app/2026-05-10
@@ -234,7 +234,7 @@ s3://logs/app/2026-05-10/app.jsonl
 
 下推与否对用户透明：用户只用 `mfs grep`，框架根据 connector 能力派发。`mfs status --verbose <uri>` 可看到该对象的 grep 实现路径。
 
-`mfs grep` 默认是字面精确匹配（符合 unix 习惯），`--mode index` 才走 Milvus BM25 召回。
+为什么默认不"线性扫原始字节"：CS 模式下 server 常没有原始字节（远端 connector 在 API 后、file 字节在 staging），异构 `--all` 也没法对 SQL 表 / Slack / PDF 统一"扫文件"；而 BM25 索引是建 dense 时顺带就有的（同一张 Milvus schema），在 server / 云侧、统一可用。**要保证精确穷尽**：用支持下推的源，或 `mfs export` 出来本地 `grep` / `rg`（MFS 不重造穷尽字节扫，见 [08 §7](08-agent-skill.md#7-让-agent-自己发现能力)）。
 
 ## 7. cat 对非文本对象的渲染
 
