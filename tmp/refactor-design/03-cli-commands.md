@@ -266,12 +266,13 @@ slack://eng/channels/incidents/2026-05-10/messages.jsonl
 118  {"ts":"1715320060.456","user":"U2","text":"api timeout is rising"}
 ```
 
-派发规则（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）：
+派发规则（详见 [05 §6](05-browse-and-read.md#6-grep-的派发)）。**默认 `mfs grep` 是字面精确匹配（unix 习惯），不碰 Milvus**——按下面优先级走"下推/扫描"：
 
 - connector 声明 `grep_pushdown=true` → 下推为 SQL `ILIKE` / Slack search API / S3 Select
-- 有 artifact cache → 扫 artifact
-- 否则 connector.read() 流式扫
-- 标记 `indexable=true` 且对象已建 chunk → 走 Milvus BM25 召回
+- 否则有 artifact cache → 线性扫 artifact 字节
+- 否则 `connector.read()` 流式线性扫（framework 的 Rust grep 模块，限速截断）
+
+只有显式 `mfs grep --mode index` 才改走 Milvus sparse_vec BM25 召回（要求对象已建 chunk）——但 BM25 是统计相关、**不保证精确字面命中**，跟默认 grep 语义不同，是可选加速路径而非默认兜底。
 
 ## 6. ls / tree / cat
 
