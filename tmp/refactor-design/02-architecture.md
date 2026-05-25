@@ -1398,12 +1398,12 @@ v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#9
 
 | 内部块 | key | 谁用 | 物理存储 | 丢失代价 |
 |---|---|---|---|---|
-| **派生产物 cache**（§10.2 的 artifact cache）| `(namespace_id, object_uri, artifact_kind)` | `cat / head / chunker` 读派生产物 | object store `artifacts/` 目录 + metadata DB 索引 | 重转 / 重算（花 API 钱）|
-| **计算 memo cache**（本节）| `sha1(input + kind + provider + model + version + config)` | `convert / embed / vlm / summary client` 跳过 API 调用 | 独立 store：本机 SQLite / CS Postgres | Milvus / 产物还在的话基本没影响 |
+| **artifact cache**（§10.2，派生产物缓存）| `(namespace_id, object_uri, artifact_kind)` | `cat / head / chunker` 读派生产物 | object store `artifacts/` 目录 + metadata DB 索引 | 重转 / 重算（花 API 钱）|
+| **transformation cache**（本节，按内容寻址的计算 memoization）| `sha1(input + kind + provider + model + version + config)` | `convert / embed / vlm / summary client` 跳过 API 调用 | 独立 store：本机 SQLite / CS Postgres | Milvus / 产物还在的话基本没影响 |
 
-派生产物 cache 按 **object_uri** 寻址（给 cat/chunker 快速读"这个对象的 md / 描述"）；计算 memo cache 按 **内容** 寻址（跨对象 / 跨连接器 / 跨 namespace 复用 API 结果）。前者是 I/O 服务，后者是纯函数 memoization，互补。
+artifact cache 按 **object_uri** 寻址（给 cat/chunker 快速读"这个对象的 md / 描述"）；transformation cache 按 **内容** 寻址（跨对象 / 跨连接器 / 跨 namespace 复用 API 结果）。前者是 I/O 服务，后者是纯函数 memoization，互补。
 
-**计算 memo 覆盖四类贵操作**（v0.4）：
+**transformation cache 覆盖四类贵操作**（v0.4）：
 
 | Kind | 输入 | 输出 | 单次成本 | 期望命中率 |
 |---|---|---|---|---|
@@ -1427,7 +1427,7 @@ transformation_cache (
   provider        VARCHAR(32),                -- 'openai' / 'voyage' / 'google' / ...
   model           VARCHAR(64),
   model_version   VARCHAR(32),
-  output_bytes    BLOB,                       -- embedding: float32 packed；vlm/summary: utf-8 text
+  output_bytes    BLOB,                       -- embedding: float32 packed；convert/vlm/summary: utf-8 text
   output_size     INTEGER,
   hit_count       INTEGER DEFAULT 0,
   created_at      TIMESTAMP,
