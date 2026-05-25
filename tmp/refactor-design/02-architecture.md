@@ -398,7 +398,7 @@ client 提交的 renames_hint 由 server 用 sha1 验证（client 端 inode 跨 
 错误恢复：
 
 - 上传到一半失败 / multipart 没完成：server 不动 file_state，下次重跑 manifest diff 自然识别
-- commit 解压过程中崩：file_state UPSERT 还没执行 → 下次 sync 扫到没记录的 staging 文件按 stale 处理
+- commit 解压过程中崩：bundle 先解压到 **temp 目录**，全部校验通过后才 atomic rename 进 staging area（`files/`）+ UPSERT `file_state`。崩在中间 → 半截文件留在 temp（**没进 staging、没有 file_state 记录**）。**file connector sync 只认 `file_state` 里 `status='staged'` 的记录，绝不把 staging 目录里"无 file_state 记录"的文件当 added** → 半截解压不会被误索引；temp 残留由 housekeeping 清理
 
 `connector_uri` 构造为 `file://<client_id>/<abs-path>`；一个 connector_uri 一辈子绑定一个 client，v0.4 禁止多 client 共写同一 connector。
 
@@ -576,18 +576,24 @@ async def worker_loop():
 
         # 并行跑 chunker（IO 并发 + Rust PyO3 模块释放 GIL，CPU bound 部分也能多核）
         chunk_lists = await asyncio.gather(*[chunk_object(t) for t in tasks])
+
+        # embedding 跨 task 攒批（省 API）：向量只是算出来放内存，不影响可见性 / 原子性
         all_chunks = [c for lst in chunk_lists for c in lst]
+        vecs = await embedding_client.batch_embed([c.content for c in all_chunks])
+        for c, v in zip(all_chunks, vecs):
+            c.dense_vec = v
 
-        # 按 chunk 硬上限分组：防超大 task（一个 object 出几万 chunk）一次性灌爆内存 / embedding
-        for group in batched(all_chunks, MAX_CHUNKS_PER_BATCH):
-            # CachingEmbeddingClient：先查 transformation cache，miss 走 BatchingEmbeddingClient
-            vecs = await embedding_client.batch_embed([c.content for c in group])
-            for c, v in zip(group, vecs):
-                c.dense_vec = v
-            await milvus.batch_upsert(group)            # 内部再按 insert_batch_size 分 RPC
-
-        await db.mark_succeeded([t.id for t in tasks])
+        # 写 Milvus + mark 按【task 边界】走 —— 保证 per-object 原子（§7 ②）：
+        # 一个 object 的所有 chunk 一次性 upsert 完，立刻 mark 这个 task succeeded。
+        # 崩在某 task 的 upsert 中间 → 该 task 没 mark、整个重跑（chunk_id 幂等覆盖），
+        # 已 mark 的 task 不受影响。
+        for t, chunks in zip(tasks, chunk_lists):
+            for group in batched(chunks, MAX_CHUNKS_PER_BATCH):  # 仅当【单个 object】chunk 数超上限才分多组
+                await milvus.batch_upsert(group)                 # 内部再按 insert_batch_size 分 RPC
+            await db.mark_succeeded(t.id)
 ```
+
+> embedding 跨 task 攒批（省 API）和「upsert 按 task 边界」（保原子）不冲突——前者只是把向量算出来放内存，真正决定 search 可见性的是 upsert。唯一的边界情况：**单个超大 object**（chunk 数超 `MAX_CHUNKS_PER_BATCH`）自己要分多组 upsert，那个 object 在分组之间可能短暂 partial 可见——这一例外靠 chunk_id 幂等自愈（重跑覆盖），细检查点见 [§8.3](#83-sync-中的-remove-流程)。**多个普通 object 之间**则严格 per-object 原子，不会出现「A 写一半 B 写一半」。
 
 `TASK_CLAIM_SIZE` / `MAX_CHUNKS_PER_BATCH` 都是 **framework 内部默认值，不暴露为用户配置**——worker 拉多拉少影响小（瓶颈在 embedding API rate limit，且第二层 micro-batcher 按自己的 `batch_size` 攒 API 批、不绑定 worker 拉取粒度），没必要让用户操心。真正给用户的旋钮是 `chunk_max`（控单 object 索引规模 / 成本，见 [06 §11](06-search-and-retrieval.md#11-大对象索引控制)）和可选的 `embedding.batch_size`（贴 provider rate limit）。
 
@@ -848,9 +854,10 @@ framework 怎么决定 "Milvus 里哪些 chunk 该删"？核心约束：**"没 y
      直接 yield ObjectChange("deleted")，framework 立即删，不依赖全量 diff
 ```
 
-模式信号来源：
+模式信号来源（connector **运行时声明**，不靠输入侧反推）：
 
-- `SyncOptions.full = True`（用户 `--force-index`，或连接器自己决定本次走全量枚举）
+- connector 在 `sync()` 里调 `ctx.declare_enumeration(mode)` 声明本次**实际**枚举模式：`'full'`（完整枚举了全集 → 可做全集 diff 删除）/ `'incremental'`（增量，默认 → 跳过 deletion）/ `'explicit_only'`（只靠 yield 的 deleted event）。**不声明 = `incremental`（最保守）**。
+- 关键：用 connector 运行时声明的**事实**，不是 `SyncOptions.full`——后者只是 framework 让它走全量的*请求*，连接器到底有没有完整枚举只有它自己知道。只在完整枚举成功路径上 declare `'full'`；中途 raise 就没声明到 → sync_job 失败、到不了 deletion 步、不删（呼应 §7.4.3 枚举契约）。
 - `delete_detection = 'never'` 的 connector（如 slack）→ 永远跳过 deletion
 
 > v0.4 不内置定时调度，所以"全量 sync"基本是用户主动触发的（手动 `--force-index` 或自带 cron 调一次全量）。postgres 这类 `full_scan` connector 的删除，就在这种用户触发的全量 sync 时被发现，不自动发现（详见 04 §9）。

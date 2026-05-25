@@ -353,6 +353,11 @@ class ConnectorContext:
         """按 path 在 [[objects]] match glob 中找匹配项；
         没匹配的用默认配置（按 object_kind 推断）。grep / chunker 用。"""
 
+    def declare_enumeration(self, mode: Literal["full", "incremental", "explicit_only"]) -> None:
+        """connector 在 sync() 里声明【本次实际枚举模式】，framework 据此决定能否做全集 diff 删除。
+        不调 = 默认 incremental（最保守，跳过 deletion）。只有真完整枚举了全集才声明 full——
+        中途 raise 没声明到就按未完整处理、不删。详见 02 §7.4。"""
+
 @dataclass
 class ObjectConfig:
     """从 connector TOML 的 [[objects]] 段解析而来。framework 注入。"""
@@ -577,6 +582,8 @@ class PostgresPlugin(ConnectorPlugin):
         cursors = {} if opts.full else (await self.state.get("cursors") or {})
         if opts.since:
             cursors = {k: opts.since for k in cursors}
+        # 声明本次枚举模式：全量 add → full（可推断删除）；增量 → incremental
+        self.ctx.declare_enumeration("full" if opts.full else "incremental")
 
         for schema in self.config.schemas:
             for table in await self._list_tables(schema):
