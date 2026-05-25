@@ -408,10 +408,12 @@ max_partitions_per_query = 32     # --all 时最多并行扫几个 partition
 ### 模式
 
 ```bash
-mfs search "..." <path>                 # hybrid (默认)
-mfs search "..." <path> --mode dense    # 仅 dense
-mfs search "..." <path> --mode sparse   # 仅 BM25
+mfs search "..." <path>                    # hybrid（默认）
+mfs search "..." <path> --mode semantic    # 仅 dense 向量（语义）
+mfs search "..." <path> --mode keyword     # 仅 BM25 sparse（关键词）
 ```
+
+模式名 `hybrid` / `semantic` / `keyword` 是面向用户的叫法；底层对应 `dense_vec` + `sparse_vec` 混合、纯 `dense_vec`、纯 `sparse_vec`。
 
 ### Filter
 
