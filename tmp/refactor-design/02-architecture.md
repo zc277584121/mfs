@@ -1254,7 +1254,7 @@ v0.4 上传协议是单次 PUT（同一个请求里发字节 + 改状态，详�
 - **artifact cache 文件**：每个有 artifact cache 的 object 的派生产物（每个 object 通常只对应一个 artifact_kind）
 - **upload staging**：client 上传的 zip bundle + 解压后的文件树（仅 §4.2 upload flow 用）
 
-> **transformation cache**（按 content_hash 寻址的计算缓存）跟这里的 artifact cache 是不同的两层，物理上也分开（独立 SQLite 文件），详见 [§10.4](#104-cache-层)。
+> **transformation cache**（按 content_hash 寻址的计算缓存）跟这里的 artifact cache 是不同的两层，物理上也分开（独立 store：本机 SQLite / CS Postgres），详见 [§10.4](#104-cache-层)。
 
 artifact_kind 跟 object 类型的对应：
 
@@ -1397,7 +1397,7 @@ v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#9
 | 内部块 | key | 谁用 | 物理存储 | 丢失代价 |
 |---|---|---|---|---|
 | **派生产物 cache**（§10.2 的 artifact cache）| `(namespace_id, object_uri, artifact_kind)` | `cat / head / chunker` 读派生产物 | object store `artifacts/` 目录 + metadata DB 索引 | 重转 / 重算（花 API 钱）|
-| **计算 memo cache**（本节）| `sha1(input + kind + provider + model + version + config)` | `convert / embed / vlm / summary client` 跳过 API 调用 | 独立 SQLite `~/.mfs/transformation_cache.db` | Milvus / 产物还在的话基本没影响 |
+| **计算 memo cache**（本节）| `sha1(input + kind + provider + model + version + config)` | `convert / embed / vlm / summary client` 跳过 API 调用 | 独立 store：本机 SQLite / CS Postgres | Milvus / 产物还在的话基本没影响 |
 
 派生产物 cache 按 **object_uri** 寻址（给 cat/chunker 快速读"这个对象的 md / 描述"）；计算 memo cache 按 **内容** 寻址（跨对象 / 跨连接器 / 跨 namespace 复用 API 结果）。前者是 I/O 服务，后者是纯函数 memoization，互补。
 
@@ -1414,10 +1414,10 @@ v0.4 的两种 collection_strategy（`shared` / `per_namespace`，见 [§9.4](#9
 
 #### 10.4.1 Schema
 
-独立 SQLite 文件，**不进 metadata DB**：
+独立 store，**跟 metadata DB 逻辑隔离**（本机用独立 SQLite 文件，CS 用 Postgres，见下）：
 
 ```sql
--- ~/.mfs/transformation_cache.db
+-- 本机：~/.mfs/transformation_cache.db（SQLite）；CS：Postgres 独立 schema，BLOB→BYTEA
 transformation_cache (
   cache_key       VARCHAR(64) PRIMARY KEY,    -- sha1(input + kind + provider + model + version + config)
   kind            VARCHAR(16),                -- 'convert' | 'embedding' | 'vlm' | 'summary'
@@ -1437,12 +1437,20 @@ CREATE INDEX ix_tx_kind ON transformation_cache (kind);
 
 `cache_key` 是单一 sha1 哈希主键，所有维度（输入内容、kind、模型、版本、prompt/config 等）都揉进去 hash。这样 lookup 是 `WHERE cache_key IN (...)` 一句 SQL，不需要多列匹配。
 
-**为什么独立 DB 文件**：
+**为什么逻辑独立**（跟存储后端无关）：
 
-- cache 写量大（每次 sync 几千到几万行），跟 metadata DB 共用会拖累事务关键路径
+- cache 写量大（每次 sync 几千到几万行），跟 metadata DB 的事务关键路径隔离
 - LRU eviction 频繁删/insert，跟核心 schema 隔离
-- 丢失或清空 cache 不影响业务正确性，独立文件方便整体重置
-- WAL mode 多读单写，跟 ingest worker 并发友好
+- 丢失或清空 cache 不影响业务正确性，方便整体重置
+
+**后端按部署选**（跟 metadata / object store 一样可配置）：
+
+| 部署 | 后端 | 说明 |
+|---|---|---|
+| 本机 `mfs serve`（单 worker）| **SQLite** 独立文件 `~/.mfs/transformation_cache.db` | WAL（多读单写）够用 |
+| CS / Docker Compose / K8s（多 worker）| **Postgres** | 多 worker 跨进程 / 跨 Pod 共享；SQLite 是单机文件、跨 Pod 共享不了 |
+
+CS 下可复用 metadata 那个 Postgres 实例的**独立 database / schema**——PG 行级锁、并发写强，不抢 metadata 的锁，上面"逻辑隔离"的意图照样达成，不必单独实例。SQLite 路径用 WAL：
 
 ```python
 conn.execute("PRAGMA journal_mode=WAL")
@@ -1569,7 +1577,9 @@ deletion 本身的判断很简单（详见 [§7.4](#74-deletion-策略)）：inc
 # server.toml
 [transformation_cache]
 enabled = true                        # 全局开关，false 时退化成透明 passthrough
-db_path = "~/.mfs/transformation_cache.db"
+backend = "sqlite"                    # 本机默认；CS / K8s 多 worker 用 "postgres"
+db_path = "~/.mfs/transformation_cache.db"   # backend=sqlite 时
+# dsn = "<env:TX_CACHE_DSN>"          # backend=postgres 时（可复用 metadata PG 的独立 schema）
 max_size_gb = 5                       # LRU 上限
 eviction_interval_s = 600             # 10 min 跑一次清理
 write_flush_interval_s = 2            # 异步 writer 每 2s flush 一次
