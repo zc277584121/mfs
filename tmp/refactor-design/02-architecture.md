@@ -633,11 +633,9 @@ cache lookup 比 API 调用便宜得多，能一次查更多。worker 攒到 500
 #   Postgres → 默认 4
 # 显式写数字会覆盖自适应（SQLite 下写 >1 会启动时报警并降到 1）。
 concurrency = "auto"
-poll_interval_ms = 200
-heartbeat_interval_s = 30
-# worker 一次拉几个 task、一批处理多少 chunk 是 framework 内部默认（影响小、
-# 瓶颈在 embedding API），不暴露为用户配置；超大 task 由内部 chunk 硬上限防爆，
-# 单 object 规模由 chunk_max 控（见 06 §11）。
+# poll_interval / heartbeat_interval / task-claim 数 / chunk-batch 上限都是 framework
+# 内部默认（影响小、瓶颈在 embedding API），不暴露为用户配置；超大 task 由内部 chunk
+# 硬上限防爆，单 object 规模由 chunk_max 控（见 06 §11）。
 
 [embedding]
 batch_size = 100
