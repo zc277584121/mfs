@@ -690,7 +690,7 @@ daemon 启动:
   },
   "object": {
     "grep_pushdown": true, "search_pushdown": false,
-    "paged_cat": true, "acl": false
+    "paged_cat": true
   },
   "credentials": {
     "required": true, "schema": "PostgresCredential"

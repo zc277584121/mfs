@@ -88,7 +88,6 @@ Connector 暴露两类方法：
   chunk_plan    默认按 object_kind 推断；自定义 chunk strategy 时重写
   render        默认按 media_type 渲染；Parquet / ORC 等特殊格式可重写
   task_priority 默认 0（FIFO）；有"首屏可见"诉求的 connector（如 file）重写
-  acl           默认 None；多租户 ACL 场景重写
 ```
 
 只实现这 6 个核心方法就能跑起来（~500 行 Python）。需要性能或自定义能力时增量重写可选方法，每个独立、低耦合。
@@ -169,7 +168,7 @@ class ConnectorPlugin(ABC):
 
     # ─────── 必须实现：核心 IO（abstract method）───────────────
     @abstractmethod
-    async def stat(self, path: str) -> FileStat: ...
+    async def stat(self, path: str) -> PathStat: ...
     @abstractmethod
     async def list(self, path: str) -> list[Entry]: ...
 
@@ -257,10 +256,6 @@ class ConnectorPlugin(ABC):
         Postgres / Slack / GitHub 一般保留默认即可。
         v0.4 由 connector 写死，不暴露给用户配置（见 02 §6.3）。"""
         return 0
-
-    async def acl(self, path: str) -> dict | None:
-        """ACL 快照（多租户 enterprise 场景）。v0.4 暂不启用。"""
-        return None
 ```
 
 > **术语**：方法签名里的 `path: str` 是 **connector root 内的相对路径**（如 `/public/tickets/rows.jsonl`），不是完整 URI。framework 调用前已经剥掉 URI 的 scheme + alias 前缀。用户面看到的 `<uri>`（如 `postgres://prod/public/tickets/rows.jsonl`）和 connector 方法收到的 `path` 是两个层级，详见 [02-architecture.md §1 术语速览](02-architecture.md#术语速览)。
@@ -290,7 +285,6 @@ class Capabilities:
     grep_pushdown: bool = False          # 重写了 grep()，做 SQL ILIKE / provider search / S3 Select
     search_pushdown: bool = False        # 重写了 search()，用 provider search API
     paged_cat: bool = True               # 支持 cat --range 区间读取
-    acl: bool = False                    # 重写了 acl()，提供 ACL 快照
 ```
 
 `mfs connector inspect <root>` 直接 dump 这个。
@@ -299,7 +293,7 @@ class Capabilities:
 
 ```python
 @dataclass
-class FileStat:
+class PathStat:
     path: str
     type: Literal["file", "dir"]
     media_type: str | None             # "application/x-ndjson" 等
@@ -483,7 +477,7 @@ class PostgresConfig(BaseModel):
 ```python
 import json, asyncpg
 from mfs_server.connectors.base import (
-    ConnectorPlugin, Capabilities, FileStat, Entry, ObjectChange,
+    ConnectorPlugin, Capabilities, PathStat, Entry, ObjectChange,
     HealthStatus, GrepMatch,
 )
 from .config import PostgresConfig
@@ -521,17 +515,17 @@ class PostgresPlugin(ConnectorPlugin):
         node = resolve(path)
         if node.kind in (PgKind.ROOT, PgKind.SCHEMA_DIR,
                          PgKind.TABLES_DIR, PgKind.TABLE_DIR):
-            return FileStat(path=path, type="dir",
+            return PathStat(path=path, type="dir",
                             media_type=None, size_hint=None,
                             fingerprint=None, extra={})
         if node.kind == PgKind.TABLE_SCHEMA:
             fp = await self._schema_fp(node.schema, node.table)
-            return FileStat(path=path, type="file",
+            return PathStat(path=path, type="file",
                             media_type="application/json",
                             size_hint=None, fingerprint=fp, extra={})
         if node.kind == PgKind.TABLE_ROWS:
             cnt, max_ts = await self._table_stats(node.schema, node.table)
-            return FileStat(path=path, type="file",
+            return PathStat(path=path, type="file",
                             media_type="application/x-ndjson",
                             size_hint=cnt * 200,
                             fingerprint=f"{max_ts}:{cnt}",
@@ -649,7 +643,7 @@ class PostgresPlugin(ConnectorPlugin):
 import aiohttp
 from markitdown import MarkItDown          # HTML→markdown，与 PDF/DOCX 等共用一个 converter
 from mfs_server.connectors.base import (
-    ConnectorPlugin, Capabilities, FileStat, Entry, ObjectChange,
+    ConnectorPlugin, Capabilities, PathStat, Entry, ObjectChange,
 )
 
 class WebPlugin(ConnectorPlugin):
@@ -667,12 +661,12 @@ class WebPlugin(ConnectorPlugin):
     # ─── stat / list 都查 state 里的虚拟 tree ───
     async def stat(self, path):
         if path == "/" or self._is_intermediate_dir(path):
-            return FileStat(path=path, type="dir", media_type=None,
+            return PathStat(path=path, type="dir", media_type=None,
                             size_hint=None, fingerprint=None, extra={})
         pages = await self.state.get("pages") or {}     # {path: {etag, size, ...}}
         if path in pages:
             p = pages[path]
-            return FileStat(path=path, type="file",
+            return PathStat(path=path, type="file",
                             media_type="text/markdown",
                             size_hint=p["size"], fingerprint=p["etag"],
                             extra={"url": p["url"]})
@@ -799,7 +793,7 @@ framework 提供 `tests/connectors/_contract.py`，对任意 plugin 跑一组通
 ```python
 @pytest.mark.parametrize("plugin", [PostgresPlugin, SlackPlugin, ...])
 async def test_connector_contract(plugin):
-    # stat 必须返回有效 FileStat
+    # stat 必须返回有效 PathStat
     # list 返回 list[Entry]，按 name 排序
     # read 范围内可重入
     # fingerprint 同 input 同 output
