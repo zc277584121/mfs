@@ -2,6 +2,76 @@
 
 这一篇写给想给 MFS 加新 connector 的开发者。预期工作量：500~1500 行 Python，集中在 `connectors/<name>/`，按实现到哪一层而定。
 
+## 开始之前：用大白话先讲一遍你在干什么
+
+下面这一节不含任何契约细节，只帮你建立直觉。看懂了再往下读 §0 起的精确接口。
+
+### 一句话
+
+MFS framework 是**一台已经造好的机器**：从上游把数据拉过来之后的所有重活——切 chunk、调 embedding、写 Milvus、混合检索、两层缓存、存储、HTTP API，还有 `ls / tree / cat / head / tail / grep / search / export` 这些命令的实现——**全都做好了**。你写一个 connector，只是给这台机器接上"**怎么够到你这个数据源**"的那几根线。其余的你**白拿**。
+
+### 你的代码在整个数据流的哪一段
+
+```
+上游数据源（postgres / 某网站 / slack / ...）
+   │
+   │   ← 只有这一段是你写的：连上游 + 把它"长成"一棵虚拟文件树
+   ▼
+┌──────────── 你的 connector（~500–1500 行）─────────────┐
+│  stat / list / read(_records) / fingerprint /         │
+│  sync / object_kind_of      （6 个核心方法）          │
+└───────────────────────┬────────────────────────────────┘
+   │   目录项 / 字节 / record / ObjectChange
+   ▼
+╔═══════════ 以下全是 framework，你碰不到、也不用写 ═══════════╗
+║  任务队列 → chunk 切分 → embedding / VLM / summary →       ║
+║  写 Milvus → cache 两层 → deletion reconcile               ║
+║                                                            ║
+║  HTTP /v1 → ls / tree / cat / head / tail / grep /         ║
+║  search / export 的命令实现 + 输出渲染 + 大对象 guard +    ║
+║  分页 + 错误码 + 多租户 namespace                          ║
+╚════════════════════════════════════════════════════════════╝
+   │
+   ▼
+agent / 用户 敲 mfs 命令
+```
+
+### 关键：命令是"白拿"的——你实现底层方法，命令自动就有了
+
+很多人卡在"框架有个 `tree` 命令，可贡献接口里没看到 `tree`，那它从哪来？"——**你不实现 `tree`，`tree` 也能用**，因为框架的 `tree` 就是去**递归调你的 `list`**。同理一排命令都是这么"派生"出来的：
+
+| 用户敲的命令 | framework 自动做的 | 你只需提供 |
+|---|---|---|
+| `mfs ls <uri>` | 取孩子、排序、单层截断 100、metadata DB 缓存、渲染表格 | `list(path)` 返回直接子节点 |
+| `mfs tree <uri> -L 2` | **递归**调你的 `list`、控制深度 `-L`、时间倒序、截断、画成树 | 还是那个 `list`（你没写 tree，tree 自动有） |
+| `mfs cat / head / tail / export` | 大对象 guard、`--range` 解析、按 media_type 渲染、artifact cache | `read`（字节）或 `read_records`（record 流）+ `stat`（给 size） |
+| `mfs grep "..."` | 默认线性扫你的 `read` 流、`-C/-i/-w`、限速截断 | 啥都不用（想更快才重写 `grep` 做下推） |
+| `mfs search "..."` | 切 chunk、embed、写 Milvus、混合召回、RRF、组 envelope | **几乎不写代码**：TOML 配 `text_fields` + `object_kind_of` 标对类型 |
+| `mfs add` / 再同步 | 起 job、排队、调 chunk/embed、deletion、cache | `fingerprint`（算变化标记）+ `sync`（yield 变了的 object） |
+
+一句话：**你填的是"数据怎么来"，framework 补的是"数据来了之后怎么用"。** 6 个核心方法写完，上面一整排命令就都能跑——不是你一条条命令去实现的。
+
+### 那 6 个"洞"为什么偏偏是这 6 个
+
+每个方法回答框架的一个问题，框架拿到答案就能驱动对应的命令/流程：
+
+| 方法 | 它回答框架的问题 | 撑起什么 |
+|---|---|---|
+| `stat(path)` | 这个 path 是文件还是目录？多大？什么 media_type？变了没？ | cat 的大小 guard、ls 的每一行、freshness |
+| `list(path)` | 这个目录下一层有哪些孩子？ | `ls` / `tree`（tree = 框架递归你的 list） |
+| `read` / `read_records` | 把这个对象的内容给我（字节流 / record 流） | cat / head / tail / export / grep / chunk 的原料 |
+| `fingerprint(path)` | 给我一个"变没变"的廉价标记（mtime / etag / version 单值） | 增量 sync 判断跳过谁、artifact 是否 stale |
+| `sync(opts)` | 从上次到现在，哪些 object 变了？流式报给我 | `mfs add` 的增量、full scan 时的 deletion 推断 |
+| `object_kind_of(path)` | 这个 path 该按哪类加工（document / code / table_rows / ...）？ | 框架据此选 chunker / 渲染器 / 是否进 Milvus |
+
+> 直觉分两半：前三个（`stat` / `list` / `read`）是"**把数据源长成一棵能浏览、能读的虚拟文件树**"；后三个（`fingerprint` / `sync` / `object_kind_of`）是"**告诉框架什么变了、每个东西是什么**"。两半都给齐，剩下全自动。
+
+### 哪些你完全不用碰（framework 全包）
+
+chunk 怎么切、用哪个 embedding 模型、Milvus schema、检索 / RRF、两层 cache、deletion 逻辑、任务队列、HTTP API、命令外壳与输出渲染、错误码、多租户 namespace——**这些 framework 全做了，你想碰也碰不到**（[§11](#11-边界规则) 列了明确禁区，比如不准在 connector 里直接写 Milvus 或直接调 embedding API）。这条分割线是刻意画的：差异部分越薄，贡献一个新源越容易。
+
+建立完这个直觉，下面 §0 起是精确版——先看"必须实现 vs 可选重写"，再到逐方法签名。
+
 ## 0. 必须实现 vs 可选重写
 
 Connector 暴露两类方法：
