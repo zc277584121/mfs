@@ -478,6 +478,8 @@ async def sync(self):
 
 不调 checkpoint 的 connector 走默认末尾提交语义，靠 chunk_id 幂等保证重跑不会写脏 Milvus。
 
+> **checkpoint 推进的是 cursor（yield 进度），不是 task 成功水位**——两者异步解耦。所以失败的下游 task 不靠"下次重新 yield"复活（cursor 可能已越过它），而靠 object_task durable + 下次 job 过继（详见 [02 §7.1](02-architecture.md#71-故障恢复)）。调不调 checkpoint 都成立。
+
 ### 5.7 Rename detection
 
 笔记类场景里改文件夹名 / 改文件名很常见。如果当成 `deleted + added` 处理，所有 chunks 都要重新切分 + 重新 embed——既花钱又花时间，但文件内容根本没变。Framework 提供一套机制让 connector 报告 rename，跳过重 embed。
@@ -745,4 +747,4 @@ framework 根据这些字段派发：`grep_pushdown=true` 时 `mfs grep` 走 SQL
 - worker 处理单 object 时，可恢复错误（429 / timeout）自动 retry N 次（指数退避）
 - 超限 → object_task 标 failed，**整 sync_job 继续跑其他 task**（不因单个对象失败放弃全部）
 - 失败 task 在 `mfs status --verbose <uri>` 和 `mfs job inspect <id>` 可见
-- 下次 `mfs add` 重新出 ObjectChange → 重新创建 task → 再试一次
+- 失败 task 留 `failed` 终态，**不靠重新 yield 复活**：下次 `mfs add` 的新 sync_job 过继该 connector 残留的 `failed` / `pending` task 重跑——cursor 已推进也不会漏掉它（详见 [02 §7.1](02-architecture.md#71-故障恢复)）

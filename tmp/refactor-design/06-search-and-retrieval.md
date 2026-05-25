@@ -168,7 +168,7 @@ match = "public.tickets"
 text_fields       = ["subject", "description", "comments[].body"]
 metadata_fields   = ["status", "priority", "assignee", "updated_at"]
 locator_fields    = ["id"]
-chunk_strategy    = "per_row"        # per_row | per_group | per_field_chunked
+chunk_strategy    = "per_row"        # per_row | per_group | per_field_chunked | windowed | sampled
 
 # 选填
 group_by          = "thread_ts"      # chunk_strategy="per_group" 时
@@ -229,18 +229,22 @@ comments:
 | `per_row` | issue / ticket / DB row / SaaS record | 一条记录 |
 | `per_group` | slack / discord / gmail | 一组（thread / session / time-window） |
 | `per_field_chunked` | 单字段长文本（如 Notion page body、web page） | 该字段按 markdown 切多个 chunk |
+| `windowed` | 超大时序表只索引近窗口 | 一条记录（见下）|
+| `sampled` | 超大 audit / event 表抽样索引 | 一条记录（见下）|
 
-`per_field_chunked` 也是 fallback：text 超过 `max_text_chars` 时自动从 `per_row` 升级。
+前三个决定"一个 chunk 是什么形态"；`windowed` / `sampled` 是在 `per_row` 基础上叠加"只索引哪部分行"的**行子集选择**（仍按行切，配 `chunk_window` / `sample_rate`），用于大对象降量，详见 [§11](#11-大对象索引控制)。`per_field_chunked` 也是 fallback：text 超过 `max_text_chars` 时自动从 `per_row` 升级。
 
 ### filter_expr
 
-只索引部分记录，避免 chunk 爆炸。语法是 Python expr（sandbox eval）：
+只索引部分记录，避免 chunk 爆炸。是一个**受限表达式**，由 framework 解析成 AST 后在白名单内求值——**不是 `eval` Python**（Python sandbox 几乎做不牢，远端 server 上执行不可信配置太危险）：
 
 ```toml
 filter_expr = "state == 'open' and priority in ['high', 'critical']"
 filter_expr = "updated_at > '2025-01-01'"
 filter_expr = "len(description) > 50"
 ```
+
+白名单只放：字段引用、字面量（str / num / bool / list）、比较 `== != < > <= >=`、布尔 `and / or / not`、成员 `in`，以及少量安全内建（`len`）。属性访问 / 任意函数调用 / 下标 / 推导式一律在**解析期**拒绝（报 `invalid_filter_expr`），不进求值。
 
 ### chunk_max
 
@@ -544,6 +548,8 @@ provider = "marker"             # 学术 PDF
 这套是 [04 §5.2](04-connector-and-ingest.md#52-重建与-cache) cache 模型的直接应用——每个操作的 cache key 都把所属 provider / model / version 揉进去，换工具 → key 变 → 自动重算对应层，不靠多层 fingerprint chain。
 
 **converter 路线图**：v0.4 默认 `markitdown`（一个库覆盖 PDF/DOCX/DOC/PPT/XLSX/图片/HTML），`docling / marker / mineru / llamaparse` 等高质量 converter 作为可选 backend（`mfs-server[converter-docling]` 等 extra 按需装）——它们对复杂表格、嵌入公式、扫描件显著更好但更重，不进默认安装，用户按文件类型 / path 路由即可。convert 结果进 transformation cache（key 含 `converter + version`，见 [02 §10.4](02-architecture.md#104-cache-层)），换 converter 自动失效重转。
+
+> **HTML 有两条转换路径，别混**。framework converter 处理的是"connector 吐出**独立文件字节**"的场景——PDF / DOCX / 本地 `.html` 文件 / gdrive 导出的 HTML 等；上面 `[converter]` 的 HTML 能力就是给这类**文件态 HTML**。**web crawler 不走这条**：web connector 的 HTML→markdown 跟抓取 backend 耦合（`static` 内联 markitdown，`crawl4ai` 自带 JS 渲染 + 正文抽取），在 connector 内部完成，结果只进 `converted_md` artifact cache、靠 ETag 304 省重抓，**不进 transformation cache**。分界线是"转换是否跟抓取 backend 耦合"——耦合的内联（web），不耦合的（吐独立文件）走 framework converter。详见 [07 §6.2](07-contributing-connector.md#62-web-connector动态发现-path-tree)。
 
 ### 10.1 Transformation cache：跨调用复用 API 结果
 

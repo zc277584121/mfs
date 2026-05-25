@@ -730,6 +730,24 @@ UPDATE object_tasks SET status='pending'
 
 state 没 commit，下次 `mfs add` 自然从上一个成功的 state 接续。没有 `mfs job retry` 命令——重跑 = 下次 `mfs add`。
 
+#### 未完成 / 失败 task 由下次 job 继承（不靠重新 yield）
+
+上面那条 reset SQL 把崩溃 job 的 task 退回 `pending`，但 worker claim 是按 `connector_job_id` 限定的（[§6.2](#62-worker-怎么拉-task)），这些 task 挂在已 `failed` 的旧 job 下、不会被认领。**谁来跑它们 = 下一个 sync_job 过继**：
+
+```
+mfs add <connector> 启动新 sync_job 时，先过继该 connector 名下的残留 task：
+  UPDATE object_tasks
+     SET connector_job_id = <new_job>, status = 'pending'
+   WHERE connector_id = <this connector>
+     AND status IN ('pending', 'failed')      -- 上个 job 没跑完的 + 失败的
+     AND attempts < max_attempts              -- 超上限的不再复活，留 failed 供诊断
+  再跑 connector.sync() 把【本次新变化】叠加进来（chunk_id 幂等，重复 yield 不写脏）
+```
+
+为什么不能只靠"下次 sync 重新 yield"补偿失败 task：**cursor 推进 ≠ task 成功**。`sync()` 推进 / checkpoint cursor 的依据是"我已 yield 了这批 ObjectChange"，而 task 的 chunk + embed 是异步消费、可能晚很久才失败。cursor 一旦越过某个 object（它上游不再变），重新 yield 永远不会再带上它——所以失败 object 的重试必须挂在 **durable 的 object_task + 下次 job 过继**上，而不是 cursor 重放。这条同时回答了"failed job 的 pending task 谁 claim"。
+
+`failed` 是"上一轮结果"的记录；task 行本身被新 job 复活重跑。真正的结构性失败（如某 row 恒缺 text_fields）会反复 `failed` + `attempts` 累加，到上限后不再复活、在 `mfs status --verbose` 里可见，由用户改配置解决，不无限静默重试。
+
 #### 错误分类：retry-able vs fatal
 
 单 task 失败有两类原因，区别对待：

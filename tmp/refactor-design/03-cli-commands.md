@@ -54,13 +54,15 @@ mfs
 
 所有 `<uri>` 参数都是 connector URI。本地路径是 `file` scheme URI 的简写：
 
-| 用户写 | CLI 内部规范化 |
+| 用户写 | CLI 规范化（用户可见形式） |
 |---|---|
 | `./repo`（相对路径） | `file:///<resolved-abs-path>/repo` |
 | `/abs/path`（绝对路径） | `file:///abs/path` |
 | `file:///abs/path` | 不变 |
 | `file://./repo` | 报错（违反 URI 规范，相对路径不能跟 `file://` 一起用） |
 | `postgres://prod` | 不变（按 scheme 路由到对应 connector） |
+
+> 这列是**用户可见的规范化形式**——CLI 输入、搜索结果的 `source`、`mfs ls` 输出都用它。file connector 的**内部身份**会再焊上 client_id（`file://<client_id>/<abs-path>`，见 [02 §3.4](02-architecture.md#34-client_idclient-的稳定身份)），用于跨 add / search / remove 的去重；但 client_id 是 UUID、对用户无意义，**不出现在用户面**，CLI 也不接受带 client_id 的写法。要看完整内部 URI（如排查孤儿 connector）走 `mfs connector list / inspect`。
 
 ## 2. 设计原则
 

@@ -359,7 +359,7 @@ class ObjectConfig:
     text_fields:     list[str]
     metadata_fields: list[str]
     locator_fields:  list[str]
-    chunk_strategy:  str            # per_row / per_group / per_field_chunked
+    chunk_strategy:  str            # per_row / per_group / per_field_chunked / windowed / sampled
     indexable:       bool = True
     chunk_max:       int = 1_000_000
     filter_expr:     Optional[str] = None
