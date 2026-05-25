@@ -294,7 +294,6 @@ mfs job list/inspect/cancel
 | 08 | [08-agent-skill.md](08-agent-skill.md) | 给 LLM agent skill 作者的指南 | Skill 作者、prompt 工程师 |
 | 09 | [09-connector-catalog.md](09-connector-catalog.md) | 每类 connector 的虚拟目录布局清单 | 用户、贡献者参考 |
 | 10 | [10-packaging-and-deployment.md](10-packaging-and-deployment.md) | 打包、部署形态、发版、工程目录、运维 | 运维、维护者 |
-| —  | [18-project-structure-flow.html](18-project-structure-flow.html) | 可交互目录树和信息流（HTML） | 所有人 |
 
 ## 与 Mirage 的关系
 

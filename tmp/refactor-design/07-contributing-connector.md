@@ -45,7 +45,7 @@ agent / 用户 敲 mfs 命令
 | `mfs ls <uri>` | 取孩子、排序、单层截断 100、metadata DB 缓存、渲染表格 | `list(path)` 返回直接子节点 |
 | `mfs tree <uri> -L 2` | **递归**调你的 `list`、控制深度 `-L`、时间倒序、截断、画成树 | 还是那个 `list`（你没写 tree，tree 自动有） |
 | `mfs cat / head / tail / export` | 大对象 guard、`--range` 解析、按 media_type 渲染、artifact cache | `read`（字节）或 `read_records`（record 流）+ `stat`（给 size） |
-| `mfs grep "..."` | 默认线性扫你的 `read` 流、`-C/-i/-w`、限速截断 | 啥都不用（想更快才重写 `grep` 做下推） |
+| `mfs grep "..."` | 已索引对象走 Milvus BM25 召回；未索引才线性扫你的 `read` 流、`-C/-i/-w`、限速截断 | 啥都不用（想更快 / 要精确穷尽才重写 `grep` 做下推） |
 | `mfs search "..."` | 切 chunk、embed、写 Milvus、混合召回、RRF、组 envelope | **几乎不写代码**：TOML 配 `text_fields` + `object_kind_of` 标对类型 |
 | `mfs add` / 再同步 | 起 job、排队、调 chunk/embed、deletion、cache | `fingerprint`（算变化标记）+ `sync`（yield 变了的 object） |
 
@@ -83,7 +83,7 @@ Connector 暴露两类方法：
   object_kind_of                  路径 → object 类型映射
 
 可选重写（基类有默认；重写就走你的逻辑）
-  grep          默认线性扫；postgres / slack 可重写做下推
+  grep          默认派发：已索引走 Milvus BM25 / 未索引线性扫兜底；postgres / slack 可重写做下推（精确穷尽）
   search        默认 None（framework 走 Milvus 召回）；某些 connector 可用 provider search API
   chunk_plan    默认按 object_kind 推断；自定义 chunk strategy 时重写
   render        默认按 media_type 渲染；Parquet / ORC 等特殊格式可重写
@@ -230,7 +230,7 @@ class ConnectorPlugin(ABC):
     async def grep(
         self, pattern: str, path: str, options: GrepOptions
     ) -> AsyncIterator[GrepMatch] | None:
-        """默认走 framework 线性扫；postgres/slack 等可重写做下推。
+        """默认走 framework grep 派发（已索引对象走 Milvus BM25，未索引线性扫兜底）；postgres/slack 等可重写做下推。
         返回 None = 用 framework default。
         options.text_fields / metadata_fields 由 framework 从 ObjectConfig 注入。"""
         return None
@@ -590,7 +590,7 @@ class PostgresPlugin(ConnectorPlugin):
     async def grep(self, pattern, path, options):
         node = resolve(path)
         if node.kind != PgKind.TABLE_ROWS:
-            return None     # 用 framework 默认线性扫
+            return None     # 用 framework 默认派发（BM25 / 线性扫兜底）
         text_fields = options.text_fields    # framework 从 ObjectConfig 注入
         if not text_fields:
             return None
@@ -797,7 +797,7 @@ async def test_connector_contract(plugin):
     # list 返回 list[Entry]，按 name 排序
     # read 范围内可重入
     # fingerprint 同 input 同 output
-    # change_set 在无变化时 added/modified/deleted 全空
+    # sync 在无变化时不 yield 任何 ObjectChange
     # ...
 ```
 
@@ -985,7 +985,7 @@ pages/docs.acme.com/Guide/Start__q=lang=zh.md
 4. 怎么判断对象变化？fingerprint 算什么？
 5. 哪些对象要索引（进 chunk）？text_fields 默认是什么？
 6. 能否下推 grep / search / tail？
-7. **upstream 能不能识别 delete？属于 `delete_detection` 的哪一档**（`never` / `explicit` / `full_scan` / `state_change`）？详见 [02 §7.4](../02-architecture.md#74-deletion-策略)
+7. **upstream 能不能识别 delete？属于 `delete_detection` 的哪一档**（`never` / `explicit` / `full_scan` / `state_change`）？详见 [02 §7.4](02-architecture.md#74-deletion-策略)
 8. 凭据是什么？OAuth scope 要哪些？
 9. 用户必填配置最少是什么？
 

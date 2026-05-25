@@ -55,7 +55,7 @@ mfs add <target>
        已注册：复用现有配置
   │
   ③ connector.sync() 流式 yield ObjectChange
-       added / modified / deleted
+       added / modified / deleted / renamed
   │
   ④ 对每个 ObjectChange（yield 出来的）：upstream 变了就重跑该 object 的 pipeline
        中间贵操作（convert/embed/vlm/summary）过 cache，命中复用、miss 才花钱（见 §5.2）

@@ -8,10 +8,10 @@
 mfs ls postgres://prod/public/tickets
   │
   ① 查 metadata DB:
-       SELECT virtual_path, media_type, size_hint, last_seen, fingerprint, extra
+       SELECT object_uri, media_type, size_hint, last_seen, fingerprint, extra
        FROM objects
        WHERE connector_id = $cid AND parent_path = '/public/tickets'
-       ORDER BY virtual_path
+       ORDER BY object_uri
   │
   ② 如果 records 的 last_seen 超过 TTL（默认 1h）：
        触发后台 connector.list($path) 刷新（不阻塞当前请求）
