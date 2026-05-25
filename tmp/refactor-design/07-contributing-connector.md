@@ -887,7 +887,7 @@ tickets/
   comments.jsonl               # 全部 comment（带 ticket_id 反向引用）
 ```
 
-取单条用 `mfs grep '"id":12' tickets/records.jsonl` 或 `export + jq`。
+取单条用 `mfs cat tickets/records.jsonl --locator '{"id":12}'` 或 `export + jq`。
 
 ### 10.3 单 record 走 locator，不暴露成 path
 

@@ -50,8 +50,8 @@ mfs head -n 5 postgres://prod/public/tickets/rows.jsonl
 # 5. 语义搜索找候选
 mfs search "customer cannot login" postgres://prod/public/tickets --top-k 5
 
-# 6. 精确读单条
-mfs grep '"id":12' postgres://prod/public/tickets/rows.jsonl
+# 6. 精确读单条（用 search 结果里的 locator）
+mfs cat postgres://prod/public/tickets/rows.jsonl --locator '{"pk":{"id":12}}'
 ```
 
 ### 工作流 B：在本地代码仓库里找 bug
@@ -69,9 +69,8 @@ mfs cat ./src/auth/token.py --range 150:180  # 读上下文
 mfs search "why did we change pricing limit" --all --top-k 10
 # 返回可能混合：linear issue / github PR / slack thread
 
-# 拿到结果继续展开
-mfs cat linear://product/teams/Pricing/issues.jsonl
-mfs grep '"id":"LIN-88"' linear://product/teams/Pricing/issues.jsonl
+# 拿到结果继续展开：用 locator 精确取那一条
+mfs cat linear://product/teams/Pricing/issues.jsonl --locator '{"team":"Pricing","id":"LIN-88"}'
 ```
 
 ### 工作流 D：周期跟随数据（v0.4 不内置 tail -f）

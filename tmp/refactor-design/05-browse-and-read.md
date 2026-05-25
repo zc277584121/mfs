@@ -390,8 +390,8 @@ mfs head -n 5 postgres://prod/public/tickets/rows.jsonl
 mfs search "customer cannot login after SSO" postgres://prod/public/tickets --top-k 5
 # → 返回 id=12 / id=41 等候选
 
-# 4. 精确读单条
-mfs grep '"id":12' postgres://prod/public/tickets/rows.jsonl
+# 4. 精确读单条（用 search 结果里的 locator）
+mfs cat postgres://prod/public/tickets/rows.jsonl --locator '{"pk":{"id":12}}'
 
 # 5. 想离线分析全部 high priority
 mfs export postgres://prod/public/tickets/rows.jsonl ./tickets.jsonl
